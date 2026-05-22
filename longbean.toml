@@ -1,0 +1,47 @@
+# 构建系统配置：告诉 Python 用 setuptools 来打包这个项目
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+# 项目基础信息
+[project]
+name = "mini-agent"
+version = "0.1.0"
+description = "A minimal local coding agent built from scratch."
+readme = "README.md"
+requires-python = ">=3.11"
+
+# 项目运行依赖
+dependencies = [
+  "openai>=1.30.0",         # 统一走 OpenAI SDK，也可接 OpenAI-compatible 服务
+  "python-dotenv>=1.0.1",   # 从 .env 读取 API Key / Base URL / Model
+  "rich>=13.7.0",           # 终端输出更友好，可选但推荐
+]
+
+# 开发依赖：测试时安装
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0.0",
+  "pytest-mock>=3.14.0",
+]
+
+# 命令行入口
+# 安装后可以直接执行：mini-agent
+# 实际会调用 app/main.py 里的 main() 函数
+[project.scripts]
+mini-agent = "app.main:main"
+
+# setuptools 找包配置
+[tool.setuptools]
+package-dir = {"" = "."}
+
+# 告诉 setuptools 去哪里找 Python 包
+# include = ["app*"] 表示把 app 包及其子包一起打进去
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["app*"]
+
+# pytest 配置
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]

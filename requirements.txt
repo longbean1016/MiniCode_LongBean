@@ -1,0 +1,7 @@
+openai>=1.30.0
+python-dotenv>=1.0.1
+rich>=13.7.0
+
+# 测试
+# pytest>=8.0.0
+# pytest-mock>=3.14.0
