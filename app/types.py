@@ -2,6 +2,8 @@
 from dataclasses import dataclass, field
 from typing import Any, Callable, Literal, Protocol, TypedDict
 
+ 
+
 
 class ChatMessage(TypedDict,total=False):
     """
@@ -30,7 +32,7 @@ class ToolCall(TypedDict):
     """
 
     id: str
-    toolName: str
+    tool_name: str
     input: Any # 调用该工具时传入的参数。
 
 @dataclass(slots=True)
@@ -57,7 +59,7 @@ class AgentStep:
     content: str=""
     kind: Literal["final","progress"]|None=None # 表示这条 assistant 内容属于哪种回答阶段。
     calls: list[ToolCall]=field(default_factory=list) # 本步需要执行的工具调用列表。当 type="tool_calls" 时，这里会有一个或多个 ToolCall。
-    contentKind: Literal["progress"]|None=None # 表示内容类型的更细粒度标记。
+    content_kind: Literal["progress"]|None=None # 表示内容类型的更细粒度标记。
     diagnostics: StepDiagnostics|None=None #附带的诊断信息。
 
 
@@ -92,3 +94,28 @@ class AppConfig:
 
     # agent 允许工作的根目录
     workspace_root: str
+
+
+@dataclass(slots=True)
+class ToolResult:
+    """
+        表示一次工具执行后的结果
+    """
+
+    ok: bool # 表示工具执行是否成功
+
+    output: str # 工具执行后的输出文本结果
+
+
+
+@dataclass(slots=True)
+class ToolContext:
+    """
+    表示一次工具调用的上下文信息
+    """
+
+    cwd: str # 当前工具执行时的工作目录
+
+
+
+
