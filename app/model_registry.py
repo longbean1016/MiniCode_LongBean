@@ -23,36 +23,39 @@ class OpenAIModelAdapter:
         # 保存当前使用的模型名称
         self.model_name=model_name
 
-    def _to_openai_messages(self,messages:list[ChatMessage])->list[dict]: # type: ignore
+    def _to_openai_messages(self, messages: list[ChatMessage]) -> list[dict[str, str]]:
 
         """
         把项目内部消息格式转换成 OpenAI 接口需要的 messages 格式。
         第一版先只保留最核心的 role 和 content。
         """
 
-        result:list[dict[str,str]] = []
+        result: list[dict[str, str]] = []
 
         for msg in messages:
-            role=msg.get("role")
-            content=msg.get("content","")
+            role = msg.get("role")
+            content = msg.get("content", "")
 
             # 只转换模型当前能直接理解的三类基础消息
-            if role in ("system","user","assistant"):
+            if role in ("system", "user", "assistant"):
                 result.append(
                     {
-                    "role":role,
-                    "content":content
-                })
+                        "role": role,
+                        "content": content,
+                    }
+                )
 
             # 工具结果消息，第一版先转成 assistant 可读的普通文本
-            elif role=="tool_result":
+            elif role == "tool_result":
                 result.append(
                     {
-                    "role":"assistant",
-                    "content":f"[工具调用结果] {content}"
-                })
+                        "role": "assistant",
+                        "content": f"[工具调用结果] {content}",
+                    }
+                )
 
-            return result
+        # 循环结束后再统一返回，确保所有消息都被转换进去
+        return result
         
     def next(
         self,
