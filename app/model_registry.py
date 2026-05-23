@@ -6,7 +6,7 @@ from openai import OpenAI
 from app.types import AgentStep, ChatMessage
 
 
-class OpenAIModelRegistry:
+class OpenAIModelAdapter:
     """
     模型适配器：
     负责把消息发送给模型，并把模型返回结果整理成统一的 AgentStep。
