@@ -1,9 +1,14 @@
 
  
 
-from openai import OpenAI
+import json
+from typing import Any
 
-from app.types import AgentStep, ChatMessage
+from openai import OpenAI
+ 
+
+from app.tooling import ToolRegistry
+from app.types import AgentStep, ChatMessage, ToolCall
 
 
 class OpenAIModelAdapter:
@@ -12,7 +17,7 @@ class OpenAIModelAdapter:
     负责把消息发送给模型，并把模型返回结果整理成统一的 AgentStep。
     """
 
-    def __init__(self,api_key:str,base_url:str,model_name:str) -> None:
+    def __init__(self,api_key:str,base_url:str,model_name:str,tool_registry:ToolRegistry) -> None:
         # 创建openai客户端实例
         # 如果你后面把 base_url 换成 DeepSeek 的兼容地址，这里也可以继续复用。
         self.client=OpenAI(
@@ -22,6 +27,27 @@ class OpenAIModelAdapter:
 
         # 保存当前使用的模型名称
         self.model_name=model_name
+
+        # 保存工具注册表，后面需要把工具描述传给模型
+        self.tool_registry=tool_registry
+
+
+
+    def _build_openai_tools(self)->list[dict[str, Any]]:
+        """
+        把内部工具定义转换成 OpenAI / DeepSeek 兼容的 tools 格式。
+        """
+        openai_tools: list[dict[str, Any]] = []
+        for tool in self.tool_registry.list_tools():
+            openai_tools.append({
+                "type": "function",
+                "function": {
+                    "name": tool.name, # 工具名称
+                    "description": tool.description, # 工具说明
+                    "parameters": tool.input_schema # 工具参数结构，符合 OpenAI function call 的规范
+                }
+            })
+        return openai_tools
 
     def _to_openai_messages(self, messages: list[ChatMessage]) -> list[dict[str, str]]:
 
@@ -65,25 +91,56 @@ class OpenAIModelAdapter:
     )-> AgentStep: # type: ignore
         
         """
-        调用模型，返回统一的 AgentStep。
-        第一版先只支持普通文本回答，不处理工具调用。
+        调用模型并返回统一的 AgentStep。
+        当前版本支持两种结果：
+        1. 普通文本回答
+        2. 模型发起工具调用
         """
 
         # 把内部消息格式转换成接口需要的格式
         openai_messages = self._to_openai_messages(messages)
         
+        # 构造当前可用工具列表，传给模型做 function call
+        openai_tools = self._build_openai_tools()
+
         # 调用聊天接口
         response=self.client.chat.completions.create(
             model=self.model_name,
             messages=openai_messages, # type: ignore
+            tools=openai_tools, # 把工具描述交给模型 # type: ignore
         )
 
         # 取出模型返回的文本内容
-        content=response.choices[0].message.content or ""
+        message=response.choices[0].message
 
-        # 第一版统一按普通 assistant 回复处理
+        # 如果模型返回了工具调用，就先转为统一的tool_calls结构
+        if message.tool_calls: # type: ignore
+            calls: list[ToolCall] = []
+            for call in message.tool_calls: # type: ignore
+                tool_name=call.function.name # type: ignore
+                tool_args=call.function.arguments or "{}" # type: ignore
+
+                # 把模型返回的 JSON 字符串参数转成字典
+                try:
+                    parsed_input = json.loads(tool_args)
+                except json.JSONDecodeError:
+                    parsed_input = {}  
+
+                calls.append(
+                    {
+                        "id": call.id,
+                        "tool_name": tool_name,
+                        "input": parsed_input,
+                    }
+                )
+            return AgentStep(
+                type="tool_calls",
+                calls=calls,
+            )
+        # 否则就是普通文本回答，直接返回
+        content=message.content or "" # type: ignore
         return AgentStep(
             type="assistant",
             content=content,
-            kind="final"
+            kind="final",
         )

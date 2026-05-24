@@ -81,4 +81,14 @@ run_command_tool = ToolDefinition(
     description="执行一条命令并返回输出结果",
     validator=_validate,
     runner=_run,
+    input_schema={
+        "type": "object",
+        "properties": {
+            "command": {
+                "type": "string",
+                "description": "要执行的命令，必须是非空字符串",
+            }
+        },
+        "required": ["command"],
+    }
 )

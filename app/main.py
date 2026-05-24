@@ -4,7 +4,7 @@ from app.agent_loop import run_agent_once
 from app.config import load_config
 from app.model_registry import OpenAIModelAdapter
 from app.tools import build_tool_registry
-from app.types import ChatMessage
+from app.types import ChatMessage, ToolContext
  
 
 
@@ -21,15 +21,21 @@ def main()-> None:
     # 加载项目运行配置
     config=load_config()
 
+    # 初始化默认工具注册表
+    tool_registry=build_tool_registry()
+
     # 初始化模型适配器
     model=OpenAIModelAdapter(
         api_key=config.api_key,
         base_url=config.base_url,
-        model_name=config.model
+        model_name=config.model,
+        tool_registry=tool_registry # 初始化工具注册表
     ) # type: ignore
 
-    # 初始化默认工具注册表
-    tool_registry=build_tool_registry()
+    # 创建工具执行上下文，规定工具默认工作目录
+    tool_context = ToolContext(
+        cwd=config.workspace_root,
+    )
 
     # 保存对话历史，便于多轮对话
     history:list[ChatMessage]=[]
@@ -54,6 +60,7 @@ def main()-> None:
             user_input=user_input,
             model=model,
             tool_registry=tool_registry,
+            tool_context=tool_context,
             history=history
         )
 

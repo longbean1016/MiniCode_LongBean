@@ -100,4 +100,14 @@ list_files_tool = ToolDefinition(
     description="列出指定目录下的文件和文件夹",
     validator=_validate,
     runner=_run, # type: ignore
+    input_schema={
+        "type": "object",
+        "properties": {
+            "path": {
+                "type": "string",
+                "description": "要列出的目录路径，默认当前目录",
+            }
+        },
+        "required": [],
+    },
 )

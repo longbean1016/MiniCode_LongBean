@@ -25,8 +25,9 @@ class ToolDefinition:
 
     name: str # 工具名称，必须唯一
     description: str # 工具描述信息，供模型参考使用
-    validator: Validator # 输入检验/转换函数
+    validator: Validator # 参数校验函数
     runner: Runner # 工具执行函数
+    input_schema:dict[str, Any] # 工具的参数结构，给 function call 使用
 
 
 class ToolRegistry:

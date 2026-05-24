@@ -102,4 +102,18 @@ grep_files_tool = ToolDefinition(
     description="在指定目录中搜索包含目标文本的文件内容",
     validator=_validate,
     runner=_run,
+    input_schema={
+        "type": "object",
+        "properties": {
+            "pattern": {
+                "type": "string",
+                "description": "要搜索的文本内容，必填",
+            },
+            "path": {
+                "type": "string",
+                "description": "要搜索的目录路径，选填，默认为当前目录",
+            },
+        },
+        "required": ["pattern"],
+    }
 )

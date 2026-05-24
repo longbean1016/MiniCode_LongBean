@@ -69,4 +69,14 @@ read_file_tool = ToolDefinition(
     description="读取指定文件的内容",
     validator=_validate,
     runner=_run,
+    input_schema={
+        "type": "object",
+        "properties": {
+            "path": {
+                "type": "string",
+                "description": "要读取的文件路径，必须在工作目录内",
+            }
+        },
+        "required": ["path"],
+    }
 )
