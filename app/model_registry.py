@@ -57,6 +57,7 @@ class OpenAIModelAdapter:
             model=self.model_name,
             messages=openai_messages, # type: ignore
             tools=openai_tools, # 把工具描述交给模型 # type: ignore
+            extra_body={"thinking": {"type": "disabled"}},
         )
 
         return parse_openai_response_message(response.choices[0].message)
