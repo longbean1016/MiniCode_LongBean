@@ -102,9 +102,10 @@ class ToolResult:
         表示一次工具执行后的结果
     """
 
-    ok: bool # 表示工具执行是否成功
-
-    output: str # 工具执行后的输出文本结果
+    ok: bool  # 是否成功
+    output: str  # 给模型看的文本输出（永远是字符串）
+    error: str | None = None  # 错误摘要（成功时为 None）
+    meta: dict[str, Any] = field(default_factory=dict)  # 附加信息（截断、耗时等）
 
 
 

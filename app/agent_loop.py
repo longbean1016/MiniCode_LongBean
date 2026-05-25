@@ -1,7 +1,7 @@
 from app.message_builder import MessageBuilder
 from app.prompt import build_system_prompt
 from app.tooling import ToolRegistry
-from app.types import AgentStep, ChatMessage, ModelAdapter, ToolContext
+from app.types import AgentStep, ChatMessage, ModelAdapter, ToolContext, ToolResult
 
 
 def run_agent_once(
@@ -55,7 +55,7 @@ def run_agent_once(
                 builder.add_assistant(fallback.content)
                 return fallback, builder.build()
 
-            # 先记录工具调用，再执行工具，再记录工具结果
+            # 先记录工具调用，再执行，再记录结果
             for call in step.calls:
                 print(f"准备调用工具: {call['tool_name']}")
                 builder.add_tool_call(
@@ -64,13 +64,25 @@ def run_agent_once(
                     input_data=call["input"],
                 )
 
-                result = tool_registry.execute_tool(
-                    tool_name=call["tool_name"],
-                    input_data=call["input"],
-                    context=tool_context,
-                )
+                try:
+                    # 通过 registry 统一执行（包含输入校验和异常兜底）
+                    result = tool_registry.execute_tool(
+                        tool_name=call["tool_name"],
+                        input_data=call["input"],
+                        context=tool_context,
+                    )
+                except Exception as error:
+                    # 理论上不该进这里；作为最后保险，保证主循环不崩
+                    result = ToolResult(
+                        ok=False,
+                        output=f"工具调用发生未捕获异常: {error}",
+                        error="UNCAUGHT_TOOL_ERROR",
+                        meta={"tool_name": call["tool_name"]},
+                    )
+
                 print(f"工具{call['tool_name']}返回: {result.ok}")
 
+                # 始终把工具结果喂回模型
                 builder.add_tool_result(
                     tool_use_id=call["id"],
                     tool_name=call["tool_name"],

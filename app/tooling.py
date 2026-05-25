@@ -35,11 +35,16 @@ class ToolRegistry:
     工具注册表：负责统一管理和执行所有工具。
     """
 
-    def __init__(self,tools:list[ToolDefinition])->None:
+    def __init__(
+            self,
+            tools:list[ToolDefinition],
+            max_output_lines:int=120, #超长输出最大保留行数
+            )->None:
         # 保存工具列表，便于后续遍历展示
         self._tools=tools
         # 使用字典建立工具名到工具定义的映射，方便后续根据工具名快速找到对应的工具定义和执行函数
         self._tool_index:dict[str,ToolDefinition]={tool.name: tool for tool in tools}
+        self._max_output_lines = max_output_lines  # 输出摘要阈值
 
     def list_tools(self)->list[ToolDefinition]:
         """
@@ -60,6 +65,55 @@ class ToolRegistry:
         """
         return self._tool_index.get(name)
     
+    def _normalize_output(self, text: Any) -> str:
+        """把输出统一转成字符串，并处理空输出。"""
+        if text is None:
+            return "工具执行完成，但没有输出。"
+        s = str(text).strip()
+        if not s:
+            return "工具执行完成，但没有输出。"
+        return s
+    
+    def _summarize_output(self, text: str) -> tuple[str, bool, int]:
+        """按行截断超大输出，返回(文本, 是否截断, 原始行数)。"""
+        lines = text.splitlines()
+        total = len(lines)
+        if total <= self._max_output_lines:
+            return text, False, total
+
+        kept = lines[: self._max_output_lines]
+        remain = total - self._max_output_lines
+        kept.append(f"[输出已截断：共 {total} 行，仅保留前 {self._max_output_lines} 行，省略 {remain} 行]")
+        return "\n".join(kept), True, total
+
+    def _normalize_result(self, tool_name: str, result: ToolResult) -> ToolResult:
+        """统一返回结构：空输出兜底 + 超大输出摘要 + meta 填充。"""
+        # 保证 output 永远是字符串
+        output = self._normalize_output(result.output)
+
+        # 超大输出做摘要
+        summarized_output, truncated, total_lines = self._summarize_output(output)
+
+        # 统一错误字段（失败但没填 error 时自动补）
+        error = result.error
+        if not result.ok and not error:
+            error = f"工具 {tool_name} 执行失败"
+
+        # 合并 meta，不覆盖已有键
+        meta = dict(result.meta)
+        meta.setdefault("tool_name", tool_name)
+        meta.setdefault("truncated", truncated)
+        meta.setdefault("total_lines", total_lines)
+        meta.setdefault("max_output_lines", self._max_output_lines)
+
+        # 返回标准化后的 ToolResult
+        return ToolResult(
+            ok=result.ok,
+            output=summarized_output,
+            error=error,
+            meta=meta,
+        )
+    
     def execute_tool(self,tool_name:str,input_data:Any,context:ToolContext)->ToolResult:
         """
         统一执行一个工具。
@@ -78,35 +132,65 @@ class ToolRegistry:
 
         tool=self.find_tool(tool_name)
         if not tool:
-            return ToolResult(
+            return self._normalize_result(
+                tool_name,
+                ToolResult(
                 ok=False,
                 output=f"不存在名称为 {tool_name} 的工具",
+                error="TOOL_NOT_FOUND",
+                meta={"tool_name": tool_name},
+                ),
             )
         try:
-            # 先检验或规范化输入
-            parsed_input=tool.validator(input_data)
-
-            # 再执行工具核心功能
-            result=tool.runner(parsed_input,context)
-
-            # 防止工具返回None输出，保证output始终是字符串，避免后续处理出现类型问题
-            if result.output is None:
-                result.output=""
-            
-            return result
-        except (ValueError,TypeError,KeyError) as error:
-            # 输入格式错误或缺少必要字段等问题，都会抛出这些类型的异常，我们捕获后返回一个失败的 ToolResult
-            return ToolResult(
-                ok=False,
-                output=f"工具{tool_name}执行失败，原因：{str(error)}",
+            # 先做输入校验与规范化
+            parsed_input = tool.validator(input_data)
+        except (ValueError, TypeError, KeyError) as error:
+            # 输入不合法：返回失败结果，不抛异常
+            return self._normalize_result(
+                tool_name,
+                ToolResult(
+                    ok=False,
+                    output=f"工具参数错误：{error}",
+                    error="INVALID_INPUT",
+                    meta={"tool_name": tool_name},
+                ),
             )
+
+        try:
+            # 调用工具核心逻辑
+            raw_result = tool.runner(parsed_input, context)
         except Exception as error:
-            # 捕获其他未知异常，避免工具执行时崩溃整个系统
-            return ToolResult(
-                ok=False,
-                output=f"工具{tool_name}执行过程中发生错误，原因：{str(error)}",
+            # 工具运行异常：兜底返回，避免主循环崩溃
+            return self._normalize_result(
+                tool_name,
+                ToolResult(
+                    ok=False,
+                    output=f"工具运行异常：{error}",
+                    error="TOOL_RUNTIME_ERROR",
+                    meta={"tool_name": tool_name},
+                ),
             )
-        
+
+        # runner 若返回 None（防御式兜底）
+        if raw_result is None:
+            raw_result = ToolResult(
+                ok=False,
+                output="工具未返回结果。",
+                error="EMPTY_RESULT",
+                meta={"tool_name": tool_name},
+            )
+
+        # runner 返回类型不正确时兜底，避免后续访问属性报错
+        if not isinstance(raw_result, ToolResult):
+            raw_result = ToolResult(
+                ok=False,
+                output=f"工具 {tool_name} 返回了非法结果类型: {type(raw_result).__name__}",
+                error="INVALID_TOOL_RESULT",
+                meta={"tool_name": tool_name},
+            )
+
+        # 最后统一标准化结果结构
+        return self._normalize_result(tool_name, raw_result)
 
     
     
