@@ -93,3 +93,7 @@ Thumbs.db
 # Jupyter Notebook 缓存
 # =========================
 .ipynb_checkpoints/
+
+
+# 本地会话历史记录
+.sessions
