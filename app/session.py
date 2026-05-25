@@ -1,31 +1,32 @@
-
+from __future__ import annotations
 
 import json
+import time
+import uuid
+from dataclasses import dataclass, field
 from pathlib import Path
-import time  # 用来生成时间戳
-import uuid  # 用来生成 session_id
-from dataclasses import dataclass, field  # dataclass 简化数据结构定义
-from typing import Any  # extra 字段允许放任意附加信息
+from typing import Any
 
-from app.types import ChatMessage  # 复用现有消息结构
+from app.types import ChatMessage
 
 
 # 会话文件统一存到项目根目录下的 .sessions 文件夹
 SESSIONS_DIR_NAME = ".sessions"
 
+
 @dataclass(slots=True)
 class SessionMeta:
     """会话元信息：用于列表展示、最近会话恢复、索引检索。"""
 
-    session_id: str   # 当前会话唯一标识
+    session_id: str  # 当前会话唯一标识
     created_at: float  # 会话创建时间戳
-    updated_at: float # 会话最后更新时间戳
-    workspace: str    # 会话所属工作目录
-    message_count: int # 当前会话消息数量
-    first_user_message: str="" # 第一条用户消息摘要
-    last_message: str="" # 最后一条消息摘要
+    updated_at: float  # 会话最后更新时间戳
+    workspace: str  # 会话所属工作目录
+    message_count: int = 0  # 当前会话消息数量
+    first_user_message: str = ""  # 第一条用户消息摘要
+    last_message: str = ""  # 最后一条消息摘要
 
-    def to_dict(self)->dict[str,Any]:
+    def to_dict(self) -> dict[str, Any]:
         """把 SessionMeta 转成可写入 JSON 的字典。"""
         return {
             "session_id": self.session_id,
@@ -35,11 +36,10 @@ class SessionMeta:
             "message_count": self.message_count,
             "first_user_message": self.first_user_message,
             "last_message": self.last_message,
-
         }
-    
+
     @classmethod
-    def from_dict(cls,data:dict[str,Any])->"SessionMeta":
+    def from_dict(cls, data: dict[str, Any]) -> "SessionMeta":
         """从字典恢复 SessionMeta。"""
         return cls(
             session_id=str(data["session_id"]),
@@ -64,7 +64,7 @@ class SessionData:
     meta: SessionMeta | None = None  # 会话元信息
     extra: dict[str, Any] = field(default_factory=dict)  # 预留扩展字段
 
-    def __post_init__(self)->None:
+    def __post_init__(self) -> None:
         """初始化后补齐 meta，但不主动刷新时间。"""
         if self.meta is None:
             self.meta = SessionMeta(
@@ -79,7 +79,6 @@ class SessionData:
             if self.messages:
                 self.sync_meta_fields()
 
-    
     def sync_meta_fields(self) -> None:
         """只同步摘要和计数，不修改 updated_at。"""
         # 防御式兜底
@@ -89,7 +88,7 @@ class SessionData:
                 created_at=self.created_at,
                 updated_at=self.updated_at,
                 workspace=self.workspace,
-            ) # type: ignore
+            )
 
         # 同步基础字段
         self.meta.updated_at = self.updated_at
@@ -100,20 +99,20 @@ class SessionData:
         self.meta.first_user_message = ""
         self.meta.last_message = ""
 
-        # 找第一条用户消息，作为开头摘要
+        # 找到第一条 user 消息，作为会话开头摘要
         for msg in self.messages:
             if msg.get("role") == "user":
                 self.meta.first_user_message = str(msg.get("content", ""))[:100]
                 break
 
-        # 从后往前找最后一条非空消息，作为结尾摘要
+        # 从后往前找最后一条有内容的消息，作为会话结尾摘要
         for msg in reversed(self.messages):
             content = str(msg.get("content", "")).strip()
             if content:
                 self.meta.last_message = content[:100]
                 break
 
-    def refresh_meta(self)->None:
+    def refresh_meta(self) -> None:
         """根据当前消息刷新元信息，并更新时间。"""
         # 只在真实会话变更时刷新 updated_at
         self.updated_at = time.time()
@@ -129,7 +128,7 @@ class SessionData:
         self.messages = list(messages)
         self.refresh_meta()
 
-    def to_dict(self)->dict[str,Any]:
+    def to_dict(self) -> dict[str, Any]:
         """把 SessionData 转成可写入 JSON 的字典。"""
         return {
             "session_id": self.session_id,
@@ -140,23 +139,22 @@ class SessionData:
             "meta": self.meta.to_dict() if self.meta else None,
             "extra": dict(self.extra),
         }
-    
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any],refresh:bool=False) -> "SessionData":
+    def from_dict(cls, data: dict[str, Any], refresh: bool = False) -> "SessionData":
         """从字典恢复 SessionData。"""
-        raw_meta = data.get("meta")  # 先取出 meta 原始数据
+        raw_meta = data.get("meta")
         meta = SessionMeta.from_dict(raw_meta) if isinstance(raw_meta, dict) else None
 
         raw_messages = data.get("messages", [])
         messages: list[ChatMessage] = []
 
-        # 做一层防御式过滤，避免脏数据直接混进历史
+        # 过滤脏数据，只接收 dict 形态的消息
         for item in raw_messages:
             if isinstance(item, dict):
-                messages.append(item) # type: ignore
+                messages.append(item)  # type: ignore[arg-type]
 
-        session= cls(
+        session = cls(
             session_id=str(data["session_id"]),
             created_at=float(data["created_at"]),
             updated_at=float(data["updated_at"]),
@@ -165,18 +163,18 @@ class SessionData:
             meta=meta,
             extra=dict(data.get("extra", {})),
         )
+
         # 只有显式要求时才刷新，避免覆盖磁盘中的原始时间
         if refresh:
             session.refresh_meta()
 
         return session
-    
 
 
 def create_new_session(workspace: str) -> SessionData:
     """创建一个新的空会话。"""
-    now = time.time()  # 当前时间同时作为创建时间和更新时间
-    session_id = uuid.uuid4().hex[:12]  # 生成一个短一点的会话 id
+    now = time.time()
+    session_id = uuid.uuid4().hex[:12]
 
     session = SessionData(
         session_id=session_id,
@@ -185,6 +183,7 @@ def create_new_session(workspace: str) -> SessionData:
         workspace=workspace,
         messages=[],
     )
+
     # 新会话创建后补一遍摘要字段
     session.refresh_meta()
     return session
@@ -221,7 +220,6 @@ def save_session(session: SessionData) -> Path:
 
     # 原子替换正式文件
     temp_file.replace(session_file)
-
     return session_file
 
 
@@ -285,6 +283,47 @@ def list_sessions(workspace: str) -> list[SessionMeta]:
     # 按更新时间倒序，最近的排前面
     metas.sort(key=lambda item: item.updated_at, reverse=True)
     return metas
+
+
+def format_session_list(metas: list[SessionMeta]) -> str:
+    """把会话列表格式化成适合终端展示的文本。"""
+    # 没有可恢复会话时直接返回提示
+    if not metas:
+        return "当前工作区没有可恢复的会话。"
+
+    # 收集最终输出的每一行
+    lines: list[str] = []
+
+    # 先输出标题
+    lines.append("可恢复的会话列表（按最近更新时间倒序）：")
+
+    # 逐条格式化会话信息
+    for index, meta in enumerate(metas, start=1):
+        # 把更新时间格式化到分钟，不显示秒
+        updated_text = time.strftime(
+            "%Y-%m-%d %H:%M",
+            time.localtime(meta.updated_at),
+        )
+
+        # 使用第一条用户消息作为摘要；没有则标记为空会话
+        summary = meta.first_user_message or "(空会话)"
+
+        # 摘要只展示前 15 个字符，避免列表过长
+        if len(summary) > 15:
+            summary = f"{summary[:15]}..."
+
+        # 第一行展示核心字段
+        lines.append(
+            f"{index}. session_id={meta.session_id} | "
+            f"updated_at={updated_text} | "
+            f"messages={meta.message_count}"
+        )
+
+        # 第二行展示摘要
+        lines.append(f"first_user_message={summary}")
+
+    # 拼接成最终字符串返回
+    return "\n".join(lines)
 
 
 def get_latest_session(workspace: str) -> SessionData | None:
