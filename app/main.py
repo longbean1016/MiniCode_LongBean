@@ -32,7 +32,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="指定要恢复的会话 ID",
     )
 
-    # 只允许固定恢复模式，避免误传其他值时偷偷新建会话
+    # 只允许固定恢复模式，避免误传其他值时误建会话
     parser.add_argument(
         "--resume",
         type=str,
@@ -46,7 +46,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 
 def _load_or_create_session(workspace: str, session_id: str, resume: str) -> SessionData:
     """按参数决定是恢复旧会话还是创建新会话。"""
-    # 优先级最高：显式指定 session_id
+    # 优先恢复指定会话
     if session_id:
         session = load_session(workspace, session_id)
         if session is None:
@@ -54,7 +54,7 @@ def _load_or_create_session(workspace: str, session_id: str, resume: str) -> Ses
         print(f"已恢复指定会话: {session.session_id}")
         return session
 
-    # 次优先级：恢复当前工作区最近一次会话
+    # 其次恢复当前工作区最近一次会话
     if resume == "latest":
         session = get_latest_session(workspace)
         if session is not None:
@@ -78,16 +78,16 @@ def main() -> None:
     parser = _build_arg_parser()
     args = parser.parse_args()
 
-    # 加载项目运行配置
+    # 加载项目配置
     config = load_config()
 
-    # 只要用户请求列会话，就打印后直接退出
+    # 只要用户请求列会话，就打印后退出
     if args.resume == "list":
         metas = list_sessions(config.workspace_root)
         print(format_session_list(metas))
         return
 
-    # 初始化默认工具注册表
+    # 初始化工具注册表
     tool_registry = build_tool_registry()
 
     # 初始化模型适配器
@@ -98,7 +98,7 @@ def main() -> None:
         tool_registry=tool_registry,
     )  # type: ignore[arg-type]
 
-    # 创建工具执行上下文，规定工具默认工作目录
+    # 创建工具执行上下文
     tool_context = ToolContext(
         cwd=config.workspace_root,
     )
@@ -111,7 +111,7 @@ def main() -> None:
         resume=args.resume or "",
     )
 
-    # 用已恢复的会话历史初始化当前运行时历史
+    # 用会话历史初始化当前运行时历史
     history: list[ChatMessage] = list(session.messages)
 
     print("LongBean MiniCode Agent 已启动，输入 quit 或 exit 退出。")
@@ -131,13 +131,14 @@ def main() -> None:
             print("Bye!")
             break
 
-        # 执行一轮 Agent 主流程
+        # 执行一轮 Agent 主流程，并传入 session_id 方便记录日志
         step, history = run_agent_once(
             user_input=user_input,
             model=model,
             tool_registry=tool_registry,
             tool_context=tool_context,
             history=history,
+            session_id=session.session_id,
         )
 
         # 每轮结束后把最新历史写回会话并保存
