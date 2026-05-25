@@ -32,12 +32,13 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="指定要恢复的会话 ID",
     )
 
-    # 指定恢复策略，目前支持 latest 和 list
+    # 只允许固定恢复模式，避免误传其他值时偷偷新建会话
     parser.add_argument(
         "--resume",
         type=str,
-        default="",
-        help="恢复模式，支持 latest 或 list，例如: --resume latest",
+        choices=["latest", "list"],
+        default=None,
+        help="恢复模式，只支持 latest 或 list，例如 --resume latest",
     )
 
     return parser
@@ -53,7 +54,7 @@ def _load_or_create_session(workspace: str, session_id: str, resume: str) -> Ses
         print(f"已恢复指定会话: {session.session_id}")
         return session
 
-    # 其次：恢复当前工作区最近一次会话
+    # 次优先级：恢复当前工作区最近一次会话
     if resume == "latest":
         session = get_latest_session(workspace)
         if session is not None:
@@ -80,8 +81,8 @@ def main() -> None:
     # 加载项目运行配置
     config = load_config()
 
-    # 如果用户要求列出会话列表，就打印后直接退出
-    if args.resume.strip().lower() == "list":
+    # 只要用户请求列会话，就打印后直接退出
+    if args.resume == "list":
         metas = list_sessions(config.workspace_root)
         print(format_session_list(metas))
         return
@@ -106,7 +107,8 @@ def main() -> None:
     session = _load_or_create_session(
         workspace=config.workspace_root,
         session_id=args.session.strip(),
-        resume=args.resume.strip().lower(),
+        # 没传 --resume 时兜底为空字符串，保持后续分支判断简单
+        resume=args.resume or "",
     )
 
     # 用已恢复的会话历史初始化当前运行时历史
