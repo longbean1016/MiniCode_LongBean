@@ -121,7 +121,7 @@ def main()-> None:
 
         # 退出前先保存当前会话
         if user_input.lower() in {"quit", "exit"}:
-            session.messages = list(history)
+            session.replace_messages(history)
             save_session(session)
             print("Bye!")
             break
@@ -136,7 +136,7 @@ def main()-> None:
         )
 
         # 每轮结束后把最新历史写回会话并保存
-        session.messages = list(history)
+        session.replace_messages(history)
         save_session(session)
 
         # 打印模型返回内容

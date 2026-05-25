@@ -124,6 +124,11 @@ class SessionData:
         self.messages.append(message)
         self.refresh_meta()
 
+    def replace_messages(self, messages: list[ChatMessage]) -> None:
+        """批量替换完整消息历史，并刷新元信息。"""
+        self.messages = list(messages)
+        self.refresh_meta()
+
     def to_dict(self)->dict[str,Any]:
         """把 SessionData 转成可写入 JSON 的字典。"""
         return {
