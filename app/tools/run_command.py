@@ -28,20 +28,19 @@ def _validate(input_data: Any) -> dict[str, str]:
 
 
 def _run(validated_input: dict[str, str], context: ToolContext) -> ToolResult:
-    """
-    执行命令并返回输出结果。
-    """
+    """执行命令并返回结果，包含权限检查、超时控制和输出截断。"""
+
     # 创建权限管理器，用于检查命令是否属于危险命令
     permission_manager = PermissionManager(context.cwd)
 
     # 取出用户输入的原始命令
     raw_command = validated_input["command"]
 
-    # 权限管理器检查命令是否合法
+     # 1) 命令安全检查（危险命令黑名单）
     permission_manager.ensure_command_allowed(raw_command)
 
     try:
-        # 在工作目录中执行命令，并捕获标准输出和标准错误
+        # 2) 执行命令（加超时，防止卡死）
         result = subprocess.run(
             raw_command,
             cwd=context.cwd,
@@ -49,33 +48,42 @@ def _run(validated_input: dict[str, str], context: ToolContext) -> ToolResult:
             capture_output=True,
             text=True,
             encoding="utf-8",
+            errors="replace",  # 编码异常时替换，避免抛错中断
+            timeout=permission_manager.get_command_timeout(),
+        )
+    except subprocess.TimeoutExpired:
+        # 3) 超时错误统一返回
+        return ToolResult(
+            ok=False,
+            output=f"命令执行超时：超过 {permission_manager.get_command_timeout()} 秒",
         )
     except Exception as error:
-        # 如果命令执行过程本身出错，返回失败结果
+        # 其他执行异常统一兜底
         return ToolResult(
             ok=False,
             output=f"命令执行失败: {error}",
         )
 
-    # 拼接标准输出和标准错误，方便调用方查看完整结果
+    # 组装 stdout/stderr
     output_parts: list[str] = []
-
     if result.stdout:
         output_parts.append(f"标准输出:\n{result.stdout.strip()}")
-
     if result.stderr:
         output_parts.append(f"标准错误:\n{result.stderr.strip()}")
 
-    output = "\n".join(part for part in output_parts if part)
+    output = "\n\n".join(output_parts).strip()
+    if not output:
+        output = "命令执行完成，但没有输出。"
 
-    # 返回码为 0 说明命令执行成功，否则视为失败
+    # 4) 截断超长输出，防止污染上下文
+    output = permission_manager.truncate_output(output)
+
     return ToolResult(
         ok=(result.returncode == 0),
-        output=output or "命令执行完成，但没有输出。",
+        output=output,
     )
 
 
-# 把 run_command 工具注册成统一定义
 run_command_tool = ToolDefinition(
     name="run_command",
     description="执行一条命令并返回输出结果",
@@ -86,9 +94,9 @@ run_command_tool = ToolDefinition(
         "properties": {
             "command": {
                 "type": "string",
-                "description": "要执行的命令，必须是非空字符串",
+                "description": "要执行的命令（非空字符串）",
             }
         },
         "required": ["command"],
-    }
+    },
 )
