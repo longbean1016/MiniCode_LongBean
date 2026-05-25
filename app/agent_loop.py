@@ -6,7 +6,7 @@ from app.logger import log_event
 from app.message_builder import MessageBuilder
 from app.prompt import build_system_prompt
 from app.tooling import ToolRegistry
-from app.types import AgentStep, ChatMessage, ModelAdapter, ToolContext, ToolResult
+from app.types import AgentStep, ApprovalRequest, ChatMessage, ModelAdapter, ToolContext, ToolResult
 
 
 def run_agent_once(
@@ -82,7 +82,7 @@ def run_agent_once(
                 kind="final",
             )
             builder.add_assistant(fallback.content)
-            return fallback, builder.build()
+            return fallback, builder.build() # type: ignore
 
         # 情况一：模型直接返回最终答案
         if step.type == "assistant":
@@ -141,12 +141,6 @@ def run_agent_once(
                         context=tool_context,
                     )
 
-                    # 记录工具执行结果和耗时
-                    tool_cost = time.perf_counter() - tool_started_at
-                    log_event(
-                        f"[session={session_id or '-'}] 第 {step_index + 1} 轮工具 {tool_name} "
-                        f"执行完成 ok={result.ok} 耗时={tool_cost:.3f}s"
-                    )
                 except Exception as error:
                     # 理论上 registry 已经兜底，这里是主循环最后一层保险
                     tool_cost = time.perf_counter() - tool_started_at
@@ -161,12 +155,39 @@ def run_agent_once(
                         meta={"tool_name": tool_name},
                     )
 
-                # 记录工具返回状态
+                tool_cost = time.perf_counter() - tool_started_at
                 log_event(
-                    f"[session={session_id or '-'}] 第 {step_index + 1} 轮工具 {tool_name} 返回 ok={result.ok}"
+                    f"[session={session_id or '-'}] 第 {step_index + 1} 轮工具 {tool_name} "
+                    f"返回 ok={result.ok} error={result.error} 耗时={tool_cost:.3f}s"
                 )
 
-                # 始终把工具结果喂回模型
+                # 命中“需要授权”时，不继续喂模型，而是把审批请求返回给 main
+                if result.error=="PERMISSION_REQUIRED":
+                    command=str(result.meta.get("command", ""))
+                    reason = str(result.meta.get("reason", ""))
+                    action_key = str(result.meta.get("action_key", ""))
+
+                    approval_message = (
+                        "该操作需要用户授权。\n"
+                        f"工具: {tool_name}\n"
+                        f"命令: {command}\n"
+                        f"原因: {reason}"
+                    )
+
+                    approval_step = AgentStep(
+                        type="approval",
+                        content=approval_message,
+                        approval=ApprovalRequest(
+                            tool_name=tool_name,
+                            tool_use_id=tool_use_id,
+                            action_key=action_key,
+                            message=approval_message,
+                            input_data=tool_input,
+                        ),
+                    )
+                    return approval_step, builder.build()
+
+                # 正常情况才把工具结果写回消息历史
                 builder.add_tool_result(
                     tool_use_id=tool_use_id,
                     tool_name=tool_name,
@@ -182,9 +203,6 @@ def run_agent_once(
             continue
 
         # 情况三：遇到未知返回类型时兜底退出
-        log_event(
-            f"[session={session_id or '-'}] 第 {step_index + 1} 轮出现未识别返回类型: {step.type}"
-        )
         fallback = AgentStep(
             type="assistant",
             content="未识别的模型返回类型。",

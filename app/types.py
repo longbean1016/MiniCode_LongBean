@@ -48,6 +48,21 @@ class StepDiagnostics:
 
 
 @dataclass(slots=True)
+class ApprovalRequest:
+    """"
+        表示一次待用户确认的授权请求
+    """
+
+    tool_name: str # 哪个工具触发了授予权限
+    tool_use_id: str # 本次工具调用id
+    action_key: str  # 本次授权的唯一键，用于批准后重试
+    message:str # 给终端展示的提示文案
+    input_data: Any  # 原始工具输入，批准后用于重试
+
+
+
+
+@dataclass(slots=True)
 class AgentStep:
     """
     表示模型执行一步后的统一结果。
@@ -55,12 +70,13 @@ class AgentStep:
     agent loop 会根据 type 决定下一步是继续对话还是执行工具。
 
     """
-    type:Literal["assistant","tool_calls"]
+    type:Literal["assistant","tool_calls","approval"]
     content: str=""
     kind: Literal["final","progress"]|None=None # 表示这条 assistant 内容属于哪种回答阶段。
     calls: list[ToolCall]=field(default_factory=list) # 本步需要执行的工具调用列表。当 type="tool_calls" 时，这里会有一个或多个 ToolCall。
     content_kind: Literal["progress"]|None=None # 表示内容类型的更细粒度标记。
     diagnostics: StepDiagnostics|None=None #附带的诊断信息。
+    approval: ApprovalRequest|None=None  # 只有 type="approval" 时使用
 
 
 class ModelAdapter(Protocol):
@@ -116,6 +132,7 @@ class ToolContext:
     """
 
     cwd: str # 当前工具执行时的工作目录
+    approved_actions: set[str] = field(default_factory=set)  # 当前会话内已批准的动作键
 
 
 

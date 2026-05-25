@@ -131,7 +131,12 @@ def main() -> None:
             print("Bye!")
             break
 
-        # 执行一轮 Agent 主流程，并传入 session_id 方便记录日志
+        # 先保存本轮开始前的历史。
+        # 如果后面触发授权重试，需要从这个“干净历史”重新跑，
+        # 避免把中途产生的 user / tool_call 重复写进会话。
+        base_history = list(history)
+
+        # 先正常跑一轮 Agent
         step, history = run_agent_once(
             user_input=user_input,
             model=model,
@@ -141,7 +146,37 @@ def main() -> None:
             session_id=session.session_id,
         )
 
-        # 每轮结束后把最新历史写回会话并保存
+        # 如果这一步要求授权，就在终端里询问用户
+        if step.type == "approval" and step.approval is not None:
+            print(step.approval.message)
+            answer = input("是否允许本次执行？(y/n)> ").strip().lower()
+
+            if answer == "y":
+                # 批准后，把动作键加入当前会话上下文。
+                # 同一会话里再次遇到同一条高风险命令时就可以直接放行。
+                tool_context.approved_actions.add(step.approval.action_key)
+
+                # 从本轮开始前的干净历史重新跑一遍。
+                # 不直接复用 approval 返回后的 history，
+                # 否则会重复追加同一条 user 消息和 tool_call 记录。
+                step, history = run_agent_once(
+                    user_input=user_input,
+                    model=model,
+                    tool_registry=tool_registry,
+                    tool_context=tool_context,
+                    history=base_history,
+                    session_id=session.session_id,
+                )
+            else:
+                # 拒绝后恢复到本轮开始前的历史，
+                # 避免把未真正执行的授权请求残留到会话里。
+                history = base_history
+
+                # 拒绝后不执行危险操作，直接给出提示
+                print("Agent> 用户已拒绝此次高风险操作。")
+                continue
+
+        # 每轮结束后保存最新会话
         session.replace_messages(history)
         save_session(session)
 
