@@ -19,20 +19,61 @@ def run_agent_once(
     session_id: str = "",
 ) -> tuple[AgentStep, list[ChatMessage]]:
     """执行一轮 agent 主循环：模型 -> 工具 -> 再模型，直到完成或达到上限。"""
-    # 记录整轮请求开始时间
-    loop_started_at = time.perf_counter()
-
     # 没有历史时用空列表兜底
     if history is None:
         history = []
-
-    # 构建系统提示词
-    system_prompt = build_system_prompt(tool_registry)
 
     # 用 MessageBuilder 统一管理本轮消息
     builder = MessageBuilder()
     builder.extend(history)
     builder.add_user(user_input)
+
+    # 从“新用户输入”开始进入主循环
+    return _run_agent_loop(
+        builder=builder,
+        model=model,
+        tool_registry=tool_registry,
+        tool_context=tool_context,
+        max_steps=max_steps,
+        session_id=session_id,
+    )
+
+
+def continue_agent_from_history(
+    history: list[ChatMessage],
+    model: ModelAdapter,
+    tool_registry: ToolRegistry,
+    tool_context: ToolContext,
+    max_steps: int = 8,
+    session_id: str = "",
+) -> tuple[AgentStep, list[ChatMessage]]:
+    """基于已有历史继续主循环，不再追加新的 user 消息。"""
+    builder = MessageBuilder()
+    builder.extend(history)
+    return _run_agent_loop(
+        builder=builder,
+        model=model,
+        tool_registry=tool_registry,
+        tool_context=tool_context,
+        max_steps=max_steps,
+        session_id=session_id,
+    )
+
+
+def _run_agent_loop(
+    builder: MessageBuilder,
+    model: ModelAdapter,
+    tool_registry: ToolRegistry,
+    tool_context: ToolContext,
+    max_steps: int,
+    session_id: str,
+) -> tuple[AgentStep, list[ChatMessage]]:
+    """执行真正的模型/工具循环，既可用于新请求，也可用于授权后的继续执行。"""
+    # 记录整轮请求开始时间
+    loop_started_at = time.perf_counter()
+
+    # 构建系统提示词
+    system_prompt = build_system_prompt(tool_registry)
 
     # 记录本轮请求开始
     log_event(
@@ -166,6 +207,15 @@ def run_agent_once(
                     command=str(result.meta.get("command", ""))
                     reason = str(result.meta.get("reason", ""))
                     action_key = str(result.meta.get("action_key", ""))
+
+                    # 授权中断前也要补一条 tool_result，避免历史里只留下 tool_call
+                    # 否则下一轮把这段历史再发给模型时，会因为协议断链而报 400
+                    builder.add_tool_result(
+                        tool_use_id=tool_use_id,
+                        tool_name=tool_name,
+                        content="该操作需要用户授权，当前尚未执行。",
+                        is_error=True,
+                    )
 
                     approval_message = (
                         "该操作需要用户授权。\n"

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 
-from app.agent_loop import run_agent_once
+from app.agent_loop import continue_agent_from_history, run_agent_once
 from app.config import load_config
 from app.model_registry import OpenAIModelAdapter
 from app.session import (
@@ -72,6 +72,54 @@ def _load_or_create_session(workspace: str, session_id: str, resume: str) -> Ses
     return session
 
 
+def _replace_pending_tool_result(
+    history: list[ChatMessage],
+    tool_use_id: str,
+    tool_name: str,
+    content: str,
+    is_error: bool,
+) -> list[ChatMessage]:
+    """按 tool_use_id 精确替换待授权的占位 tool_result，避免误删其他历史。"""
+    updated_history: list[ChatMessage] = []
+    replaced = False
+
+    for msg in history:
+        # 只替换目标 tool_use_id 对应的那条 tool_result
+        if (
+            msg.get("role") == "tool_result"
+            and msg.get("tool_use_id") == tool_use_id
+            and not replaced
+        ):
+            updated_history.append(
+                {
+                    "role": "tool_result",
+                    "tool_use_id": tool_use_id,
+                    "tool_name": tool_name,
+                    "content": content,
+                    "is_error": is_error,
+                }
+            )
+            replaced = True
+            continue
+
+        # 其他历史原样保留
+        updated_history.append(msg)
+
+    # 正常情况下应当能找到占位结果；兜底时补一条真实结果，避免历史断链
+    if not replaced:
+        updated_history.append(
+            {
+                "role": "tool_result",
+                "tool_use_id": tool_use_id,
+                "tool_name": tool_name,
+                "content": content,
+                "is_error": is_error,
+            }
+        )
+
+    return updated_history
+
+
 def main() -> None:
     """程序入口：加载配置、恢复会话、启动命令行对话循环。"""
     # 解析命令行参数
@@ -131,11 +179,6 @@ def main() -> None:
             print("Bye!")
             break
 
-        # 先保存本轮开始前的历史。
-        # 如果后面触发授权重试，需要从这个“干净历史”重新跑，
-        # 避免把中途产生的 user / tool_call 重复写进会话。
-        base_history = list(history)
-
         # 先正常跑一轮 Agent
         step, history = run_agent_once(
             user_input=user_input,
@@ -156,23 +199,32 @@ def main() -> None:
                 # 同一会话里再次遇到同一条高风险命令时就可以直接放行。
                 tool_context.approved_actions.add(step.approval.action_key)
 
-                # 从本轮开始前的干净历史重新跑一遍。
-                # 不直接复用 approval 返回后的 history，
-                # 否则会重复追加同一条 user 消息和 tool_call 记录。
-                step, history = run_agent_once(
-                    user_input=user_input,
+                # 批准后不再重问模型，而是直接把待授权工具真正执行掉。
+                result = tool_registry.execute_tool(
+                    tool_name=step.approval.tool_name,
+                    input_data=step.approval.input_data,
+                    context=tool_context,
+                )
+
+                # 按 tool_use_id 精确替换占位结果，避免误删或漏掉其他消息。
+                approved_history = _replace_pending_tool_result(
+                    history=history,
+                    tool_use_id=step.approval.tool_use_id,
+                    tool_name=step.approval.tool_name,
+                    content=result.output,
+                    is_error=not result.ok,
+                )
+
+                # 再从“真实 tool_result 已写回”的历史继续跑模型总结。
+                step, history = continue_agent_from_history(
+                    history=approved_history,
                     model=model,
                     tool_registry=tool_registry,
                     tool_context=tool_context,
-                    history=base_history,
                     session_id=session.session_id,
                 )
             else:
-                # 拒绝后恢复到本轮开始前的历史，
-                # 避免把未真正执行的授权请求残留到会话里。
-                history = base_history
-
-                # 拒绝后不执行危险操作，直接给出提示
+                # 拒绝后保留授权提示这段历史，但不执行危险操作。
                 print("Agent> 用户已拒绝此次高风险操作。")
                 continue
 
