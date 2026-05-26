@@ -7,6 +7,7 @@ from app.message_builder import MessageBuilder
 from app.prompt import build_system_prompt
 from app.tooling import ToolRegistry
 from app.types import AgentStep, ApprovalRequest, ChatMessage, ModelAdapter, ToolContext, ToolResult
+from app.working_memory import WorkingMemory
 
 
 def run_agent_once(
@@ -14,6 +15,7 @@ def run_agent_once(
     model: ModelAdapter,
     tool_registry: ToolRegistry,
     tool_context: ToolContext,
+    working_memory: WorkingMemory,
     history: list[ChatMessage] | None = None,
     max_steps: int = 8,
     session_id: str = "",
@@ -35,6 +37,7 @@ def run_agent_once(
         tool_registry=tool_registry,
         tool_context=tool_context,
         max_steps=max_steps,
+        working_memory=working_memory,
         session_id=session_id,
     )
 
@@ -43,6 +46,7 @@ def continue_agent_from_history(
     history: list[ChatMessage],
     model: ModelAdapter,
     tool_registry: ToolRegistry,
+    working_memory: WorkingMemory,
     tool_context: ToolContext,
     max_steps: int = 8,
     session_id: str = "",
@@ -56,6 +60,7 @@ def continue_agent_from_history(
         tool_registry=tool_registry,
         tool_context=tool_context,
         max_steps=max_steps,
+        working_memory=working_memory,
         session_id=session_id,
     )
 
@@ -66,6 +71,7 @@ def _run_agent_loop(
     tool_registry: ToolRegistry,
     tool_context: ToolContext,
     max_steps: int,
+    working_memory: WorkingMemory,
     session_id: str,
 ) -> tuple[AgentStep, list[ChatMessage]]:
     """执行真正的模型/工具循环，既可用于新请求，也可用于授权后的继续执行。"""
@@ -117,6 +123,8 @@ def _run_agent_loop(
             log_event(
                 f"[session={session_id or '-'}] 第 {step_index + 1} 轮模型调用异常: {error}"
             )
+            # 记录最近一次模型失败，后面做 prompt 注入时可以提醒模型避坑
+            working_memory.add_failure(f"模型调用失败: {error}")
             fallback = AgentStep(
                 type="assistant",
                 content=f"模型调用失败: {error}",
@@ -158,6 +166,11 @@ def _run_agent_loop(
                 tool_name = call["tool_name"]
                 tool_input = call["input"]
                 tool_use_id = call["id"]
+                # 如果工具参数里带 path，说明这个路径是当前任务的活跃路径
+                if isinstance(tool_input, dict):
+                    raw_path = tool_input.get("path")
+                    if isinstance(raw_path, str) and raw_path.strip():
+                        working_memory.add_active_path(raw_path)
 
                 # 先把工具调用请求记到历史里
                 builder.add_tool_call(
@@ -201,6 +214,10 @@ def _run_agent_loop(
                     f"[session={session_id or '-'}] 第 {step_index + 1} 轮工具 {tool_name} "
                     f"返回 ok={result.ok} error={result.error} 耗时={tool_cost:.3f}s"
                 )
+                # 工具失败时，把错误记进短期工作记忆
+                if not result.ok:
+                    failure_text = result.error or result.output
+                    working_memory.add_failure(f"{tool_name}: {failure_text}")
 
                 # 命中“需要授权”时，不继续喂模型，而是把审批请求返回给 main
                 if result.error=="PERMISSION_REQUIRED":
