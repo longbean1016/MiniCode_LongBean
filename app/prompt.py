@@ -58,7 +58,10 @@ def _build_response_style()->str:
     
 
 
-def build_system_prompt(tool_registry: ToolRegistry) -> str:
+def build_system_prompt(
+    tool_registry: ToolRegistry,
+    memory_context: str = "",
+) -> str:
     """拼装分层系统提示词，供主循环每轮发送给模型。"""
     sections = [
         "【角色约束】\n" + _build_role_constraints(),
@@ -66,4 +69,10 @@ def build_system_prompt(tool_registry: ToolRegistry) -> str:
         "【失败重试策略】\n" + _build_retry_policy(),
         "【回答风格】\n" + _build_response_style(),
     ]
+
+    # 记忆上下文属于每轮都可能变化的动态部分。
+    # 只有在确实有内容时才加入，避免 system prompt 里出现空标题。
+    if memory_context.strip():
+        sections.append("【记忆上下文】\n" + memory_context.strip())
+
     return "\n\n".join(sections).strip()

@@ -4,6 +4,7 @@ import argparse
 
 from app.agent_loop import continue_agent_from_history, run_agent_once
 from app.config import load_config
+from app.memory_store import JsonMemoryStore
 from app.model_registry import OpenAIModelAdapter
 from app.session import (
     SessionData,
@@ -141,6 +142,10 @@ def main() -> None:
         cwd=config.workspace_root,
     )
 
+    # 长期记忆先落到本地 JSON。
+    # 后面如果要换成向量库，只需要替换这一行的具体实现。
+    memory_store = JsonMemoryStore(config.workspace_root)
+
     # 当前会话的短期工作记忆
     working_memory = WorkingMemory()
 
@@ -174,7 +179,9 @@ def main() -> None:
             model=model,
             tool_registry=tool_registry,
             tool_context=tool_context,
+            session=session,
             working_memory=working_memory,
+            memory_store=memory_store,
             history=history,
             session_id=session.session_id,
         )
@@ -208,7 +215,9 @@ def main() -> None:
                     model=model,
                     tool_registry=tool_registry,
                     tool_context=tool_context,
+                    session=session,
                     working_memory=working_memory,
+                    memory_store=memory_store,
                     session_id=session.session_id,
                 )
             else:

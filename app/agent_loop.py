@@ -3,8 +3,11 @@ from __future__ import annotations
 import time
 
 from app.logger import log_event
+from app.memory_context_builder import build_memory_context
+from app.memory_store import MemoryStore
 from app.message_builder import MessageBuilder
 from app.prompt import build_system_prompt
+from app.session import SessionData
 from app.tooling import ToolRegistry
 from app.types import AgentStep, ApprovalRequest, ChatMessage, ModelAdapter, ToolContext, ToolResult
 from app.working_memory import WorkingMemory
@@ -15,7 +18,9 @@ def run_agent_once(
     model: ModelAdapter,
     tool_registry: ToolRegistry,
     tool_context: ToolContext,
+    session: SessionData,
     working_memory: WorkingMemory,
+    memory_store: MemoryStore | None,
     history: list[ChatMessage] | None = None,
     max_steps: int = 8,
     session_id: str = "",
@@ -36,8 +41,10 @@ def run_agent_once(
         model=model,
         tool_registry=tool_registry,
         tool_context=tool_context,
+        session=session,
         max_steps=max_steps,
         working_memory=working_memory,
+        memory_store=memory_store,
         session_id=session_id,
     )
 
@@ -46,8 +53,10 @@ def continue_agent_from_history(
     history: list[ChatMessage],
     model: ModelAdapter,
     tool_registry: ToolRegistry,
-    working_memory: WorkingMemory,
     tool_context: ToolContext,
+    session: SessionData,
+    working_memory: WorkingMemory,
+    memory_store: MemoryStore | None,
     max_steps: int = 8,
     session_id: str = "",
 ) -> tuple[AgentStep, list[ChatMessage]]:
@@ -59,8 +68,10 @@ def continue_agent_from_history(
         model=model,
         tool_registry=tool_registry,
         tool_context=tool_context,
+        session=session,
         max_steps=max_steps,
         working_memory=working_memory,
+        memory_store=memory_store,
         session_id=session_id,
     )
 
@@ -70,16 +81,15 @@ def _run_agent_loop(
     model: ModelAdapter,
     tool_registry: ToolRegistry,
     tool_context: ToolContext,
+    session: SessionData,
     max_steps: int,
     working_memory: WorkingMemory,
+    memory_store: MemoryStore | None,
     session_id: str,
 ) -> tuple[AgentStep, list[ChatMessage]]:
     """执行真正的模型/工具循环，既可用于新请求，也可用于授权后的继续执行。"""
     # 记录整轮请求开始时间
     loop_started_at = time.perf_counter()
-
-    # 构建系统提示词
-    system_prompt = build_system_prompt(tool_registry)
 
     # 记录本轮请求开始
     log_event(
@@ -94,6 +104,34 @@ def _run_agent_loop(
         # 记录当前是第几轮循环
         log_event(
             f"[session={session_id or '-'}] 第 {step_index + 1} 轮循环开始"
+        )
+
+        # 用当前 builder 里的最新消息快照构造一份临时会话对象。
+        # 这样可以让会话摘要跟随本轮新增的 user/tool/result 实时更新，
+        # 但又不会提前改动 main.py 里真正持久化的 session 对象。
+        session_snapshot = SessionData(
+            session_id=session.session_id,
+            created_at=session.created_at,
+            updated_at=session.updated_at,
+            workspace=session.workspace,
+            messages=list(builder.build()),
+            extra=dict(session.extra),
+        )
+
+        # 把“会话摘要 + 短期工作记忆 + 长期记忆检索结果”拼成一段辅助上下文。
+        # 这段内容会被注入 system prompt，而不是直接改写原始 history 结构。
+        memory_context = build_memory_context(
+            user_input=working_memory.current_goal,
+            session=session_snapshot,
+            working_memory=working_memory,
+            memory_store=memory_store,
+        )
+
+        # 每一轮都按最新记忆上下文重新构造系统提示词，
+        # 这样模型能看到刚刚更新过的 summary / working memory / 长期记忆。
+        system_prompt = build_system_prompt(
+            tool_registry=tool_registry,
+            memory_context=memory_context,
         )
 
         # 每一轮都把系统提示词和最新历史发给模型
