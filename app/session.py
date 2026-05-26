@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from app.session_summary import build_session_summary
 from app.types import ChatMessage
 
 
@@ -25,6 +26,7 @@ class SessionMeta:
     message_count: int = 0  # 当前会话消息数量
     first_user_message: str = ""  # 第一条用户消息摘要
     last_message: str = ""  # 最后一条消息摘要
+    summary: str = ""       # 会话历史消息摘要
 
     def to_dict(self) -> dict[str, Any]:
         """把 SessionMeta 转成可写入 JSON 的字典。"""
@@ -36,6 +38,7 @@ class SessionMeta:
             "message_count": self.message_count,
             "first_user_message": self.first_user_message,
             "last_message": self.last_message,
+            "summary": self.summary,
         }
 
     @classmethod
@@ -49,6 +52,7 @@ class SessionMeta:
             message_count=int(data.get("message_count", 0)),
             first_user_message=str(data.get("first_user_message", "")),
             last_message=str(data.get("last_message", "")),
+            summary=str(data.get("summary", "")),
         )
 
 
@@ -111,6 +115,7 @@ class SessionData:
             if content:
                 self.meta.last_message = content[:100]
                 break
+        self.meta.summary = build_session_summary(self.messages)
 
     def refresh_meta(self) -> None:
         """根据当前消息刷新元信息，并更新时间。"""
