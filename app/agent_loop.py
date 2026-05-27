@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import time
 
+from app.compaction_policy import build_compaction_policy
 from app.history_window import build_older_history_summary, select_history_window
+from app.history_summarizer import OlderHistorySummarizer
 from app.logger import log_event
 from app.memory_context_builder import build_memory_context
 from app.memory_store import MemoryStore
@@ -27,6 +29,7 @@ def run_agent_once(
     session: SessionData,
     working_memory: WorkingMemory,
     memory_store: MemoryStore | None,
+    history_summarizer: OlderHistorySummarizer | None = None,
     history: list[ChatMessage] | None = None,
     max_steps: int = 8,
     session_id: str = "",
@@ -51,6 +54,7 @@ def run_agent_once(
         max_steps=max_steps,
         working_memory=working_memory,
         memory_store=memory_store,
+        history_summarizer=history_summarizer,
         session_id=session_id,
     )
 
@@ -63,6 +67,7 @@ def continue_agent_from_history(
     session: SessionData,
     working_memory: WorkingMemory,
     memory_store: MemoryStore | None,
+    history_summarizer: OlderHistorySummarizer | None = None,
     max_steps: int = 8,
     session_id: str = "",
 ) -> tuple[AgentStep, list[ChatMessage]]:
@@ -78,6 +83,7 @@ def continue_agent_from_history(
         max_steps=max_steps,
         working_memory=working_memory,
         memory_store=memory_store,
+        history_summarizer=history_summarizer,
         session_id=session_id,
     )
 
@@ -91,6 +97,7 @@ def _run_agent_loop(
     max_steps: int,
     working_memory: WorkingMemory,
     memory_store: MemoryStore | None,
+    history_summarizer: OlderHistorySummarizer | None,
     session_id: str,
 ) -> tuple[AgentStep, list[ChatMessage]]:
     """执行真正的模型/工具循环，既可用于新请求，也可用于授权后的继续执行。"""
@@ -119,20 +126,31 @@ def _run_agent_loop(
 
         # 按 user 消息把完整历史切成多轮，只保留最近几轮完整消息。
         # 更老的历史转交给摘要层，避免上下文无限增长。
+        compaction_policy = build_compaction_policy(session)
+
         history_window = select_history_window(
             history=full_history,
-            keep_rounds=6,
+            keep_rounds=compaction_policy.keep_rounds,
         )
 
         # 旧历史只保留主线摘要，不再原样透传。
-        older_history_summary = build_older_history_summary(
-            history_window.older_messages,
-        )
+        # 旧历史摘要优先走模型版摘要器。
+        # 如果外面没有传摘要器，就自动退回现有的规则摘要。
+        if history_summarizer is not None:
+            older_history_summary = history_summarizer.summarize(
+                session=session,
+                older_messages=history_window.older_messages,
+                older_round_count=history_window.older_round_count,
+            )
+        else:
+            older_history_summary = build_older_history_summary(
+                history_window.older_messages,
+            )
 
         # 记录本轮上下文裁剪结果，方便观察最近窗口策略是否生效。
         log_event(
             f"[session={session_id or '-'}] 第 {step_index + 1} 轮上下文窗口: "
-            f"older={len(history_window.older_messages)} recent={len(history_window.recent_messages)}"
+            f"level={compaction_policy.level} keep_rounds={compaction_policy.keep_rounds} older={len(history_window.older_messages)} recent={len(history_window.recent_messages)}"
         )
 
         # 用最近几轮原始消息构造临时会话快照。

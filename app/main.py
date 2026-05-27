@@ -4,6 +4,7 @@ import argparse
 
 from app.agent_loop import continue_agent_from_history, run_agent_once
 from app.config import load_config
+from app.history_summarizer import OlderHistorySummarizer
 from app.memory_extractor import LongTermMemoryExtractor
 from app.memory_store import JsonMemoryStore, MemoryEntry
 from app.model_registry import OpenAIModelAdapter
@@ -215,6 +216,14 @@ def main() -> None:
         model_name=config.model,
     )
 
+    # 旧历史摘要器只服务于 prompt 构造时的 older history summary。
+    # 它带运行期缓存，避免每轮循环都重复调用模型做摘要。
+    history_summarizer = OlderHistorySummarizer(
+        api_key=config.api_key,
+        base_url=config.base_url,
+        model_name=config.model,
+    )
+
     session = _load_or_create_session(
         workspace=config.workspace_root,
         session_id=args.session.strip(),
@@ -248,6 +257,7 @@ def main() -> None:
             session=session,
             working_memory=working_memory,
             memory_store=memory_store,
+            history_summarizer=history_summarizer,
             history=history,
             session_id=session.session_id,
         )
@@ -284,6 +294,7 @@ def main() -> None:
                     session=session,
                     working_memory=working_memory,
                     memory_store=memory_store,
+                    history_summarizer=history_summarizer,
                     session_id=session.session_id,
                 )
             else:
