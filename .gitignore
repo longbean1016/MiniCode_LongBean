@@ -73,6 +73,7 @@ transcripts/
 runtime/
 workspace_state/
 .cache/
+.memory
 
 # =========================
 # IDE / 编辑器配置

@@ -12,6 +12,11 @@ from app.session import SessionData
 from app.tooling import ToolRegistry
 from app.types import AgentStep, ApprovalRequest, ChatMessage, ModelAdapter, ToolContext, ToolResult
 from app.working_memory import WorkingMemory
+from app.working_memory_updater import (
+    extract_active_paths,
+    extract_decision_from_assistant,
+    summarize_failure,
+)
 
 
 def run_agent_once(
@@ -200,6 +205,12 @@ def _run_agent_loop(
         if step.type == "assistant":
             builder.add_assistant(step.content)
 
+            # 从最终 assistant 回复里尝试抽一条关键决策。
+            # 这不是为了记录所有回答，而是尽量保留“已经确认的方向或约束”。
+            decision = extract_decision_from_assistant(step.content)
+            if decision:
+                working_memory.add_decision(decision)
+
             # 记录当前 step 和整轮总耗时
             step_cost = time.perf_counter() - step_started_at
             total_cost = time.perf_counter() - loop_started_at
@@ -229,11 +240,11 @@ def _run_agent_loop(
                 tool_name = call["tool_name"]
                 tool_input = call["input"]
                 tool_use_id = call["id"]
-                # 如果工具参数里带 path，说明这个路径是当前任务的活跃路径
-                if isinstance(tool_input, dict):
-                    raw_path = tool_input.get("path")
-                    if isinstance(raw_path, str) and raw_path.strip():
-                        working_memory.add_active_path(raw_path)
+
+                # 从工具输入里尽量提取活跃路径。
+                # 这一步会覆盖 path / file_path / directory / run_command 等常见形式。
+                for path in extract_active_paths(tool_name, tool_input):
+                    working_memory.add_active_path(path)
 
                 # 先把工具调用请求记到历史里
                 builder.add_tool_call(
@@ -277,10 +288,12 @@ def _run_agent_loop(
                     f"[session={session_id or '-'}] 第 {step_index + 1} 轮工具 {tool_name} "
                     f"返回 ok={result.ok} error={result.error} 耗时={tool_cost:.3f}s"
                 )
-                # 工具失败时，把错误记进短期工作记忆
+
+                # 工具失败时，把错误压成短摘要写进短期工作记忆。
                 if not result.ok:
-                    failure_text = result.error or result.output
-                    working_memory.add_failure(f"{tool_name}: {failure_text}")
+                    working_memory.add_failure(
+                        summarize_failure(tool_name, result)
+                    )
 
                 # 命中“需要授权”时，不继续喂模型，而是把审批请求返回给 main
                 if result.error=="PERMISSION_REQUIRED":

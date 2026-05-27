@@ -4,7 +4,8 @@ import argparse
 
 from app.agent_loop import continue_agent_from_history, run_agent_once
 from app.config import load_config
-from app.memory_store import JsonMemoryStore
+from app.memory_extractor import LongTermMemoryExtractor
+from app.memory_store import JsonMemoryStore, MemoryEntry
 from app.model_registry import OpenAIModelAdapter
 from app.session import (
     SessionData,
@@ -15,6 +16,7 @@ from app.session import (
     load_session,
     save_session,
 )
+from app.turn_history import get_last_round_messages
 from app.tools import build_tool_registry
 from app.types import ChatMessage, ToolContext
 from app.working_memory import WorkingMemory
@@ -116,6 +118,63 @@ def _replace_pending_tool_result(
     return updated_history
 
 
+def _should_extract_long_term_memory(step_content: str) -> bool:
+    """判断这次最终回复是否适合触发长期记忆抽取。"""
+    # 空回复不抽。
+    text = step_content.strip()
+    if not text:
+        return False
+
+    # 这些是内部兜底回复，不适合作为长期记忆抽取的“最终结果”。
+    blocked_prefixes = (
+        "模型调用失败:",
+        "已达到最大循环步数",
+        "未识别的模型返回类型",
+        "模型返回了空的工具调用",
+    )
+    return not text.startswith(blocked_prefixes)
+
+
+def _persist_extracted_memories(
+    memory_store: JsonMemoryStore,
+    entries: list[MemoryEntry],
+) -> int:
+    """
+    把抽取出来的长期记忆写入 memory store。
+
+    写入前再做一层本地去重，
+    避免相同 category + content 被重复写入。
+    """
+    # 先读取已有长期记忆，构造一个稳定的去重键集合。
+    existing_keys = {
+        (
+            entry.category.strip().lower(),
+            " ".join(entry.content.strip().lower().split()),
+        )
+        for entry in memory_store.load_memories()
+        if entry.content.strip()
+    }
+
+    stored_count = 0
+
+    for entry in entries:
+        # 当前候选记忆的去重键。
+        dedupe_key = (
+            entry.category.strip().lower(),
+            " ".join(entry.content.strip().lower().split()),
+        )
+
+        # 已存在就跳过，不重复写。
+        if dedupe_key in existing_keys:
+            continue
+
+        memory_store.add_memory(entry)
+        existing_keys.add(dedupe_key)
+        stored_count += 1
+
+    return stored_count
+
+
 def main() -> None:
     """程序入口：加载配置、恢复会话、启动命令行对话循环。"""
     parser = _build_arg_parser()
@@ -148,6 +207,13 @@ def main() -> None:
 
     # 当前会话的短期工作记忆
     working_memory = WorkingMemory()
+
+    # 长期记忆抽取器：负责从“当前一轮完整消息”里提炼可复用记忆。
+    memory_extractor = LongTermMemoryExtractor(
+        api_key=config.api_key,
+        base_url=config.base_url,
+        model_name=config.model,
+    )
 
     session = _load_or_create_session(
         workspace=config.workspace_root,
@@ -225,6 +291,26 @@ def main() -> None:
                 working_memory.add_failure("用户拒绝了高风险操作授权")
                 print("Agent> 用户已拒绝此次高风险操作。")
                 continue
+
+        # 只有真正得到最终 assistant 回复时，才尝试做长期记忆抽取。
+        if step.type == "assistant" and _should_extract_long_term_memory(step.content):
+            try:
+                # 从完整 history 里取出最后一轮消息，避免拿全量历史去抽长期记忆。
+                last_round_messages = get_last_round_messages(history)
+
+                # 基于“当前用户输入 + 本轮最终结果 + 本轮完整消息链”抽取长期记忆。
+                extracted_memories = memory_extractor.extract_from_turn(
+                    user_input=user_input,
+                    final_step=step,
+                    turn_messages=last_round_messages,
+                    session_id=session.session_id,
+                )
+
+                # 写入前再做一层去重保护。
+                _persist_extracted_memories(memory_store, extracted_memories)
+            except Exception:
+                # 长期记忆抽取失败不能影响主流程回答。
+                pass
 
         session.replace_messages(history)
         save_session(session)
