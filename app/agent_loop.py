@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import time
 
+from app.history_window import build_older_history_summary, select_history_window
 from app.logger import log_event
 from app.memory_context_builder import build_memory_context
 from app.memory_store import MemoryStore
@@ -106,15 +107,37 @@ def _run_agent_loop(
             f"[session={session_id or '-'}] 第 {step_index + 1} 轮循环开始"
         )
 
-        # 用当前 builder 里的最新消息快照构造一份临时会话对象。
-        # 这样可以让会话摘要跟随本轮新增的 user/tool/result 实时更新，
-        # 但又不会提前改动 main.py 里真正持久化的 session 对象。
+        # 先取出当前完整历史。
+        # 这份 full_history 只在本轮内部用于切窗口和生成摘要，
+        # 不会整段原样发给模型。
+        full_history = list(builder.build())
+
+        # 按 user 消息把完整历史切成多轮，只保留最近几轮完整消息。
+        # 更老的历史转交给摘要层，避免上下文无限增长。
+        history_window = select_history_window(
+            history=full_history,
+            keep_rounds=6,
+        )
+
+        # 旧历史只保留主线摘要，不再原样透传。
+        older_history_summary = build_older_history_summary(
+            history_window.older_messages,
+        )
+
+        # 记录本轮上下文裁剪结果，方便观察最近窗口策略是否生效。
+        log_event(
+            f"[session={session_id or '-'}] 第 {step_index + 1} 轮上下文窗口: "
+            f"older={len(history_window.older_messages)} recent={len(history_window.recent_messages)}"
+        )
+
+        # 用最近几轮原始消息构造临时会话快照。
+        # 这样 session_snapshot 更接近本轮真正要发给模型的原始消息窗口。
         session_snapshot = SessionData(
             session_id=session.session_id,
             created_at=session.created_at,
             updated_at=session.updated_at,
             workspace=session.workspace,
-            messages=list(builder.build()),
+            messages=list(history_window.recent_messages),
             extra=dict(session.extra),
         )
 
@@ -125,6 +148,7 @@ def _run_agent_loop(
             session=session_snapshot,
             working_memory=working_memory,
             memory_store=memory_store,
+            session_summary_override=older_history_summary,
         )
 
         # 每一轮都按最新记忆上下文重新构造系统提示词，
@@ -134,14 +158,15 @@ def _run_agent_loop(
             memory_context=memory_context,
         )
 
-        # 每一轮都把系统提示词和最新历史发给模型
+        # 每一轮都只发送最近几轮完整消息。
+        # 更老的历史已经进入 older_history_summary，不再重复占上下文窗口。
         messages: list[ChatMessage] = [
             {
                 "role": "system",
                 "content": system_prompt,
             }
         ]
-        messages.extend(builder.build())
+        messages.extend(history_window.recent_messages)
 
         try:
             # 记录即将请求模型

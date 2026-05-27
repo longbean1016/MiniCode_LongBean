@@ -96,6 +96,7 @@ def build_memory_context(
     session: SessionData,
     working_memory: WorkingMemory | None,
     memory_store: MemoryStore | None,
+    session_summary_override: str = "",
     top_k: int = 5,
     max_summary_chars: int = 400,
     max_memory_chars_per_item: int = 180,
@@ -110,9 +111,12 @@ def build_memory_context(
     sections: list[str] = []
 
     # 1. 注入会话摘要
-    # session.meta.summary 是你前面已经做好的规则摘要
-    session_summary = ""
-    if session.meta is not None:
+    # 优先使用外部传入的旧历史摘要。
+    # 这样主循环做完“近轮保留 + 旧轮摘要”后，就不会再把 recent tail 重复概括一遍。
+    session_summary = _shorten(session_summary_override, max_summary_chars)
+
+    # 如果外部没有覆盖值，再退回到 session.meta.summary。
+    if not session_summary and session.meta is not None:
         session_summary = _shorten(session.meta.summary, max_summary_chars)
 
     # 有摘要时才放进去，避免空标题污染 prompt
