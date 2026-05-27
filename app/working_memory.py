@@ -162,24 +162,41 @@ class WorkingMemory:
         # current_goal 是单个字符串字段
         current_goal = str(data.get("current_goal", "")).strip()
 
+        # 先把原始字段取出来，再做类型收窄。
+        # 因为 data 被标注为 dict[str, object]，
+        # 所以类型检查器不会默认认为这些值一定可迭代。
+        raw_recent_decisions = data.get("recent_decisions", [])
+        if not isinstance(raw_recent_decisions, list):
+            raw_recent_decisions = []
+
         # recent_decisions 要从字典里恢复成字符串列表
         recent_decisions = [
             str(item).strip()
-            for item in data.get("recent_decisions", [])
+            for item in raw_recent_decisions
             if str(item).strip()
         ]
+
+        # 同样先校验 recent_failures 的原始值是不是列表。
+        raw_recent_failures = data.get("recent_failures", [])
+        if not isinstance(raw_recent_failures, list):
+            raw_recent_failures = []
 
         # recent_failures 要从字典里恢复成字符串列表
         recent_failures = [
             str(item).strip()
-            for item in data.get("recent_failures", [])
+            for item in raw_recent_failures
             if str(item).strip()
         ]
+
+        # active_paths 也需要先收窄成 list，避免类型检查报 object 不可迭代。
+        raw_active_paths = data.get("active_paths", [])
+        if not isinstance(raw_active_paths, list):
+            raw_active_paths = []
 
         # active_paths 要从字典里恢复成字符串列表
         active_paths = [
             str(item).strip()
-            for item in data.get("active_paths", [])
+            for item in raw_active_paths
             if str(item).strip()
         ]
 
