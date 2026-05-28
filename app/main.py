@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import argparse
 
@@ -241,7 +241,13 @@ def main() -> None:
             continue
 
         # 先把本轮用户输入记为当前主要目标
-        working_memory.set_current_goal(user_input)
+        working_memory.protect(
+            user_input,
+            entry_type="user_intent",
+            ttl_seconds=3600,
+            importance=1.0,
+            replace_latest_of_type=True,
+        )
 
         if user_input.lower() in {"quit", "exit"}:
             session.replace_messages(history)
@@ -299,7 +305,12 @@ def main() -> None:
                 )
             else:
                 # 记录一次授权拒绝，提醒后续模型不要默认继续危险操作
-                working_memory.add_failure("用户拒绝了高风险操作授权")
+                working_memory.protect(
+                    "用户拒绝了高风险操作授权",
+                    entry_type="error_context",
+                    ttl_seconds=1800,
+                    importance=0.9,
+                )
                 print("Agent> 用户已拒绝此次高风险操作。")
                 continue
 

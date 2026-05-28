@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import time
 
@@ -167,7 +167,7 @@ def _run_agent_loop(
         # 把“会话摘要 + 短期工作记忆 + 长期记忆检索结果”拼成一段辅助上下文。
         # 这段内容会被注入 system prompt，而不是直接改写原始 history 结构。
         memory_context = build_memory_context(
-            user_input=working_memory.current_goal,
+            user_input=working_memory.get_primary_user_intent(),
             session=session_snapshot,
             working_memory=working_memory,
             memory_store=memory_store,
@@ -210,7 +210,12 @@ def _run_agent_loop(
                 f"[session={session_id or '-'}] 第 {step_index + 1} 轮模型调用异常: {error}"
             )
             # 记录最近一次模型失败，后面做 prompt 注入时可以提醒模型避坑
-            working_memory.add_failure(f"模型调用失败: {error}")
+            working_memory.protect(
+                f"模型调用失败: {error}",
+                entry_type="error_context",
+                ttl_seconds=1800,
+                importance=0.9,
+            )
             fallback = AgentStep(
                 type="assistant",
                 content=f"模型调用失败: {error}",
@@ -227,7 +232,12 @@ def _run_agent_loop(
             # 这不是为了记录所有回答，而是尽量保留“已经确认的方向或约束”。
             decision = extract_decision_from_assistant(step.content)
             if decision:
-                working_memory.add_decision(decision)
+                working_memory.protect(
+                    decision,
+                    entry_type="key_decision",
+                    ttl_seconds=3600,
+                    importance=0.95,
+                )
 
             # 记录当前 step 和整轮总耗时
             step_cost = time.perf_counter() - step_started_at
@@ -262,7 +272,12 @@ def _run_agent_loop(
                 # 从工具输入里尽量提取活跃路径。
                 # 这一步会覆盖 path / file_path / directory / run_command 等常见形式。
                 for path in extract_active_paths(tool_name, tool_input):
-                    working_memory.add_active_path(path)
+                    working_memory.protect(
+                        path,
+                        entry_type="active_task",
+                        ttl_seconds=1800,
+                        importance=0.8,
+                    )
 
                 # 先把工具调用请求记到历史里
                 builder.add_tool_call(
@@ -309,8 +324,11 @@ def _run_agent_loop(
 
                 # 工具失败时，把错误压成短摘要写进短期工作记忆。
                 if not result.ok:
-                    working_memory.add_failure(
-                        summarize_failure(tool_name, result)
+                    working_memory.protect(
+                        summarize_failure(tool_name, result),
+                        entry_type="error_context",
+                        ttl_seconds=1800,
+                        importance=0.9,
                     )
 
                 # 命中“需要授权”时，不继续喂模型，而是把审批请求返回给 main

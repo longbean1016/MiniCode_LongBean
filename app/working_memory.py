@@ -1,236 +1,167 @@
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
-from typing import Any
 
 
-def _dedupe_keep_last(items: list[str], max_items: int) -> list[str]:
-    """
-    列表去重，并保留最近一次出现的顺序。
-    """
-    # seen 用来记录已经保留过的内容。
-    seen: set[str] = set()
+def _normalize_text(text: str) -> str:
+    """规范化文本空白，便于作为运行时工作记忆存储。"""
+    return " ".join(str(text).strip().split())
 
-    # result 用来收集去重后的结果。
-    result: list[str] = []
 
-    # 倒序遍历，优先保留“最近加入”的内容。
-    for item in reversed(items):
-        # 先去掉首尾空格，避免空字符串和纯空白内容混入。
-        text = item.strip()
+@dataclass(slots=True)
+class WorkingMemoryEntry:
+    """仅存在于运行时的受保护上下文条目。"""
 
-        # 空内容直接跳过。
-        if not text:
-            continue
+    content: str
+    entry_type: str
+    created_at: float = field(default_factory=time.time)
+    expires_at: float | None = None
+    importance: float = 1.0
 
-        # 如果这条内容已经保留过，就不再重复加入。
-        if text in seen:
-            continue
-
-        # 记录这条内容已经出现过。
-        seen.add(text)
-
-        # 把当前内容加入结果。
-        result.append(text)
-
-    # 因为前面是倒序遍历，这里再翻回正常顺序。
-    result.reverse()
-
-    # 最后限制最大保留条数。
-    return result[-max_items:]
+    def is_expired(self, now: float | None = None) -> bool:
+        """判断当前条目是否已经过期。"""
+        if self.expires_at is None:
+            return False
+        current = time.time() if now is None else now
+        return current > self.expires_at
 
 
 @dataclass(slots=True)
 class WorkingMemory:
-    """
-    短期工作记忆：保存当前任务最重要、最不能丢的上下文状态。
-    """
+    """类似 minicode 的运行时工作记忆跟踪器。"""
 
-    current_goal: str = ""  # 当前用户最主要的目标
-    recent_decisions: list[str] = field(default_factory=list)  # 最近关键决策
-    recent_failures: list[str] = field(default_factory=list)  # 最近失败或报错
-    active_paths: list[str] = field(default_factory=list)  # 当前活跃文件或目录路径
+    max_entries: int = 15
+    entries: list[WorkingMemoryEntry] = field(default_factory=list)
 
-    max_decisions: int = 5  # 最多保留多少条决策
-    max_failures: int = 5  # 最多保留多少条失败
-    max_paths: int = 8  # 最多保留多少条活跃路径
-
-    def set_current_goal(self, goal: str) -> None:
+    def protect(
+        self,
+        content: str,
+        *,
+        entry_type: str = "active_task",
+        ttl_seconds: float | None = None,
+        importance: float = 1.0,
+        replace_latest_of_type: bool = False,
+    ) -> WorkingMemoryEntry | None:
         """
-        设置当前任务目标。
-        """
-        # goal 就是用户当前最核心的任务描述。
-        self.current_goal = goal.strip()
+        添加一条运行时受保护上下文。
 
-    def add_decision(self, decision: str) -> None:
+        默认 `entry_type` 是 `active_task`：
+        - 调用方不传 `entry_type` 时，按 `active_task` 处理
+        - 传入空字符串时，也会回退到 `active_task`
         """
-        记录一条关键决策。
-        """
-        # decision 表示一条已经确认的执行方向或约束。
-        text = decision.strip()
-
-        # 空内容不记录。
+        text = _normalize_text(content)
+        normalized_type = _normalize_text(entry_type) or "active_task"
         if not text:
-            return
+            return None
 
-        # 先追加到原列表。
-        self.recent_decisions.append(text)
+        expires_at = None
+        if ttl_seconds is not None:
+            expires_at = time.time() + ttl_seconds
 
-        # 再统一做去重和数量限制。
-        self.recent_decisions = _dedupe_keep_last(
-            self.recent_decisions,
-            self.max_decisions,
+        if replace_latest_of_type:
+            self.entries = [
+                entry for entry in self.get_entries()
+                if entry.entry_type != normalized_type
+            ]
+
+        entry = WorkingMemoryEntry(
+            content=text,
+            entry_type=normalized_type,
+            expires_at=expires_at,
+            importance=float(importance),
         )
-
-    def add_failure(self, failure: str) -> None:
-        """
-        记录一条最近失败信息。
-        """
-        # failure 表示最近一次失败、异常或被拒绝的原因。
-        text = failure.strip()
-
-        # 空内容不记录。
-        if not text:
-            return
-
-        # 先加入失败列表。
-        self.recent_failures.append(text)
-
-        # 再统一做去重和数量限制。
-        self.recent_failures = _dedupe_keep_last(
-            self.recent_failures,
-            self.max_failures,
-        )
-
-    def add_active_path(self, path: str) -> None:
-        """
-        记录当前活跃路径，例如最近读写过的文件或目录。
-        """
-        # path 表示当前任务里最近操作过的文件或目录路径。
-        text = path.strip()
-
-        # 空内容不记录。
-        if not text:
-            return
-
-        # 先加入路径列表。
-        self.active_paths.append(text)
-
-        # 再统一做去重和数量限制。
-        self.active_paths = _dedupe_keep_last(
-            self.active_paths,
-            self.max_paths,
-        )
+        self.entries.append(entry)
+        self._enforce_entry_limits()
+        return entry
 
     def clear_failures(self) -> None:
-        """
-        清空最近失败记录。
-        """
-        self.recent_failures.clear()
+        """清理当前保存的错误上下文条目。"""
+        self.entries = [
+            entry for entry in self.get_entries()
+            if entry.entry_type != "error_context"
+        ]
 
-    def to_dict(self) -> dict[str, object]:
-        """
-        转成可序列化字典，后面如果要持久化可以直接复用。
-        """
-        return {
-            "current_goal": self.current_goal,
-            "recent_decisions": list(self.recent_decisions),
-            "recent_failures": list(self.recent_failures),
-            "active_paths": list(self.active_paths),
-        }
+    def clear_expired(self) -> int:
+        """删除已过期的运行时条目，并返回删除数量。"""
+        before = len(self.entries)
+        now = time.time()
+        self.entries = [
+            entry for entry in self.entries
+            if not entry.is_expired(now)
+        ]
+        return before - len(self.entries)
 
-    @classmethod
-    def from_dict(cls, data: dict[str, object]) -> "WorkingMemory":
-        """
-        从字典恢复 WorkingMemory。
-        """
-        # current_goal 是当前工作记忆里的主目标。
-        current_goal = str(data.get("current_goal", "")).strip()
+    def get_entries(self) -> list[WorkingMemoryEntry]:
+        """按插入顺序返回所有未过期条目。"""
+        self.clear_expired()
+        return list(self.entries)
 
-        # 先把 recent_decisions 原始值取出来，再判断是不是 list。
-        raw_recent_decisions = data.get("recent_decisions", [])
-        if isinstance(raw_recent_decisions, list):
-            recent_decisions = [
-                str(item).strip()
-                for item in raw_recent_decisions
-                if str(item).strip()
-            ]
-        else:
-            recent_decisions = []
+    def get_primary_user_intent(self) -> str:
+        """返回最新一条用户意图，用于记忆检索和 prompt 聚焦。"""
+        for entry in reversed(self.get_entries()):
+            if entry.entry_type == "user_intent":
+                return entry.content
+        return ""
 
-        # recent_failures 要从字典里恢复成字符串列表。
-        raw_recent_failures = data.get("recent_failures", [])
-        if isinstance(raw_recent_failures, list):
-            recent_failures = [
-                str(item).strip()
-                for item in raw_recent_failures
-                if str(item).strip()
-            ]
-        else:
-            recent_failures = []
-
-        # active_paths 要从字典里恢复成字符串列表。
-        raw_active_paths = data.get("active_paths", [])
-        if isinstance(raw_active_paths, list):
-            active_paths = [
-                str(item).strip()
-                for item in raw_active_paths
-                if str(item).strip()
-            ]
-        else:
-            active_paths = []
-
-        memory = cls(
-            current_goal=current_goal,
-            recent_decisions=recent_decisions,
-            recent_failures=recent_failures,
-            active_paths=active_paths,
-        )
-
-        # 恢复后顺手做一次去重和数量限制。
-        memory.recent_decisions = _dedupe_keep_last(
-            memory.recent_decisions,
-            memory.max_decisions,
-        )
-        memory.recent_failures = _dedupe_keep_last(
-            memory.recent_failures,
-            memory.max_failures,
-        )
-        memory.active_paths = _dedupe_keep_last(
-            memory.active_paths,
-            memory.max_paths,
-        )
-
-        return memory
+    def get_entries_by_type(self, entry_type: str) -> list[WorkingMemoryEntry]:
+        """按 entry_type 过滤并返回对应条目。"""
+        normalized_type = _normalize_text(entry_type)
+        return [
+            entry for entry in self.get_entries()
+            if entry.entry_type == normalized_type
+        ]
 
     def format_for_prompt(self) -> str:
-        """
-        把短期工作记忆格式化成可注入 prompt 的文本。
-        """
-        # parts 用来逐段收集最终要注入 prompt 的文本。
-        parts: list[str] = []
+        """把运行时保护上下文格式化成可注入 prompt 的文本。"""
+        sections: list[str] = []
+        grouped = {
+            "user_intent": self.get_entries_by_type("user_intent"),
+            "active_task": self.get_entries_by_type("active_task"),
+            "key_decision": self.get_entries_by_type("key_decision"),
+            "error_context": self.get_entries_by_type("error_context"),
+        }
 
-        # 当前目标单独作为第一段。
-        if self.current_goal:
-            parts.append(f"当前目标：{self.current_goal}")
+        if grouped["user_intent"]:
+            sections.append("用户意图：")
+            for entry in grouped["user_intent"][-3:]:
+                sections.append(f"- {entry.content}")
 
-        # 最近关键决策按列表输出。
-        if self.recent_decisions:
-            parts.append("最近关键决策：")
-            for item in self.recent_decisions:
-                parts.append(f"- {item}")
+        if grouped["active_task"]:
+            sections.append("活跃任务：")
+            for entry in grouped["active_task"][-5:]:
+                sections.append(f"- {entry.content}")
 
-        # 最近失败按列表输出。
-        if self.recent_failures:
-            parts.append("最近失败：")
-            for item in self.recent_failures:
-                parts.append(f"- {item}")
+        if grouped["key_decision"]:
+            sections.append("关键决策：")
+            for entry in grouped["key_decision"][-5:]:
+                sections.append(f"- {entry.content}")
 
-        # 当前活跃路径按列表输出。
-        if self.active_paths:
-            parts.append("当前活跃路径：")
-            for item in self.active_paths:
-                parts.append(f"- {item}")
+        if grouped["error_context"]:
+            sections.append("错误上下文：")
+            for entry in grouped["error_context"][-5:]:
+                sections.append(f"- {entry.content}")
 
-        # 把列表每个元素用换行拼起来，形成完整文本。
-        return "\n".join(parts).strip()
+        supplemental_entries = [
+            entry for entry in self.get_entries()
+            if entry.entry_type not in grouped
+        ]
+        if supplemental_entries:
+            sections.append("运行时保护上下文：")
+            for entry in supplemental_entries[-5:]:
+                sections.append(f"- [{entry.entry_type}] {entry.content}")
+
+        return "\n".join(sections).strip()
+
+    def _enforce_entry_limits(self) -> None:
+        """超过最大条目数时，优先删除重要度最低、最旧的条目。"""
+        self.clear_expired()
+        while len(self.entries) > self.max_entries:
+            lowest = min(
+                range(len(self.entries)),
+                key=lambda index: (
+                    self.entries[index].importance,
+                    self.entries[index].created_at,
+                ),
+            )
+            self.entries.pop(lowest)
