@@ -23,6 +23,7 @@ class WorkingMemoryEntry:
         """判断当前条目是否已经过期。"""
         if self.expires_at is None:
             return False
+
         current = time.time() if now is None else now
         return current > self.expires_at
 
@@ -82,6 +83,27 @@ class WorkingMemory:
             if entry.entry_type != "error_context"
         ]
 
+    def clear_entries_by_type(self, *entry_types: str) -> None:
+        """
+        按类型批量清理运行时条目。
+
+        这个方法主要给反思链路使用：
+        - 每轮开始前清空上一轮的 `reflection_*` 条目
+        - 避免上一轮采集到的决策、失败、文件触点污染本轮反思输入
+        """
+        normalized_types = {
+            _normalize_text(entry_type)
+            for entry_type in entry_types
+            if _normalize_text(entry_type)
+        }
+        if not normalized_types:
+            return
+
+        self.entries = [
+            entry for entry in self.get_entries()
+            if entry.entry_type not in normalized_types
+        ]
+
     def clear_expired(self) -> int:
         """删除已过期的运行时条目，并返回删除数量。"""
         before = len(self.entries)
@@ -105,7 +127,7 @@ class WorkingMemory:
         return ""
 
     def get_entries_by_type(self, entry_type: str) -> list[WorkingMemoryEntry]:
-        """按 entry_type 过滤并返回对应条目。"""
+        """按 `entry_type` 过滤并返回对应条目。"""
         normalized_type = _normalize_text(entry_type)
         return [
             entry for entry in self.get_entries()
@@ -113,7 +135,7 @@ class WorkingMemory:
         ]
 
     def format_for_prompt(self) -> str:
-        """把运行时保护上下文格式化成可注入 prompt 的文本。"""
+        """把运行时保护上下文化成可注入 prompt 的文本。"""
         sections: list[str] = []
         grouped = {
             "user_intent": self.get_entries_by_type("user_intent"),
@@ -145,6 +167,7 @@ class WorkingMemory:
         supplemental_entries = [
             entry for entry in self.get_entries()
             if entry.entry_type not in grouped
+            and not entry.entry_type.startswith("reflection_")
         ]
         if supplemental_entries:
             sections.append("运行时保护上下文：")

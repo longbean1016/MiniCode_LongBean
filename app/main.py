@@ -6,7 +6,9 @@ from app.agent_loop import continue_agent_from_history, run_agent_once
 from app.config import load_config
 from app.history_summarizer import OlderHistorySummarizer
 from app.memory_extractor import LongTermMemoryExtractor
+from app.memory_guard import MemoryWriteGuard
 from app.memory_store import JsonMemoryStore, MemoryEntry
+from app.memory_verifier import MemoryVerifier
 from app.model_registry import OpenAIModelAdapter
 from app.session import (
     SessionData,
@@ -19,8 +21,9 @@ from app.session import (
 )
 from app.turn_history import get_last_round_messages
 from app.tools import build_tool_registry
-from app.types import ChatMessage, ToolContext
+from app.types import AgentStep, ChatMessage, ToolContext
 from app.working_memory import WorkingMemory
+from app.working_memory_updater import extract_active_paths, summarize_failure
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
@@ -119,58 +122,124 @@ def _replace_pending_tool_result(
     return updated_history
 
 
-def _should_extract_long_term_memory(step_content: str) -> bool:
-    """判断这次最终回复是否适合触发长期记忆抽取。"""
-    # 空回复不抽。
-    text = step_content.strip()
+def _clear_reflection_runtime_context(working_memory: WorkingMemory) -> None:
+    """
+    清理上一轮留下的 reflection 运行时条目。
+
+    这些条目只服务当前一轮的 task reflection，
+    不应该泄漏到下一轮继续参与反思。
+    """
+    working_memory.clear_entries_by_type(
+        "reflection_decision",
+        "reflection_failure",
+        "reflection_file",
+    )
+
+
+def _collect_reflection_entries(
+    working_memory: WorkingMemory,
+    entry_type: str,
+    *,
+    limit: int,
+) -> list[str]:
+    """
+    从运行时工作记忆里取出当前轮的反思辅助条目，并做轻量去重。
+
+    参数说明：
+    - `entry_type`: 需要读取的运行时条目类型
+    - `limit`: 最多返回多少条，避免单轮反思输入失控
+    """
+    result: list[str] = []
+    seen: set[str] = set()
+
+    for entry in working_memory.get_entries_by_type(entry_type):
+        content = entry.content.strip()
+        if not content or content in seen:
+            continue
+        seen.add(content)
+        result.append(content)
+        if len(result) >= limit:
+            break
+
+    return result
+
+
+def _should_reflect_long_term_memory(step: AgentStep) -> bool:
+    """判断这次最终回复是否满足自动长期记忆反思时机。"""
+    if step.type != "assistant":
+        return False
+
+    text = step.content.strip()
     if not text:
         return False
 
-    # 这些是内部兜底回复，不适合作为长期记忆抽取的“最终结果”。
+    # 这些是内部兜底回复，不适合作为长期记忆反思的最终结果。
     blocked_prefixes = (
         "模型调用失败:",
         "已达到最大循环步数",
         "未识别的模型返回类型",
         "模型返回了空的工具调用",
     )
-    return not text.startswith(blocked_prefixes)
+    if text.startswith(blocked_prefixes):
+        return False
+
+    # 第一阶段先保守处理，只在“完成 / 阶段完成 / 稳定结论”语气下触发。
+    stable_markers = (
+        "已完成",
+        "已经完成",
+        "完成了",
+        "阶段完成",
+        "已实现",
+        "实现了",
+        "已修复",
+        "修复了",
+        "最终",
+        "结论",
+        "可以确定",
+        "建议采用",
+        "改为",
+        "保留",
+        "done",
+        "completed",
+        "implemented",
+        "fixed",
+        "conclusion",
+        "final",
+    )
+    lowered = text.lower()
+    return any(marker in text or marker in lowered for marker in stable_markers)
 
 
 def _persist_extracted_memories(
     memory_store: JsonMemoryStore,
+    memory_guard: MemoryWriteGuard,
+    memory_verifier: MemoryVerifier,
     entries: list[MemoryEntry],
 ) -> int:
     """
     把抽取出来的长期记忆写入 memory store。
 
-    写入前再做一层本地去重，
-    避免相同 category + content 被重复写入。
+    当前阶段的写入流程是：
+    1. 先读取已有长期记忆
+    2. 逐条走 `MemoryWriteGuard` 做快速门禁
+    3. 再走 `MemoryVerifier` 做 duplicate / conflict / reject 判断
+    4. 只有 verifier 判定为 `store` 才真正落盘
     """
-    # 先读取已有长期记忆，构造一个稳定的去重键集合。
-    existing_keys = {
-        (
-            entry.category.strip().lower(),
-            " ".join(entry.content.strip().lower().split()),
-        )
-        for entry in memory_store.load_memories()
-        if entry.content.strip()
-    }
-
+    existing_entries = memory_store.load_memories()
     stored_count = 0
 
     for entry in entries:
-        # 当前候选记忆的去重键。
-        dedupe_key = (
-            entry.category.strip().lower(),
-            " ".join(entry.content.strip().lower().split()),
-        )
-
-        # 已存在就跳过，不重复写。
-        if dedupe_key in existing_keys:
+        guard_decision = memory_guard.should_store(entry)
+        if not guard_decision.should_store:
             continue
 
-        memory_store.add_memory(entry)
-        existing_keys.add(dedupe_key)
+        similar_entries = memory_verifier.find_similar_entries(entry, existing_entries)
+        verify_decision = memory_verifier.verify(entry, similar_entries)
+        if verify_decision.action != "store":
+            continue
+
+        stored_entry = memory_store.add_memory(entry)
+        existing_entries.append(stored_entry)
         stored_count += 1
 
     return stored_count
@@ -209,8 +278,14 @@ def main() -> None:
     # 当前会话的短期工作记忆
     working_memory = WorkingMemory()
 
-    # 长期记忆抽取器：负责从“当前一轮完整消息”里提炼可复用记忆。
+    # 长期记忆抽取器：负责把本轮任务整理成 task reflection，并产出候选记忆。
     memory_extractor = LongTermMemoryExtractor(
+        api_key=config.api_key,
+        base_url=config.base_url,
+        model_name=config.model,
+    )
+    memory_guard = MemoryWriteGuard()
+    memory_verifier = MemoryVerifier(
         api_key=config.api_key,
         base_url=config.base_url,
         model_name=config.model,
@@ -239,6 +314,9 @@ def main() -> None:
 
         if not user_input:
             continue
+
+        # 每一轮开始前先清掉上一轮的反思辅助条目。
+        _clear_reflection_runtime_context(working_memory)
 
         # 先把本轮用户输入记为当前主要目标
         working_memory.protect(
@@ -283,6 +361,40 @@ def main() -> None:
                     context=tool_context,
                 )
 
+                # 授权后的工具执行不会经过 agent_loop 的常规工具分支，
+                # 所以这里手动补齐反思输入采集，避免漏掉路径触点和失败摘要。
+                for path in extract_active_paths(
+                    step.approval.tool_name,
+                    step.approval.input_data,
+                ):
+                    working_memory.protect(
+                        path,
+                        entry_type="active_task",
+                        ttl_seconds=1800,
+                        importance=0.8,
+                    )
+                    working_memory.protect(
+                        path,
+                        entry_type="reflection_file",
+                        ttl_seconds=1800,
+                        importance=0.7,
+                    )
+
+                if not result.ok:
+                    failure_summary = summarize_failure(step.approval.tool_name, result)
+                    working_memory.protect(
+                        failure_summary,
+                        entry_type="error_context",
+                        ttl_seconds=1800,
+                        importance=0.9,
+                    )
+                    working_memory.protect(
+                        failure_summary,
+                        entry_type="reflection_failure",
+                        ttl_seconds=1800,
+                        importance=0.9,
+                    )
+
                 approved_history = _replace_pending_tool_result(
                     history=history,
                     tool_use_id=step.approval.tool_use_id,
@@ -314,24 +426,47 @@ def main() -> None:
                 print("Agent> 用户已拒绝此次高风险操作。")
                 continue
 
-        # 只有真正得到最终 assistant 回复时，才尝试做长期记忆抽取。
-        if step.type == "assistant" and _should_extract_long_term_memory(step.content):
+        # 只有命中“任务完成 / 阶段完成 / 稳定结论”时，才尝试做长期记忆反思。
+        if _should_reflect_long_term_memory(step):
             try:
-                # 从完整 history 里取出最后一轮消息，避免拿全量历史去抽长期记忆。
+                # 只用当前最后一轮消息做反思，不拿整段全量历史直接抽记忆。
                 last_round_messages = get_last_round_messages(history)
+                key_decisions = _collect_reflection_entries(
+                    working_memory,
+                    "reflection_decision",
+                    limit=6,
+                )
+                failures = _collect_reflection_entries(
+                    working_memory,
+                    "reflection_failure",
+                    limit=6,
+                )
+                files_touched = _collect_reflection_entries(
+                    working_memory,
+                    "reflection_file",
+                    limit=10,
+                )
 
-                # 基于“当前用户输入 + 本轮最终结果 + 本轮完整消息链”抽取长期记忆。
-                extracted_memories = memory_extractor.extract_from_turn(
-                    user_input=user_input,
+                # 基于“任务描述 + 最终结果 + 当前轮完整消息链”做 task reflection。
+                extracted_memories = memory_extractor.extract_from_task(
+                    task_description=user_input,
                     final_step=step,
                     turn_messages=last_round_messages,
                     session_id=session.session_id,
+                    key_decisions=key_decisions,
+                    failures=failures,
+                    files_touched=files_touched,
                 )
 
-                # 写入前再做一层去重保护。
-                _persist_extracted_memories(memory_store, extracted_memories)
+                # 候选记忆先过 guard，再允许落盘。
+                _persist_extracted_memories(
+                    memory_store,
+                    memory_guard,
+                    memory_verifier,
+                    extracted_memories,
+                )
             except Exception:
-                # 长期记忆抽取失败不能影响主流程回答。
+                # 长期记忆反思失败不能影响主流程回答。
                 pass
 
         session.replace_messages(history)

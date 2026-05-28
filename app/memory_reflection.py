@@ -1,11 +1,7 @@
+from __future__ import annotations
 
-
-
-# 自动 reflection 允许写入的长期记忆类别。
-# 自动写入时，scope固定位project作用域，user、local暂不设置为自动处理
-
-from dataclasses import dataclass, field
 import json
+from dataclasses import dataclass, field
 from typing import Any
 
 from openai import OpenAI
@@ -13,11 +9,45 @@ from openai import OpenAI
 from app.types import AgentStep, ChatMessage
 
 
-ALLOWED_MEMORY_CATEGORIES={
+# 自动 reflection 目前只允许产出这四类项目级长期记忆。
+ALLOWED_MEMORY_CATEGORIES = {
     "preference",  # 当前项目协作中长期稳定有效的偏好
     "convention",  # 项目约定、实现约束、工作方式
     "conclusion",  # 已验证的重要结论、方案、架构判断
     "failure",     # 可复用的失败经验、踩坑结论、风险警告
+}
+
+# 明显属于过程性、礼貌性、临时性的表达，不应该进长期记忆。
+TEMPORARY_CONTENT_MARKERS = {
+    "本轮",
+    "这一轮",
+    "刚刚",
+    "临时",
+    "暂时",
+    "稍后",
+    "马上",
+    "待会",
+    "这次先",
+    "先这样",
+    "this turn",
+    "just now",
+    "temporarily",
+    "for now",
+    "later",
+}
+
+LOW_VALUE_PHRASES = {
+    "好的",
+    "收到",
+    "明白",
+    "没问题",
+    "已处理",
+    "我来帮你",
+    "我可以继续",
+    "thanks",
+    "thank you",
+    "got it",
+    "sounds good",
 }
 
 
@@ -30,13 +60,12 @@ class TaskReflectionInput:
     而是把当前任务整理成 task description + execution trace 风格的输入。
     """
 
-    task_description: str  # 当前任务描述，一般就是本轮用户输入或任务目标摘要
-    final_step: AgentStep  # 本轮最终 assistant 输出对应的 step，用来看最终产出
-    turn_messages: list[ChatMessage]  # 本轮完整消息链，用来提取 execution trace
+    task_description: str  # 当前任务描述，通常来自本轮用户输入
+    final_step: AgentStep  # 本轮最终 assistant 输出对应的 step
+    turn_messages: list[ChatMessage]  # 本轮完整消息链，用来提取执行轨迹
     key_decisions: list[str] = field(default_factory=list)  # 本轮关键决策列表
     failures: list[str] = field(default_factory=list)  # 本轮失败、报错、阻断、风险列表
-    files_touched: list[str] = field(default_factory=list)  # 本轮涉及的重要文件路径列表
-
+    files_touched: list[str] = field(default_factory=list)  # 本轮触及的重要文件路径
 
 
 @dataclass(slots=True)
@@ -44,32 +73,25 @@ class ReflectionMemoryCandidate:
     """
     反思模型返回的一条候选长期记忆。
 
-    字段说明：
-    - content: 记忆正文
-    - category: 记忆类别
-    - tags: 辅助检索标签
-    - confidence: 模型对这条记忆“值得长期保存”的置信度
-    - domains: 可选领域标签，例如 memory / session / permissions
+    这里仍然只是“候选”，
+    后续还要经过本地过滤和 guard 才会真正落盘。
     """
+
     content: str
     category: str
     tags: list[str]
     confidence: float
     domains: list[str] = field(default_factory=list)
 
+
 class TaskMemoryReflectionEngine:
     """
-    task-based reflection 引擎。
+    基于任务的长期记忆反思引擎。
 
-    它的职责：
-    1. 把当前一轮任务执行整理成结构化上下文
-    2. 调模型提炼“值得长期保留”的项目级记忆
-    3. 返回候选项给上层做 confidence / dedupe / conflict gate
-
-    注意：
-    - 这一层不负责真正写入 memory store
-    - 这一层也不负责决定 user/local/project
-    - 自动链路默认只服务 project 级长期记忆
+    职责：
+    1. 把当前任务执行整理成结构化上下文
+    2. 让模型提炼“未来仍值得保留”的项目级记忆
+    3. 返回候选结果，交给上层继续做写入门槛判断
     """
 
     def __init__(
@@ -81,154 +103,119 @@ class TaskMemoryReflectionEngine:
         max_context_chars: int = 7000,
         max_candidates: int = 4,
     ) -> None:
-        # # OpenAI 兼容客户端。
-        # 这里沿用你项目现有的模型接入方式。
-        self.client=OpenAI(
+        self.client = OpenAI(
             api_key=api_key,
-            base_url=base_url
+            base_url=base_url,
         )
-        # 反思型模型名
-        self.model_name=model_name
+        self.model_name = model_name
+        self.max_context_chars = max_context_chars
+        self.max_candidates = max_candidates
 
-        # 给反思模型的最大上下文字符数。
-        # 防止本轮的trace太长，把prompt撑爆。
-        self.max_context_chars=max_context_chars
-
-        # 单次最多返回多少条候选长期记忆。
-        # 这里故意保守，避免“一轮写很多条”。
-        self.max_candidates=max_candidates
-
-    
-    def reflect(self,reflection_input: TaskReflectionInput)-> list[ReflectionMemoryCandidate]:
+    def reflect(self, reflection_input: TaskReflectionInput) -> list[ReflectionMemoryCandidate]:
         """
         对当前任务做一次结构化反思。
 
         流程：
-        1. 先把输入整理成反思上下文
-        2. 调模型产出候选记忆
-        3. 对模型输出做一层本地清洗
+        1. 先构造反思上下文
+        2. 调模型生成候选记忆
+        3. 对候选结果做一层本地清洗
         """
-        context_text=self._build_reflection_context(reflection_input)
-
-        # 没有有效上下文时，直接不抽。
+        context_text = self._build_reflection_context(reflection_input)
         if not context_text:
             return []
-        
-        raw_candidates=self._call_reflection_model(context_text)
 
+        raw_candidates = self._call_reflection_model(context_text)
         return self._post_filter_candidates(raw_candidates)
-    
 
-    def _build_reflection_context(self,reflection_input: TaskReflectionInput)->str:
+    def _build_reflection_context(self, reflection_input: TaskReflectionInput) -> str:
         """
-        构建反思用上下文。
+        构造发给 reflection 模型的结构化上下文。
 
-        目标是让模型看到：
+        模型需要看到的是：
         - 当前任务是什么
         - 最终结果是什么
-        - 中间有哪些关键决策 / 失败 / 文件触点
-        - 本轮大致做了哪些动作
+        - 中间有哪些关键决策、失败、文件触点
+        - 本轮执行轨迹的大致摘要
         """
-        parts: list[str]=[]
+        parts: list[str] = []
 
-        # task_description: 用户这轮的任务描述。
-        task_description=reflection_input.task_description.strip()
+        task_description = reflection_input.task_description.strip()
         if task_description:
-            parts.append("### 当前任务：")
+            parts.append("## 当前任务")
             parts.append(task_description)
 
-        # final_text: 本轮最终 assistant 输出。
-        final_text=reflection_input.final_step.content.strip()
+        final_text = reflection_input.final_step.content.strip()
         if final_text:
-            parts.append("### 本轮最终结果：")
+            parts.append("## 本轮最终结果")
             parts.append(self._shorten(final_text, 1200))
 
-        # key_decisions: 本轮出现的关键决策。
         if reflection_input.key_decisions:
             parts.append("## 关键决策")
             for item in reflection_input.key_decisions[:6]:
-                item = item.strip()
-                if item:
-                    parts.append(f"- {self._shorten(item, 220)}")
-        
-        # failures: 本轮出现的失败、阻断、报错、风险信息。
+                cleaned = item.strip()
+                if cleaned:
+                    parts.append(f"- {self._shorten(cleaned, 220)}")
+
         if reflection_input.failures:
             parts.append("## 失败与风险")
             for item in reflection_input.failures[:6]:
-                item = item.strip()
-                if item:
-                    parts.append(f"- {self._shorten(item, 220)}")
+                cleaned = item.strip()
+                if cleaned:
+                    parts.append(f"- {self._shorten(cleaned, 220)}")
 
-        # files_touched: 本轮触及的重要文件。
         if reflection_input.files_touched:
             parts.append("## 涉及文件")
             for path in reflection_input.files_touched[:10]:
-                path = path.strip()
-                if path:
-                    parts.append(f"- {path}")
+                cleaned = path.strip()
+                if cleaned:
+                    parts.append(f"- {cleaned}")
 
-        # trace_lines: 从本轮消息里提取出来的轻量执行痕迹。
         trace_lines = self._collect_turn_trace(reflection_input.turn_messages)
         if trace_lines:
-            parts.append("## 本轮执行痕迹")
+            parts.append("## 本轮执行轨迹")
             parts.extend(trace_lines[:12])
 
-        # 把所有段落拼成完整反思上下文。
         combined = "\n".join(parts).strip()
-
-        # 最后统一做一次总长度限制。
         return self._shorten(combined, self.max_context_chars)
-    
 
-
-    def _collect_turn_trace(self, turn_messages: list[ChatMessage])-> list[str]:
+    def _collect_turn_trace(self, turn_messages: list[ChatMessage]) -> list[str]:
         """
-        从当前轮次消息中抽出一份轻量 execution trace。
+        从当前轮消息中提炼轻量 execution trace。
 
-        这里不是把所有消息原样塞给模型，
-        而是只挑对长期记忆提炼更有价值的轨迹：
-        - tool call
-        - tool result
-        - assistant 结果
+        这里不直接把所有原始消息整段塞给模型，
+        只保留对长期记忆提炼更有用的轨迹信息。
         """
-        trace_lines: list[str]=[]
+        trace_lines: list[str] = []
+
         for message in turn_messages:
-            # role: 当前消息角色，可能是 assistant / tool_result / assistant_tool_call 等。
             role = str(message.get("role", "")).strip()
-            # content: 当前消息文本正文。
             content = str(message.get("content", "")).strip()
-            # assistant_tool_call: 记录模型调用了哪个工具。
+
             if role == "assistant_tool_call":
                 tool_name = str(message.get("tool_name", "")).strip()
                 if tool_name:
                     trace_lines.append(f"[tool_call] {tool_name}")
-            
-            # tool_result: 记录工具执行结果。
+                continue
+
             if role == "tool_result" and content:
                 tool_name = str(message.get("tool_name", "")).strip()
-
-                # is_error: 这条工具结果是不是错误结果。
                 is_error = bool(message.get("is_error", False))
-
                 prefix = "[tool_error]" if is_error else "[tool_result]"
                 trace_lines.append(f"{prefix} {tool_name}: {self._shorten(content, 220)}")
+                continue
 
-            # assistant: 记录本轮 assistant 的关键输出。
             if role == "assistant" and content:
                 trace_lines.append(f"[assistant] {self._shorten(content, 220)}")
-            
+
         return trace_lines
-                
 
-
-    def _call_reflection_model(self,context_text: str)->list[ReflectionMemoryCandidate]:
+    def _call_reflection_model(self, context_text: str) -> list[ReflectionMemoryCandidate]:
         """
         调模型做 task reflection。
 
-        注意：
-        - 这里明确要求模型只产出“项目级长期记忆候选”
-        - 不让模型自己决定 scope
-        - scope 由上层固定视为 project
+        当前阶段重点是收紧评分口径：
+        - 高分只留给稳定、可复用、已验证的信息
+        - 过程描述、礼貌回复、一次性操作不允许高分
         """
         system_prompt = """
 你是一个代码 Agent 的长期记忆反思器。
@@ -241,13 +228,39 @@ class TaskMemoryReflectionEngine:
 3. conclusion: 已验证的重要结论、方案、架构判断
 4. failure: 可复用的失败经验、踩坑结论、风险警告
 
-抽取原则：
+你输出的是“候选长期记忆”，不是执行总结，也不是礼貌回复改写。
+
+严格抽取原则：
 - 只保留稳定、可复用、跨轮次仍有价值的信息
-- 不要保留一次性的临时细节
-- 不要把普通礼貌回复写成记忆
-- 如果只是“这轮做了什么”而不是“未来应记住什么”，不要输出
-- 置信度必须保守，没把握就给低分
-- 默认这些记忆都会写入 project scope，所以不要输出只适用于瞬时局部任务的内容
+- 只保留未来再次协作时值得提醒模型的内容
+- 默认这些记忆都会写入 project scope，所以不要输出只适合瞬时局部任务的内容
+- 如果内容只是“这轮做了什么”，而不是“未来应记住什么”，不要输出
+
+下面这些内容不能给高分，通常应该直接不输出：
+- 本轮过程描述
+- 一次性临时操作
+- 没有长期复用价值的解释
+- 礼貌性回复、确认性回复、寒暄
+- 还未验证的猜测
+- 只适合当前瞬时上下文的细节
+
+下面这些内容才可以给高分：
+- 项目长期约定
+- 已验证的重要结论
+- 可复用的失败经验
+- 当前项目语境下长期稳定的协作偏好
+
+confidence 打分规则必须严格使用以下口径：
+- 0.90-1.00: 高度稳定、已验证、未来多次复用都成立的项目级记忆
+- 0.75-0.89: 较稳定且有复用价值，但验证强度略弱于最高档
+- 0.50-0.74: 有一定价值，但稳定性不足、范围偏窄、或仍带过程性痕迹
+- 0.00-0.49: 不应写入长期记忆的内容；这类内容尽量不要输出
+
+额外约束：
+- 若拿不准，宁可少写，不要多写
+- 单次最多输出 4 条
+- content 必须写成一句清晰、可复用、去上下文依赖的话
+- 不要在 content 中提“本轮”“刚刚”“这次先”“稍后再看”这类临时表述
 
 只返回 JSON，格式如下：
 {
@@ -262,54 +275,48 @@ class TaskMemoryReflectionEngine:
   ]
 }
 """.strip()
-        
-        # user_prompt: 真正送给模型的任务上下文。
+
         user_prompt = f"""
-请基于下面这次任务执行信息，提炼值得长期保留的项目级记忆候选：
+请基于下面这次任务执行信息，提炼值得长期保留的项目级记忆候选。
+
+注意：
+- 不要复述执行过程
+- 不要产出临时说明
+- 不要产出礼貌性语句
+- 只有在“未来仍值得保留”时才输出
 
 {context_text}
 """.strip()
-        
+
         try:
-            response=self.client.chat.completions.create(
+            response = self.client.chat.completions.create(
                 model=self.model_name,
                 messages=[
-                    {"role": "system","content": system_prompt},
-                    {"role": "user","content": user_prompt}
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
                 ],
-                # 和你项目其他地方保持一致，关闭 thinking。
                 extra_body={"thinking": {"type": "disabled"}},
             )
-        except:
-            # 反思失败时直接返回空，不影响主流程。
+        except Exception:
             return []
-        
-        # raw_content: 模型返回的原始文本。
-        raw_content=response.choices[0].message.content or ""
 
-        # payload: 解析后的 JSON 对象。
+        raw_content = response.choices[0].message.content or ""
         payload = self._parse_json_payload(raw_content)
-        if not isinstance(payload,dict):
+        if not isinstance(payload, dict):
             return []
-        
-        # raw_memories: 模型返回的 memories 列表。
+
         raw_memories = payload.get("memories", [])
         if not isinstance(raw_memories, list):
             return []
-        
-        result: list[ReflectionMemoryCandidate] = []
 
+        result: list[ReflectionMemoryCandidate] = []
         for item in raw_memories[: self.max_candidates]:
             if not isinstance(item, dict):
                 continue
 
-            # content: 候选记忆正文。
             content = " ".join(str(item.get("content", "")).strip().split())
-
-            # category: 候选记忆类别。
             category = str(item.get("category", "")).strip().lower()
 
-            # raw_tags: 模型给出的原始 tags。
             raw_tags = item.get("tags", [])
             tags = [
                 " ".join(str(tag).strip().lower().split())
@@ -317,7 +324,6 @@ class TaskMemoryReflectionEngine:
                 if str(tag).strip()
             ] if isinstance(raw_tags, list) else []
 
-            # raw_domains: 模型给出的原始领域标签。
             raw_domains = item.get("domains", [])
             domains = [
                 " ".join(str(domain).strip().lower().split())
@@ -325,7 +331,6 @@ class TaskMemoryReflectionEngine:
                 if str(domain).strip()
             ] if isinstance(raw_domains, list) else []
 
-            # confidence: 模型给出的置信度。
             try:
                 confidence = float(item.get("confidence", 0.0))
             except (TypeError, ValueError):
@@ -342,8 +347,7 @@ class TaskMemoryReflectionEngine:
             )
 
         return result
-    
-        
+
     def _post_filter_candidates(
         self,
         candidates: list[ReflectionMemoryCandidate],
@@ -351,34 +355,35 @@ class TaskMemoryReflectionEngine:
         """
         对模型输出做本地清洗。
 
-        这里不负责复杂语义判断，
-        主要做：
-        - 白名单类别过滤
-        - 过短内容过滤
-        - 临时性内容过滤
-        - 同一轮内去重
+        这里不让 confidence 单独决定一切。
+        除了 confidence 之外，还会同时看：
+        - category 是否在白名单
+        - 内容是否明显属于过程性/礼貌性/临时性
+        - 内容长度和信息密度是否达标
+        - 同一轮候选内是否重复
         """
         result: list[ReflectionMemoryCandidate] = []
         seen_keys: set[str] = set()
 
         for item in candidates:
-            # content 为空，直接跳过。
             if not item.content:
                 continue
 
-            # 只允许白名单类别。
             if item.category not in ALLOWED_MEMORY_CATEGORIES:
                 continue
 
-            # 太短通常没有信息量。
             if len(item.content) < 12:
                 continue
 
-            # 明显属于瞬时过程的信息，不进入长期记忆。
             if self._looks_too_temporary(item.content):
                 continue
 
-            # dedupe_key: 同一轮内部去重键。
+            if self._looks_like_low_value_response(item.content):
+                continue
+
+            if self._confidence_is_too_low_for_category(item):
+                continue
+
             dedupe_key = f"{item.category}::{item.content.lower()}"
             if dedupe_key in seen_keys:
                 continue
@@ -389,12 +394,7 @@ class TaskMemoryReflectionEngine:
         return result
 
     def _parse_json_payload(self, text: str) -> Any:
-        """
-        解析模型返回的 JSON。
-
-        有些模型会把 JSON 包在 ```json 代码块里，
-        这里顺手兼容一下。
-        """
+        """解析模型返回的 JSON，兼容 ```json 代码块。"""
         raw = text.strip()
 
         if raw.startswith("```"):
@@ -407,35 +407,51 @@ class TaskMemoryReflectionEngine:
             return json.loads(raw)
         except json.JSONDecodeError:
             return None
-        
+
     def _looks_too_temporary(self, content: str) -> bool:
         """
-        判断一条候选记忆是否太临时。
+        判断候选记忆是否过于临时。
 
-        第一版先用启发式规则过滤，
-        避免把“刚刚执行了什么”这种瞬时过程写进长期记忆。
+        第一阶段先用启发式规则挡掉明显过程性内容，
+        避免把“刚刚做了什么”直接写成长期记忆。
         """
         lowered = content.lower()
-        markers = [
-            "本轮",
-            "这一次",
-            "刚刚",
-            "临时",
-            "暂时",
-            "稍后",
-            "马上",
-            "this turn",
-            "just now",
-            "temporarily",
-        ]
-        return any(marker in lowered for marker in markers)
-    
-    def _shorten(self, text: str, max_chars: int) -> str:
-        """
-        裁剪长文本，避免 prompt 过重。
+        return any(marker in lowered for marker in TEMPORARY_CONTENT_MARKERS)
 
-        这里会先压缩空白，再按最大字符数截断。
+    def _looks_like_low_value_response(self, content: str) -> bool:
         """
+        过滤明显低价值的应答式内容。
+
+        这类内容常见于礼貌回复、简单确认、执行状态播报，
+        即便模型误给了较高 confidence，也不应该进入长期记忆。
+        """
+        lowered = content.lower()
+        if any(phrase in lowered for phrase in LOW_VALUE_PHRASES):
+            return True
+
+        # 过短并带明显应答语气，通常不具备长期复用价值。
+        if len(content) <= 24 and ("可以" in content or "好的" in content or "收到" in content):
+            return True
+
+        return False
+
+    def _confidence_is_too_low_for_category(self, item: ReflectionMemoryCandidate) -> bool:
+        """
+        根据类别设置更保守的最低 confidence。
+
+        这样可以避免模型把过程性内容打到 0.5-0.7 之间时仍然被放过。
+        """
+        min_confidence_by_category = {
+            "preference": 0.82,
+            "convention": 0.80,
+            "conclusion": 0.78,
+            "failure": 0.78,
+        }
+        threshold = min_confidence_by_category.get(item.category, 0.80)
+        return item.confidence < threshold
+
+    def _shorten(self, text: str, max_chars: int) -> str:
+        """裁剪长文本，避免 reflection prompt 过重。"""
         cleaned = " ".join(text.strip().split())
         if len(cleaned) <= max_chars:
             return cleaned

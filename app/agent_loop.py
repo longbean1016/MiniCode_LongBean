@@ -216,6 +216,12 @@ def _run_agent_loop(
                 ttl_seconds=1800,
                 importance=0.9,
             )
+            working_memory.protect(
+                f"模型调用失败: {error}",
+                entry_type="reflection_failure",
+                ttl_seconds=1800,
+                importance=0.9,
+            )
             fallback = AgentStep(
                 type="assistant",
                 content=f"模型调用失败: {error}",
@@ -235,6 +241,13 @@ def _run_agent_loop(
                 working_memory.protect(
                     decision,
                     entry_type="key_decision",
+                    ttl_seconds=3600,
+                    importance=0.95,
+                )
+                # 这类条目只用于本轮 task reflection 输入，不注入后续 prompt。
+                working_memory.protect(
+                    decision,
+                    entry_type="reflection_decision",
                     ttl_seconds=3600,
                     importance=0.95,
                 )
@@ -277,6 +290,13 @@ def _run_agent_loop(
                         entry_type="active_task",
                         ttl_seconds=1800,
                         importance=0.8,
+                    )
+                    # 单独记录本轮触及的文件/路径，供长期记忆反思使用。
+                    working_memory.protect(
+                        path,
+                        entry_type="reflection_file",
+                        ttl_seconds=1800,
+                        importance=0.7,
                     )
 
                 # 先把工具调用请求记到历史里
@@ -324,9 +344,16 @@ def _run_agent_loop(
 
                 # 工具失败时，把错误压成短摘要写进短期工作记忆。
                 if not result.ok:
+                    failure_summary = summarize_failure(tool_name, result)
                     working_memory.protect(
-                        summarize_failure(tool_name, result),
+                        failure_summary,
                         entry_type="error_context",
+                        ttl_seconds=1800,
+                        importance=0.9,
+                    )
+                    working_memory.protect(
+                        failure_summary,
+                        entry_type="reflection_failure",
                         ttl_seconds=1800,
                         importance=0.9,
                     )
