@@ -179,6 +179,9 @@ class MemoryStore(Protocol):
     def get_memory_by_id(self, memory_id: str) -> MemoryEntry | None:
         ...
 
+    def mark_memories_accessed(self, memory_ids: list[str]) -> None:
+        ...
+
     def search_memories(
         self,
         query: str,
@@ -282,6 +285,35 @@ class JsonMemoryStore:
                 return entry
 
         return None
+
+    def mark_memories_accessed(self, memory_ids: list[str]) -> None:
+        """
+        批量更新指定记忆的访问统计。
+
+        这个接口给 prompt 注入链路使用：
+        - 先召回一批候选
+        - rerank 后只给真正注入 prompt 的记忆记一次 access
+        这样可以避免只是“被召回但没被使用”的记忆污染 usage_count。
+        """
+        normalized_ids = {item.strip() for item in memory_ids if item.strip()}
+        if not normalized_ids:
+            return
+
+        by_id = {entry.id: entry for entry in self.load_memories()}
+        now = time.time()
+        changed = False
+
+        for memory_id in normalized_ids:
+            stored_entry = by_id.get(memory_id)
+            if stored_entry is None:
+                continue
+
+            stored_entry.usage_count += 1
+            stored_entry.last_accessed_at = now
+            changed = True
+
+        if changed:
+            self.save_memories(list(by_id.values()))
 
     def save_memories(self, entries: list[MemoryEntry]) -> None:
         """把全部长期记忆完整写回 JSON 文件。"""
@@ -603,21 +635,10 @@ class JsonMemoryStore:
 
         访问统计主要给后面的 decay / rerank 使用。
         """
-        by_id = {entry.id: entry for entry in self.load_memories()}
-        now = time.time()
-        changed = False
-
-        for picked in picked_entries:
-            stored_entry = by_id.get(picked.id)
-            if stored_entry is None:
-                continue
-
-            stored_entry.usage_count += 1
-            stored_entry.last_accessed_at = now
-            changed = True
-
-        if changed:
-            self.save_memories(list(by_id.values()))
+        memory_ids = [entry.id for entry in picked_entries if entry.id]
+        if not memory_ids:
+            return
+        self.mark_memories_accessed(memory_ids)
 
     def _get_sort_value(self, entry: MemoryEntry, sort_by: MemorySortField) -> float:
         """读取排序字段对应的值。"""
