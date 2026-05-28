@@ -18,7 +18,7 @@ MemorySortField = Literal["updated_at", "created_at", "last_accessed_at", "usage
 
 
 def _normalize_text(text: str) -> str:
-    """把文本做基础规范化，便于后续做过滤和检索。"""
+    """把文本做基础规范化，便于过滤和检索。"""
     return " ".join(str(text).strip().lower().split())
 
 
@@ -35,8 +35,9 @@ class MemoryEntry:
     """
     一条长期记忆。
 
-    常用 metadata 已经提升为正式字段，
-    后续做向量检索、curator、decay 都直接用这些字段，不再依赖 `extra`。
+    当前常用 metadata 已经提升为正式字段，
+    这样后续做 verifier / curator / decay / retrieval 时，
+    不需要把核心信息都塞进 extra 里。
     """
 
     id: str
@@ -57,7 +58,7 @@ class MemoryEntry:
     decay_score: float = 1.0
     archived: bool = False
 
-    # 保留 extra 作为向后兼容和扩展字段。
+    # 额外信息留在 extra 里，便于兼容和扩展。
     extra: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -84,13 +85,17 @@ class MemoryEntry:
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "MemoryEntry":
         """
-        从字典恢复一条 `MemoryEntry`。
+        从字典恢复一条 MemoryEntry。
 
-        兼容两种数据：
+        同时兼容：
         1. 新版正式 metadata 字段
-        2. 旧版把 metadata 塞在 `extra` 里的格式
+        2. 旧版把 metadata 塞在 extra 里的格式
         """
-        extra = dict(data.get("extra", {})) if isinstance(data.get("extra", {}), dict) else {}
+        extra = (
+            dict(data.get("extra", {}))
+            if isinstance(data.get("extra", {}), dict)
+            else {}
+        )
 
         scope = str(data.get("scope", extra.get("scope", "project"))).strip() or "project"
 
@@ -100,11 +105,11 @@ class MemoryEntry:
             confidence = 0.0
 
         raw_domains = data.get("domains", extra.get("domains", []))
-        domains = [
-            str(item).strip()
-            for item in raw_domains
-            if str(item).strip()
-        ] if isinstance(raw_domains, list) else []
+        domains = (
+            [str(item).strip() for item in raw_domains if str(item).strip()]
+            if isinstance(raw_domains, list)
+            else []
+        )
 
         source = str(data.get("source", extra.get("source", ""))).strip()
 
@@ -160,7 +165,18 @@ class MemoryStore(Protocol):
     def save_memories(self, entries: list[MemoryEntry]) -> None:
         ...
 
+    def save_memories_and_sync(
+        self,
+        entries: list[MemoryEntry],
+        *,
+        changed_entry_ids: list[str] | None = None,
+    ) -> None:
+        ...
+
     def add_memory(self, entry: MemoryEntry) -> MemoryEntry:
+        ...
+
+    def get_memory_by_id(self, memory_id: str) -> MemoryEntry | None:
         ...
 
     def search_memories(
@@ -203,13 +219,9 @@ class JsonMemoryStore:
     """
     基于本地 JSON 文件的长期记忆存储实现。
 
-    这一层现在同时负责两件事：
+    这里同时负责两件事：
     1. 把权威数据落到 `.memory/memory.json`
-    2. 如果启用了 `MemoryVectorIndex`，同步把记忆写入 Qdrant
-
-    这样可以确保：
-    - JSON 仍然是最稳定、最容易排查的主存储
-    - Qdrant 负责语义召回和 dashboard 可视化
+    2. 如果启用了 Qdrant，同步维护语义索引
     """
 
     def __init__(
@@ -247,7 +259,7 @@ class JsonMemoryStore:
             return []
 
     def load_memories(self) -> list[MemoryEntry]:
-        """加载全部长期记忆，并转成 `MemoryEntry` 列表。"""
+        """加载全部长期记忆，并转成 MemoryEntry 列表。"""
         raw_entries = self._read_raw_entries()
         result: list[MemoryEntry] = []
 
@@ -258,6 +270,18 @@ class JsonMemoryStore:
                 continue
 
         return result
+
+    def get_memory_by_id(self, memory_id: str) -> MemoryEntry | None:
+        """按 memory id 查找一条长期记忆。"""
+        normalized_memory_id = memory_id.strip()
+        if not normalized_memory_id:
+            return None
+
+        for entry in self.load_memories():
+            if entry.id == normalized_memory_id:
+                return entry
+
+        return None
 
     def save_memories(self, entries: list[MemoryEntry]) -> None:
         """把全部长期记忆完整写回 JSON 文件。"""
@@ -270,18 +294,79 @@ class JsonMemoryStore:
         )
         temp_file.replace(self.memory_file)
 
+    def save_memories_and_sync(
+        self,
+        entries: list[MemoryEntry],
+        *,
+        changed_entry_ids: list[str] | None = None,
+    ) -> None:
+        """
+        保存长期记忆，并把变更同步到 Qdrant。
+
+        这个方法主要给 curator 使用，因为 curator 会修改已有记忆的：
+        - archived
+        - extra.merged_into / extra.superseded_by
+        - updated_at
+        """
+        previous_text = ""
+        had_previous_file = self.memory_file.exists()
+        if had_previous_file:
+            previous_text = self.memory_file.read_text(encoding="utf-8")
+
+        self.save_memories(entries)
+
+        normalized_changed_ids = {
+            item.strip()
+            for item in (changed_entry_ids or [])
+            if item.strip()
+        }
+        if self.vector_index is None or not normalized_changed_ids:
+            return
+
+        by_id = {entry.id: entry for entry in entries}
+        changed_entries = [
+            by_id[memory_id]
+            for memory_id in normalized_changed_ids
+            if memory_id in by_id
+        ]
+        if not changed_entries:
+            return
+
+        try:
+            self.sync_entries_to_vector(changed_entries)
+        except Exception:
+            # 如果 Qdrant 同步失败，就恢复 JSON，避免本地与向量库状态不一致。
+            if had_previous_file:
+                self.memory_file.write_text(previous_text, encoding="utf-8")
+            else:
+                try:
+                    self.memory_file.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            raise
+
+    def sync_entries_to_vector(self, entries: list[MemoryEntry]) -> None:
+        """
+        把指定记忆集合批量同步到 Qdrant。
+
+        这里统一使用 upsert：
+        - 新记忆会被写入
+        - 已归档记忆会用新的 payload 覆盖旧 payload
+        """
+        if self.vector_index is None:
+            return
+
+        for entry in entries:
+            self.vector_index.upsert_memory(entry)
+
     def add_memory(self, entry: MemoryEntry) -> MemoryEntry:
         """
         新增一条长期记忆并同步到向量索引。
 
-        这里故意把“向量入库”也放在 store 里做，原因是：
-        - 长期记忆的权威写入动作只有这一处
-        - 这样 JSON 和 Qdrant 的一致性更容易维护
-
-        当前采用的策略是：
+        顺序仍然保持：
         1. 先写 JSON
         2. 再写 Qdrant
-        3. 如果 Qdrant 写入失败，就回滚 JSON，避免出现只落本地不落向量库的半成功状态
+        3. 如果 Qdrant 失败，回滚 JSON
         """
         entries = self.load_memories()
 
@@ -298,9 +383,8 @@ class JsonMemoryStore:
 
         if self.vector_index is not None:
             try:
-                self.vector_index.upsert_memory(entry)
+                self.sync_entries_to_vector([entry])
             except Exception:
-                # 向量入库失败时回滚 JSON，避免主存储和向量索引不一致。
                 rolled_back_entries = [item for item in entries if item.id != entry.id]
                 self.save_memories(rolled_back_entries)
                 raise
@@ -382,8 +466,8 @@ class JsonMemoryStore:
         按查询语句检索最相关的长期记忆。
 
         优先级：
-        1. 如果配置了向量索引，优先走 Qdrant 语义召回
-        2. 如果语义召回失败，再退回到本地词面检索
+        1. 若配置了向量索引，优先走 Qdrant 语义召回
+        2. 如果语义召回失败，再回退到本地词面检索
         """
         semantic_entries = self._search_memories_semantically(
             query=query,
@@ -418,12 +502,7 @@ class JsonMemoryStore:
         include_archived: bool,
         mark_access: bool,
     ) -> list[MemoryEntry]:
-        """
-        使用 Qdrant 做语义检索。
-
-        这里先拿到命中的 memory id，再回本地 JSON 取完整 `MemoryEntry`，
-        保证 JSON 始终是最终权威来源。
-        """
+        """使用 Qdrant 做语义检索。"""
         if self.vector_index is None:
             return []
 
@@ -462,11 +541,7 @@ class JsonMemoryStore:
         include_archived: bool,
         mark_access: bool,
     ) -> list[MemoryEntry]:
-        """
-        使用本地词面规则做检索。
-
-        这是向量检索不可用时的兜底路径。
-        """
+        """使用本地词面规则做检索。"""
         normalized_query = _normalize_text(query)
         if not normalized_query:
             return []
@@ -504,7 +579,7 @@ class JsonMemoryStore:
                 if normalized_domain and normalized_domain in normalized_query:
                     score += 0.35
 
-            # 轻量把 confidence 和 decay 纳入排序。
+            # 轻量把 confidence 和 decay 也纳入排序。
             score += min(0.2, max(0.0, entry.confidence) * 0.2)
             score += min(0.2, max(0.0, entry.decay_score) * 0.1)
 
@@ -526,7 +601,7 @@ class JsonMemoryStore:
         """
         批量更新记忆访问统计。
 
-        这一步是后面做 decay 和 rerank 的基础数据。
+        访问统计主要给后面的 decay / rerank 使用。
         """
         by_id = {entry.id: entry for entry in self.load_memories()}
         now = time.time()

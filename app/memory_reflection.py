@@ -9,15 +9,15 @@ from openai import OpenAI
 from app.types import AgentStep, ChatMessage
 
 
-# 自动 reflection 目前只允许产出这四类项目级长期记忆。
+# 自动 reflection 当前只允许产出这四类项目级长期记忆。
 ALLOWED_MEMORY_CATEGORIES = {
     "preference",  # 当前项目协作中长期稳定有效的偏好
     "convention",  # 项目约定、实现约束、工作方式
     "conclusion",  # 已验证的重要结论、方案、架构判断
-    "failure",     # 可复用的失败经验、踩坑结论、风险警告
+    "failure",  # 可复用的失败经验、踩坑结论、风险警告
 }
 
-# 明显属于过程性、礼貌性、临时性的表达，不应该进长期记忆。
+# 明显属于过程性、礼貌性、临时性的表达，不应该进入长期记忆。
 TEMPORARY_CONTENT_MARKERS = {
     "本轮",
     "这一轮",
@@ -56,7 +56,7 @@ class TaskReflectionInput:
     """
     一次任务反思所需的结构化输入。
 
-    不是拿一整段聊天直接抽记忆，
+    不是拿整段聊天直接抽记忆，
     而是把当前任务整理成 task description + execution trace 风格的输入。
     """
 
@@ -65,7 +65,7 @@ class TaskReflectionInput:
     turn_messages: list[ChatMessage]  # 本轮完整消息链，用来提取执行轨迹
     key_decisions: list[str] = field(default_factory=list)  # 本轮关键决策列表
     failures: list[str] = field(default_factory=list)  # 本轮失败、报错、阻断、风险列表
-    files_touched: list[str] = field(default_factory=list)  # 本轮触及的重要文件路径
+    files_touched: list[str] = field(default_factory=list)  # 本轮涉及的重要文件路径
 
 
 @dataclass(slots=True)
@@ -90,8 +90,8 @@ class TaskMemoryReflectionEngine:
 
     职责：
     1. 把当前任务执行整理成结构化上下文
-    2. 让模型提炼“未来仍值得保留”的项目级记忆
-    3. 返回候选结果，交给上层继续做写入门槛判断
+    2. 让模型提炼“未来仍值得复用”的项目级记忆
+    3. 对模型输出做本地清洗，减少乱合并、乱拆分和过程性污染
     """
 
     def __init__(
@@ -116,7 +116,7 @@ class TaskMemoryReflectionEngine:
         对当前任务做一次结构化反思。
 
         流程：
-        1. 先构造反思上下文
+        1. 构造反思上下文
         2. 调模型生成候选记忆
         3. 对候选结果做一层本地清洗
         """
@@ -213,9 +213,9 @@ class TaskMemoryReflectionEngine:
         """
         调模型做 task reflection。
 
-        当前阶段重点是收紧评分口径：
-        - 高分只留给稳定、可复用、已验证的信息
-        - 过程描述、礼貌回复、一次性操作不允许高分
+        当前阶段重点有两类约束：
+        1. 只留下稳定、可复用、项目级的记忆
+        2. 尽量避免把多个独立约定乱合并，或把同一个约定拆成碎片
         """
         system_prompt = """
 你是一个代码 Agent 的长期记忆反思器。
@@ -236,7 +236,7 @@ class TaskMemoryReflectionEngine:
 - 默认这些记忆都会写入 project scope，所以不要输出只适合瞬时局部任务的内容
 - 如果内容只是“这轮做了什么”，而不是“未来应记住什么”，不要输出
 
-下面这些内容不能给高分，通常应该直接不输出：
+下面这些内容不能高分，通常应该直接不输出：
 - 本轮过程描述
 - 一次性临时操作
 - 没有长期复用价值的解释
@@ -244,11 +244,19 @@ class TaskMemoryReflectionEngine:
 - 还未验证的猜测
 - 只适合当前瞬时上下文的细节
 
-下面这些内容才可以给高分：
+下面这些内容才可以高分：
 - 项目长期约定
 - 已验证的重要结论
 - 可复用的失败经验
 - 当前项目语境下长期稳定的协作偏好
+
+关于“合并 / 拆分”，必须遵守下面规则：
+- 如果两条信息属于同一个稳定约定的两个部分，可以合并成一条
+- 如果两条信息分别对应两个独立约定，必须拆成两条，不要硬合并
+- 不要把“主约定 + 附带说明 + 礼貌结尾”拼成一条
+- 一条 memory 最好只表达一个核心规则或一个核心结论
+- 如果一条 memory 中出现“；”、“以及”、“并且”连接了两个不同规则，优先拆开
+- 但如果两部分本质上是在共同描述同一个约定，也可以保留为一条
 
 confidence 打分规则必须严格使用以下口径：
 - 0.90-1.00: 高度稳定、已验证、未来多次复用都成立的项目级记忆
@@ -259,8 +267,8 @@ confidence 打分规则必须严格使用以下口径：
 额外约束：
 - 若拿不准，宁可少写，不要多写
 - 单次最多输出 4 条
-- content 必须写成一句清晰、可复用、去上下文依赖的话
-- 不要在 content 中提“本轮”“刚刚”“这次先”“稍后再看”这类临时表述
+- content 必须写成一句清晰、可复用、去上下文依赖的规则或结论
+- 不要在 content 里提“本轮”“刚刚”“这次先”“稍后再看”这类临时表达
 
 只返回 JSON，格式如下：
 {
@@ -284,6 +292,8 @@ confidence 打分规则必须严格使用以下口径：
 - 不要产出临时说明
 - 不要产出礼貌性语句
 - 只有在“未来仍值得保留”时才输出
+- 如果两条候选分别代表两个独立约定，请拆成两条
+- 如果只是同一个约定的两种表述，请只保留一条更清晰的版本
 
 {context_text}
 """.strip()
@@ -358,9 +368,10 @@ confidence 打分规则必须严格使用以下口径：
         这里不让 confidence 单独决定一切。
         除了 confidence 之外，还会同时看：
         - category 是否在白名单
-        - 内容是否明显属于过程性/礼貌性/临时性
+        - 内容是否明显属于过程性、礼貌性、临时性
         - 内容长度和信息密度是否达标
         - 同一轮候选内是否重复
+        - 是否出现“一个 content 混了多个独立约定”的迹象
         """
         result: list[ReflectionMemoryCandidate] = []
         seen_keys: set[str] = set()
@@ -382,6 +393,9 @@ confidence 打分规则必须严格使用以下口径：
                 continue
 
             if self._confidence_is_too_low_for_category(item):
+                continue
+
+            if self._looks_over_merged(item):
                 continue
 
             dedupe_key = f"{item.category}::{item.content.lower()}"
@@ -429,7 +443,6 @@ confidence 打分规则必须严格使用以下口径：
         if any(phrase in lowered for phrase in LOW_VALUE_PHRASES):
             return True
 
-        # 过短并带明显应答语气，通常不具备长期复用价值。
         if len(content) <= 24 and ("可以" in content or "好的" in content or "收到" in content):
             return True
 
@@ -449,6 +462,27 @@ confidence 打分规则必须严格使用以下口径：
         }
         threshold = min_confidence_by_category.get(item.category, 0.80)
         return item.confidence < threshold
+
+    def _looks_over_merged(self, item: ReflectionMemoryCandidate) -> bool:
+        """
+        识别“多个独立约定被硬合并到一条 memory”。
+
+        这里只做保守拦截：
+        - 只对 convention / conclusion 做这层检查
+        - 如果 content 过长，同时出现多个强连接词，并且 tags 数量也偏多，
+          通常说明模型把多个独立规则揉到了一条里
+        """
+        if item.category not in {"convention", "conclusion"}:
+            return False
+
+        content = item.content
+        split_markers = ("；", ";", "以及", "并且", "同时", "另外")
+        marker_count = sum(content.count(marker) for marker in split_markers)
+
+        if len(content) >= 60 and marker_count >= 2 and len(item.tags) >= 4:
+            return True
+
+        return False
 
     def _shorten(self, text: str, max_chars: int) -> str:
         """裁剪长文本，避免 reflection prompt 过重。"""

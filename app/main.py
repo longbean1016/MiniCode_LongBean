@@ -6,9 +6,10 @@ from app.agent_loop import continue_agent_from_history, run_agent_once
 from app.config import load_config
 from app.history_summarizer import OlderHistorySummarizer
 from app.logger import log_event
+from app.memory_curator import MemoryCurator
 from app.memory_extractor import LongTermMemoryExtractor
 from app.memory_guard import MemoryWriteGuard
-from app.memory_store import JsonMemoryStore
+from app.memory_store import JsonMemoryStore, MemoryEntry
 from app.memory_vector_index import MemoryVectorIndex
 from app.memory_verifier import MemoryVerifier
 from app.model_registry import OpenAIModelAdapter
@@ -217,18 +218,23 @@ def _persist_extracted_memories(
     memory_guard: MemoryWriteGuard,
     memory_verifier: MemoryVerifier,
     entries: list[MemoryEntry],
-) -> int:
+) -> list[MemoryEntry]:
     """
     把抽取出来的长期记忆写入 memory store。
 
     当前阶段的写入流程是：
     1. 先读取已有长期记忆
     2. 逐条走 `MemoryWriteGuard` 做快速门禁
-    3. 再走 `MemoryVerifier` 做 duplicate / conflict / reject 判断
-    4. 只有 verifier 判定为 `store` 才真正落盘
+    3. 再走 `MemoryVerifier` 做 duplicate / conflict / reject / supersede_store 判断
+    4. 只有 verifier 判定为 `store` 或 `supersede_store` 才真正落盘
+
+    `supersede_store` 是 minicode 风格更新链路的关键：
+    - 新记忆先允许入库
+    - 再把“它替代的是哪条旧记忆”一起记到 extra 里
+    - 后面的 curator 会根据这条显式关系，把旧记忆降级成 superseded
     """
     existing_entries = memory_store.load_memories()
-    stored_count = 0
+    stored_entries: list[MemoryEntry] = []
 
     for entry in entries:
         guard_decision = memory_guard.should_store(entry)
@@ -237,14 +243,25 @@ def _persist_extracted_memories(
 
         similar_entries = memory_verifier.find_similar_entries(entry, existing_entries)
         verify_decision = memory_verifier.verify(entry, similar_entries)
-        if verify_decision.action != "store":
+        if verify_decision.action not in {"store", "supersede_store"}:
             continue
+
+        # 如果 verifier 已经确认“这是一条替代更新”，
+        # 就把被替代的旧记忆 id 显式写入 extra。
+        # 这样 curator 后面不必完全依赖启发式猜测关系，
+        # 能更稳定地把旧版本归档出主检索面。
+        if (
+            verify_decision.action == "supersede_store"
+            and verify_decision.matched_memory_id.strip()
+        ):
+            entry.extra["supersedes_memory_id"] = verify_decision.matched_memory_id.strip()
+            entry.extra["write_action"] = "supersede_store"
 
         stored_entry = memory_store.add_memory(entry)
         existing_entries.append(stored_entry)
-        stored_count += 1
+        stored_entries.append(stored_entry)
 
-    return stored_count
+    return stored_entries
 
 
 def main() -> None:
@@ -310,6 +327,7 @@ def main() -> None:
         model_name=config.model,
         vector_index=vector_index,
     )
+    memory_curator = MemoryCurator(memory_store)
 
     # 旧历史摘要器只服务于 prompt 构造时的 older history summary。
     # 它带运行期缓存，避免每轮循环都重复调用模型做摘要。
@@ -479,12 +497,23 @@ def main() -> None:
                 )
 
                 # 候选记忆先过 guard，再允许落盘。
-                _persist_extracted_memories(
+                stored_entries = _persist_extracted_memories(
                     memory_store,
                     memory_guard,
                     memory_verifier,
                     extracted_memories,
                 )
+
+                # 只围绕本次新写入的 project 记忆做增量整理。
+                # curator 的职责是让长期记忆“逐步收敛”，
+                # 避免系统长期运行后只增不减、重复堆积。
+                if stored_entries:
+                    memory_curator.curate_new_entries(stored_entries)
+
+                    # 当 active project 记忆增长到一定规模后，
+                    # 再额外触发一次低频全量整理，避免只做增量时留下历史脏数据。
+                    if memory_curator.should_run_full_scan():
+                        memory_curator.curate_project_memories()
             except Exception as error:
                 # 长期记忆反思失败不能影响主流程回答，
                 # 但必须把原因打印并写日志，否则会变成“静默丢记忆”，很难排查。
