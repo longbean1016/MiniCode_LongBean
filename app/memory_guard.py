@@ -61,7 +61,7 @@ class MemoryWriteGuard:
                 reason="空内容",
             )
 
-        if str(candidate.extra.get("scope", "")).strip().lower() != "project":
+        if candidate.scope.strip().lower() != "project":
             return MemoryWriteDecision(
                 should_store=False,
                 reason="自动 reflection 只允许写 project scope",
@@ -77,9 +77,8 @@ class MemoryWriteGuard:
 
     def _get_confidence(self, entry: MemoryEntry) -> float:
         """从 `entry.extra` 中读取 confidence。"""
-        raw_value = entry.extra.get("confidence", 0.0)
         try:
-            return float(raw_value)
+            return float(entry.confidence)
         except (TypeError, ValueError):
             return 0.0
 

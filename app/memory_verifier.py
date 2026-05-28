@@ -74,12 +74,12 @@ class MemoryVerifier:
         - 优先保留同 category 的记忆
         - 用词面重叠做第一轮近似召回
         """
-        candidate_scope = str(candidate.extra.get("scope", "")).strip().lower()
+        candidate_scope = candidate.scope.strip().lower()
         candidate_category = self._normalize_text(candidate.category)
 
         scored_entries: list[tuple[float, MemoryEntry]] = []
         for entry in existing_entries:
-            existing_scope = str(entry.extra.get("scope", "")).strip().lower()
+            existing_scope = entry.scope.strip().lower()
             if candidate_scope and existing_scope and existing_scope != candidate_scope:
                 continue
 
@@ -258,7 +258,7 @@ class MemoryVerifier:
             "## 新候选记忆",
             f"id: {candidate.id}",
             f"category: {candidate.category}",
-            f"confidence: {candidate.extra.get('confidence', '')}",
+            f"confidence: {candidate.confidence}",
             f"content: {candidate.content}",
             "",
             "## 相似旧记忆",

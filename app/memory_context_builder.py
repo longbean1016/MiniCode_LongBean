@@ -82,7 +82,7 @@ def build_memory_context(
     """
     sections: list[str] = []
 
-    # 优先使用当前这轮刚算出的旧历史摘要。
+    # 优先使用当前这轮刚算出来的旧历史摘要。
     session_summary = _shorten(session_summary_override, max_summary_chars)
 
     # 如果这轮没显式传入，就回退到 session.extra 里持久化的摘要缓存。
@@ -105,9 +105,12 @@ def build_memory_context(
     long_term_memory_text = ""
     if memory_store is not None:
         try:
+            # 当前自动主链路只写 project scope，因此这里默认也只检索 project。
             related_memories = memory_store.search_memories(
                 query=user_input,
                 top_k=top_k,
+                scope="project",
+                include_archived=False,
             )
         except Exception:
             related_memories = []

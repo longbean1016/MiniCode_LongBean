@@ -76,16 +76,10 @@ class LongTermMemoryExtractor:
                     category=candidate.category,
                     tags=candidate.tags,
                     session_id=session_id,
-                    extra={
-                        # 记录来源，便于后面区分自动 reflection 和其他写入渠道。
-                        "source": "task_reflection",
-                        # 当前自动主链路严格只写 project。
-                        "scope": "project",
-                        # 反思模型给出的领域标签，后面做过滤和排序时可复用。
-                        "domains": list(candidate.domains),
-                        # 模型给出的保守置信度，后续由 guard 再做门槛判断。
-                        "confidence": candidate.confidence,
-                    },
+                    source="task_reflection",
+                    scope="project",
+                    domains=list(candidate.domains),
+                    confidence=candidate.confidence,
                 )
             )
 
