@@ -5,7 +5,10 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal, Protocol
+from typing import TYPE_CHECKING, Any, Literal, Protocol
+
+if TYPE_CHECKING:
+    from app.memory_vector_index import MemoryVectorIndex
 
 
 MEMORY_DIR_NAME = ".memory"
@@ -32,8 +35,8 @@ class MemoryEntry:
     """
     一条长期记忆。
 
-    从这一版开始，常用 metadata 改成正式字段，
-    不再只是临时塞在 `extra` 里。
+    常用 metadata 已经提升为正式字段，
+    后续做向量检索、curator、decay 都直接用这些字段，不再依赖 `extra`。
     """
 
     id: str
@@ -54,7 +57,7 @@ class MemoryEntry:
     decay_score: float = 1.0
     archived: bool = False
 
-    # 仍保留 extra 作为向后兼容和扩展字段。
+    # 保留 extra 作为向后兼容和扩展字段。
     extra: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -200,16 +203,25 @@ class JsonMemoryStore:
     """
     基于本地 JSON 文件的长期记忆存储实现。
 
-    当前阶段目标：
-    - 把 memory metadata 结构正式化
-    - 保持旧数据兼容
-    - 提供后续向量检索、curator、decay 会用到的基础查询接口
+    这一层现在同时负责两件事：
+    1. 把权威数据落到 `.memory/memory.json`
+    2. 如果启用了 `MemoryVectorIndex`，同步把记忆写入 Qdrant
+
+    这样可以确保：
+    - JSON 仍然是最稳定、最容易排查的主存储
+    - Qdrant 负责语义召回和 dashboard 可视化
     """
 
-    def __init__(self, workspace: str) -> None:
+    def __init__(
+        self,
+        workspace: str,
+        *,
+        vector_index: MemoryVectorIndex | None = None,
+    ) -> None:
         self.workspace = str(Path(workspace).resolve())
         self.memory_dir = Path(self.workspace) / MEMORY_DIR_NAME
         self.memory_file = self.memory_dir / MEMORY_FILE_NAME
+        self.vector_index = vector_index
 
     def _ensure_dir(self) -> None:
         """确保记忆目录存在。"""
@@ -259,7 +271,18 @@ class JsonMemoryStore:
         temp_file.replace(self.memory_file)
 
     def add_memory(self, entry: MemoryEntry) -> MemoryEntry:
-        """新增一条长期记忆并立即落盘。"""
+        """
+        新增一条长期记忆并同步到向量索引。
+
+        这里故意把“向量入库”也放在 store 里做，原因是：
+        - 长期记忆的权威写入动作只有这一处
+        - 这样 JSON 和 Qdrant 的一致性更容易维护
+
+        当前采用的策略是：
+        1. 先写 JSON
+        2. 再写 Qdrant
+        3. 如果 Qdrant 写入失败，就回滚 JSON，避免出现只落本地不落向量库的半成功状态
+        """
         entries = self.load_memories()
 
         if not entry.id.strip():
@@ -272,6 +295,16 @@ class JsonMemoryStore:
 
         entries.append(entry)
         self.save_memories(entries)
+
+        if self.vector_index is not None:
+            try:
+                self.vector_index.upsert_memory(entry)
+            except Exception:
+                # 向量入库失败时回滚 JSON，避免主存储和向量索引不一致。
+                rolled_back_entries = [item for item in entries if item.id != entry.id]
+                self.save_memories(rolled_back_entries)
+                raise
+
         return entry
 
     def filter_memories(
@@ -282,11 +315,7 @@ class JsonMemoryStore:
         domains: list[str] | None = None,
         include_archived: bool = False,
     ) -> list[MemoryEntry]:
-        """
-        按 metadata 过滤长期记忆。
-
-        这是后面做 verifier、vector retrieval、curator、decay 的基础能力。
-        """
+        """按 metadata 过滤长期记忆。"""
         normalized_scope = _normalize_text(scope or "")
         normalized_category = _normalize_text(category or "")
         normalized_domains = {
@@ -325,18 +354,13 @@ class JsonMemoryStore:
         include_archived: bool = False,
         sort_by: MemorySortField = "updated_at",
     ) -> list[MemoryEntry]:
-        """
-        获取最近写入或最近访问的记忆集合。
-
-        后面 curator / decay / 调试展示都可以复用这个接口。
-        """
+        """获取最近写入或最近访问的记忆集合。"""
         entries = self.filter_memories(
             scope=scope,
             category=category,
             domains=domains,
             include_archived=include_archived,
         )
-
         entries.sort(
             key=lambda entry: self._get_sort_value(entry, sort_by),
             reverse=True,
@@ -357,8 +381,91 @@ class JsonMemoryStore:
         """
         按查询语句检索最相关的长期记忆。
 
-        当前仍然使用轻量词面打分，但已经支持 metadata filter。
-        后面接向量库时，可以保留这个接口不变，只替换内部召回实现。
+        优先级：
+        1. 如果配置了向量索引，优先走 Qdrant 语义召回
+        2. 如果语义召回失败，再退回到本地词面检索
+        """
+        semantic_entries = self._search_memories_semantically(
+            query=query,
+            top_k=top_k,
+            scope=scope,
+            category=category,
+            domains=domains,
+            include_archived=include_archived,
+            mark_access=mark_access,
+        )
+        if semantic_entries:
+            return semantic_entries
+
+        return self._search_memories_lexically(
+            query=query,
+            top_k=top_k,
+            scope=scope,
+            category=category,
+            domains=domains,
+            include_archived=include_archived,
+            mark_access=mark_access,
+        )
+
+    def _search_memories_semantically(
+        self,
+        *,
+        query: str,
+        top_k: int,
+        scope: str | None,
+        category: str | None,
+        domains: list[str] | None,
+        include_archived: bool,
+        mark_access: bool,
+    ) -> list[MemoryEntry]:
+        """
+        使用 Qdrant 做语义检索。
+
+        这里先拿到命中的 memory id，再回本地 JSON 取完整 `MemoryEntry`，
+        保证 JSON 始终是最终权威来源。
+        """
+        if self.vector_index is None:
+            return []
+
+        try:
+            hits = self.vector_index.search_similar_memories(
+                query_text=query,
+                top_k=top_k,
+                scope=scope,
+                category=category,
+                domains=domains,
+                include_archived=include_archived,
+            )
+        except Exception:
+            return []
+
+        by_id = {entry.id: entry for entry in self.load_memories()}
+        result: list[MemoryEntry] = []
+        for hit in hits:
+            entry = by_id.get(hit.memory_id)
+            if entry is not None:
+                result.append(entry)
+
+        if mark_access and result:
+            self._mark_entries_accessed(result)
+
+        return result
+
+    def _search_memories_lexically(
+        self,
+        *,
+        query: str,
+        top_k: int,
+        scope: str | None,
+        category: str | None,
+        domains: list[str] | None,
+        include_archived: bool,
+        mark_access: bool,
+    ) -> list[MemoryEntry]:
+        """
+        使用本地词面规则做检索。
+
+        这是向量检索不可用时的兜底路径。
         """
         normalized_query = _normalize_text(query)
         if not normalized_query:
@@ -397,7 +504,7 @@ class JsonMemoryStore:
                 if normalized_domain and normalized_domain in normalized_query:
                     score += 0.35
 
-            # 稍微把高 confidence 和记忆衰减分也纳入排序，但只做轻量加权。
+            # 轻量把 confidence 和 decay 纳入排序。
             score += min(0.2, max(0.0, entry.confidence) * 0.2)
             score += min(0.2, max(0.0, entry.decay_score) * 0.1)
 

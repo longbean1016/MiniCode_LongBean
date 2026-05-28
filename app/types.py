@@ -108,8 +108,32 @@ class AppConfig:
     # 当前使用的模型名称
     model: str
 
+    # 生成长期记忆语义向量时使用的 embedding 模型
+    embedding_model: str
+
+    # embedding 服务专用 API Key
+    embedding_api_key: str
+
+    # embedding 服务专用基础地址
+    embedding_base_url: str
+
+    # embedding 向量维度；为 0 时表示不显式传 dimensions
+    embedding_dimensions: int
+
     # agent 允许工作的根目录
     workspace_root: str
+
+    # 是否启用 Qdrant 服务端向量索引
+    qdrant_enabled: bool
+
+    # Qdrant 服务端地址，例如 http://localhost:6333
+    qdrant_url: str
+
+    # Qdrant API Key，本地无鉴权时可为空
+    qdrant_api_key: str
+
+    # 长期记忆向量集合名
+    qdrant_collection: str
 
 
 @dataclass(slots=True)

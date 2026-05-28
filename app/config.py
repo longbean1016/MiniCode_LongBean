@@ -8,8 +8,8 @@ from dotenv import load_dotenv
 from app.types import AppConfig
 
 
-# 加载当前项目目录下的 .env 文件
-# 如果 .env 不存在也不会报错，只是环境变量需要从系统环境里取
+# 加载当前项目目录下的 .env 文件。
+# 如果 .env 不存在也不会报错，只是环境变量需要从系统环境里取。
 load_dotenv(override=True)
 
 
@@ -18,51 +18,84 @@ def _get_env(name: str, default: str | None = None, required: bool = False) -> s
     统一读取环境变量。
 
     参数说明：
-    - name: 环境变量名
-    - default: 默认值，如果环境变量不存在则返回它
-    - required: 是否为必填项；如果为 True 且变量为空，则抛出异常
-
-    返回值：
-    - 返回读取到的字符串值
+    - `name`: 环境变量名
+    - `default`: 默认值；变量不存在时回退到这里
+    - `required`: 是否为必填项
     """
     value = os.getenv(name, default)
-
-    # 如果这个配置是必填的，并且没有值，就直接报错
     if required and (value is None or value.strip() == ""):
         raise ValueError(f"Missing required environment variable: {name}")
-
-    # 如果 value 仍然是 None，这里转成空字符串，避免类型不稳定
     return value or ""
+
+
+def _get_bool_env(name: str, default: bool = False) -> bool:
+    """
+    读取布尔环境变量。
+
+    兼容常见写法：
+    - true / false
+    - 1 / 0
+    - yes / no
+    - on / off
+    """
+    raw_value = _get_env(name, default="true" if default else "false").strip().lower()
+    return raw_value in {"1", "true", "yes", "on"}
+
+
+def _get_int_env(name: str, default: int = 0) -> int:
+    """
+    读取整数环境变量。
+
+    如果配置值不是合法整数，则退回默认值，避免因为配置格式错误直接中断启动。
+    """
+    raw_value = _get_env(name, default=str(default)).strip()
+    try:
+        return int(raw_value)
+    except ValueError:
+        return default
 
 
 def load_config() -> AppConfig:
     """
-    加载项目运行配置，并组装成 AppConfig 返回。
+    加载项目运行配置，并组装成 `AppConfig` 返回。
 
-    当前第一版只关心 4 个核心配置：
-    - OPENAI_API_KEY: 调用模型服务所需的密钥（必填）
-    - OPENAI_BASE_URL: 模型服务地址（可默认）
-    - OPENAI_MODEL: 使用的模型名（可默认）
-    - WORKSPACE_ROOT: agent 允许工作的根目录（可默认）
+    当前除了模型基础配置外，还补充了长期记忆向量索引相关配置：
+    - `EMBEDDING_MODEL`: 生成语义向量时使用的 embedding 模型
+    - `EMBEDDING_API_KEY`: embedding 服务专用 API Key
+    - `EMBEDDING_BASE_URL`: embedding 服务专用接口地址
+    - `EMBEDDING_DIMENSIONS`: 可选的向量维度
+    - `QDRANT_ENABLED`: 是否启用 Qdrant 服务端向量索引
+    - `QDRANT_URL`: Qdrant 服务地址
+    - `QDRANT_API_KEY`: Qdrant API Key（本地无鉴权时可留空）
+    - `QDRANT_COLLECTION`: 向量集合名
     """
     api_key = _get_env("OPENAI_API_KEY", required=True)
-
-    # 默认走 OpenAI 官方接口
-    # 如果后面切换到 DeepSeek，只需要在 .env 里改成 https://api.deepseek.com
     base_url = _get_env("OPENAI_BASE_URL", default="https://api.openai.com/v1")
-
-    # 默认模型名，第一版先给一个简单默认值
     model = _get_env("OPENAI_MODEL", default="gpt-4o-mini")
+    embedding_model = _get_env("EMBEDDING_MODEL", default="text-embedding-3-small")
+    embedding_api_key = _get_env("EMBEDDING_API_KEY", default=api_key)
+    embedding_base_url = _get_env("EMBEDDING_BASE_URL", default=base_url)
+    embedding_dimensions = _get_int_env("EMBEDDING_DIMENSIONS", default=0)
 
-    # 默认工作目录为当前项目目录
     workspace_root = _get_env("WORKSPACE_ROOT", default=".")
-
-    # 把工作目录转成绝对路径，避免后面工具执行时出现相对路径混乱
     workspace_root = str(Path(workspace_root).resolve())
+
+    qdrant_enabled = _get_bool_env("QDRANT_ENABLED", default=False)
+    qdrant_url = _get_env("QDRANT_URL", default="http://localhost:6333")
+    qdrant_api_key = _get_env("QDRANT_API_KEY", default="")
+    qdrant_collection = _get_env("QDRANT_COLLECTION", default="project_memories")
 
     return AppConfig(
         api_key=api_key,
         base_url=base_url,
         model=model,
+        embedding_model=embedding_model,
+        embedding_api_key=embedding_api_key,
+        embedding_base_url=embedding_base_url,
+        embedding_dimensions=embedding_dimensions,
         workspace_root=workspace_root,
+        qdrant_enabled=qdrant_enabled,
+        qdrant_url=qdrant_url,
+        qdrant_api_key=qdrant_api_key,
+        qdrant_collection=qdrant_collection,
     )

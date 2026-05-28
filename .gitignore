@@ -98,3 +98,6 @@ Thumbs.db
 
 # 本地会话历史记录
 .sessions
+
+# 长时记忆挂载目录
+.qdrant_storage/

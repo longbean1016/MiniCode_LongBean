@@ -5,9 +5,11 @@ import argparse
 from app.agent_loop import continue_agent_from_history, run_agent_once
 from app.config import load_config
 from app.history_summarizer import OlderHistorySummarizer
+from app.logger import log_event
 from app.memory_extractor import LongTermMemoryExtractor
 from app.memory_guard import MemoryWriteGuard
-from app.memory_store import JsonMemoryStore, MemoryEntry
+from app.memory_store import JsonMemoryStore
+from app.memory_vector_index import MemoryVectorIndex
 from app.memory_verifier import MemoryVerifier
 from app.model_registry import OpenAIModelAdapter
 from app.session import (
@@ -271,9 +273,26 @@ def main() -> None:
         cwd=config.workspace_root,
     )
 
-    # 长期记忆先落到本地 JSON。
-    # 后面如果要换成向量库，只需要替换这一行的具体实现。
-    memory_store = JsonMemoryStore(config.workspace_root)
+    # 只有显式开启 Qdrant 时，才初始化服务端向量索引。
+    # 这样默认开发模式仍然可以只用本地 JSON 跑起来。
+    vector_index: MemoryVectorIndex | None = None
+    if config.qdrant_enabled:
+        vector_index = MemoryVectorIndex(
+            api_key=config.embedding_api_key,
+            base_url=config.embedding_base_url,
+            embedding_model=config.embedding_model,
+            embedding_dimensions=config.embedding_dimensions,
+            qdrant_url=config.qdrant_url,
+            qdrant_api_key=config.qdrant_api_key,
+            collection_name=config.qdrant_collection,
+        )
+
+    # 长期记忆的权威存储仍然是本地 JSON。
+    # 如果配置了 Qdrant，则在写入 JSON 后同步建立语义向量索引。
+    memory_store = JsonMemoryStore(
+        config.workspace_root,
+        vector_index=vector_index,
+    )
 
     # 当前会话的短期工作记忆
     working_memory = WorkingMemory()
@@ -289,6 +308,7 @@ def main() -> None:
         api_key=config.api_key,
         base_url=config.base_url,
         model_name=config.model,
+        vector_index=vector_index,
     )
 
     # 旧历史摘要器只服务于 prompt 构造时的 older history summary。
@@ -465,9 +485,13 @@ def main() -> None:
                     memory_verifier,
                     extracted_memories,
                 )
-            except Exception:
-                # 长期记忆反思失败不能影响主流程回答。
-                pass
+            except Exception as error:
+                # 长期记忆反思失败不能影响主流程回答，
+                # 但必须把原因打印并写日志，否则会变成“静默丢记忆”，很难排查。
+                log_event(
+                    f"[session={session.session_id}] 长期记忆写入失败: {error}"
+                )
+                print(f"[memory-reflection-error] {error}")
 
         session.replace_messages(history)
         save_session(session)

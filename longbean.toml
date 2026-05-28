@@ -16,6 +16,7 @@ dependencies = [
   "openai>=1.30.0",         # 统一走 OpenAI SDK，也可接 OpenAI-compatible 服务
   "python-dotenv>=1.0.1",   # 从 .env 读取 API Key / Base URL / Model
   "rich>=13.7.0",           # 终端输出更友好，可选但推荐
+  "qdrant-client>=1.10.0",  # 连接 Qdrant 服务端，做长期记忆语义索引与召回
 ]
 
 # 开发依赖：测试时安装
