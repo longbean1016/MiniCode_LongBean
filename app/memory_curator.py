@@ -403,6 +403,7 @@ class MemoryCurator:
         recent_bonus = max(0.0, 1.0 - age_seconds / (30 * 86400)) * 0.15
         return (
             float(entry.confidence) * 1.2
+            + float(entry.decay_score) * 0.6
             + min(0.4, float(entry.usage_count) * 0.05)
             + min(0.2, len(entry.content.strip()) / 300.0)
             + recent_bonus

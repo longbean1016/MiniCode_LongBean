@@ -135,6 +135,30 @@ class AppConfig:
     # 长期记忆向量集合名
     qdrant_collection: str
 
+    # active project 记忆达到这个数量阈值时，允许触发一次低频全量 decay 刷新
+    decay_full_scan_trigger_count: int
+
+    # decay 分数下限，避免分数完全掉到 0
+    decay_min_score: float
+
+    # 低于这个分数时，记忆开始具备“可归档”的资格
+    decay_archive_threshold: float
+
+    # 记忆至少老化到多少天后，才允许被 decay 归档
+    decay_archive_age_days: float
+
+    # confidence 高于这个阈值的记忆，默认不被 decay 归档
+    decay_archive_confidence_threshold: float
+
+    # usage_count 高于这个阈值的记忆，默认不被 decay 归档
+    decay_archive_usage_threshold: int
+
+    # 是否启用 decay 结果摘要日志
+    decay_log_enabled: bool
+
+    # decay 日志是否同步打印到控制台
+    decay_log_echo: bool
+
 
 @dataclass(slots=True)
 class ToolResult:

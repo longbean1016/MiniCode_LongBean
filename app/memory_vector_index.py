@@ -75,7 +75,7 @@ class MemoryVectorIndex:
         self.qdrant = QdrantClient(
             url=qdrant_url,
             api_key=qdrant_api_key or None,
-            timeout=10.0,
+            timeout=10.0, # type: ignore
             # 当前本地 Docker 服务已可正常访问。
             # 这里关闭客户端的版本兼容性探测，避免启动时出现无意义警告。
             check_compatibility=False,
@@ -146,7 +146,7 @@ class MemoryVectorIndex:
             exclude_ids=exclude_ids or [],
         )
 
-        search_result = self.qdrant.search(
+        search_result = self.qdrant.search( # type: ignore
             collection_name=self.collection_name,
             query_vector=query_vector,
             query_filter=query_filter,
@@ -329,7 +329,7 @@ class MemoryVectorIndex:
             )
         else:
             collection_info = self.qdrant.get_collection(self.collection_name)
-            current_size = int(collection_info.config.params.vectors.size)
+            current_size = int(collection_info.config.params.vectors.size) # type: ignore
             if current_size != vector_size:
                 raise RuntimeError(
                     f"Qdrant collection `{self.collection_name}` 的向量维度是 {current_size}，"

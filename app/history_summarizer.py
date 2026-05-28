@@ -239,7 +239,7 @@ class OlderHistorySummarizer:
     def _safe_int(self, value: object, default: int) -> int:
         """把 extra 里的值转成 int，避免旧数据格式不一致。"""
         try:
-            return int(value)
+            return int(value) # type: ignore
         except (TypeError, ValueError):
             return default
 

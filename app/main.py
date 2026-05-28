@@ -4,6 +4,7 @@ import argparse
 
 from app.agent_loop import continue_agent_from_history, run_agent_once
 from app.config import load_config
+from app.memory_decay import DecayRunResult, MemoryDecay
 from app.history_summarizer import OlderHistorySummarizer
 from app.logger import log_event
 from app.memory_curator import MemoryCurator
@@ -264,6 +265,37 @@ def _persist_extracted_memories(
     return stored_entries
 
 
+def _log_decay_run_result(
+    *,
+    session_id: str,
+    stage: str,
+    result: DecayRunResult,
+    enabled: bool,
+    echo: bool,
+) -> None:
+    """
+    记录一轮 decay 的摘要日志。
+
+    这里只记录汇总信息：
+    - 扫描了多少条
+    - 发生了多少次分数刷新或归档
+    - 其中有多少条被归档
+    避免把细节日志直接打满正常对话输出。
+    """
+    if not enabled or result.changed_count <= 0:
+        return
+
+    log_event(
+        (
+            f"[session={session_id}] decay[{stage}] "
+            f"scanned={result.scanned_count} "
+            f"changed={result.changed_count} "
+            f"archived={result.archived_count()}"
+        ),
+        echo=echo,
+    )
+
+
 def main() -> None:
     """程序入口：加载配置、恢复会话、启动命令行对话循环。"""
     parser = _build_arg_parser()
@@ -328,6 +360,15 @@ def main() -> None:
         vector_index=vector_index,
     )
     memory_curator = MemoryCurator(memory_store)
+    memory_decay = MemoryDecay(
+        memory_store,
+        full_scan_trigger_count=config.decay_full_scan_trigger_count,
+        min_decay_score=config.decay_min_score,
+        archive_decay_threshold=config.decay_archive_threshold,
+        archive_age_days=config.decay_archive_age_days,
+        archive_confidence_threshold=config.decay_archive_confidence_threshold,
+        archive_usage_threshold=config.decay_archive_usage_threshold,
+    )
 
     # 旧历史摘要器只服务于 prompt 构造时的 older history summary。
     # 它带运行期缓存，避免每轮循环都重复调用模型做摘要。
@@ -509,11 +550,44 @@ def main() -> None:
                 # 避免系统长期运行后只增不减、重复堆积。
                 if stored_entries:
                     memory_curator.curate_new_entries(stored_entries)
+                    try:
+                        incremental_decay_result = memory_decay.refresh_new_entries(
+                            stored_entries
+                        )
+                    except Exception as error:
+                        log_event(
+                            f"[session={session.session_id}] decay[incremental] 执行失败: {error}",
+                            echo=config.decay_log_echo,
+                        )
+                    else:
+                        _log_decay_run_result(
+                            session_id=session.session_id,
+                            stage="incremental",
+                            result=incremental_decay_result,
+                            enabled=config.decay_log_enabled,
+                            echo=config.decay_log_echo,
+                        )
 
                     # 当 active project 记忆增长到一定规模后，
                     # 再额外触发一次低频全量整理，避免只做增量时留下历史脏数据。
                     if memory_curator.should_run_full_scan():
                         memory_curator.curate_project_memories()
+                    if memory_decay.should_run_full_refresh():
+                        try:
+                            full_decay_result = memory_decay.refresh_project_memories()
+                        except Exception as error:
+                            log_event(
+                                f"[session={session.session_id}] decay[full] 执行失败: {error}",
+                                echo=config.decay_log_echo,
+                            )
+                        else:
+                            _log_decay_run_result(
+                                session_id=session.session_id,
+                                stage="full",
+                                result=full_decay_result,
+                                enabled=config.decay_log_enabled,
+                                echo=config.decay_log_echo,
+                            )
             except Exception as error:
                 # 长期记忆反思失败不能影响主流程回答，
                 # 但必须把原因打印并写日志，否则会变成“静默丢记忆”，很难排查。

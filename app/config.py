@@ -55,6 +55,20 @@ def _get_int_env(name: str, default: int = 0) -> int:
         return default
 
 
+def _get_float_env(name: str, default: float = 0.0) -> float:
+    """
+    读取浮点环境变量。
+
+    如果配置值不是合法浮点数，则回退到默认值，
+    避免因为配置格式错误直接中断启动。
+    """
+    raw_value = _get_env(name, default=str(default)).strip()
+    try:
+        return float(raw_value)
+    except ValueError:
+        return default
+
+
 def load_config() -> AppConfig:
     """
     加载项目运行配置，并组装成 `AppConfig` 返回。
@@ -84,6 +98,17 @@ def load_config() -> AppConfig:
     qdrant_url = _get_env("QDRANT_URL", default="http://localhost:6333")
     qdrant_api_key = _get_env("QDRANT_API_KEY", default="")
     qdrant_collection = _get_env("QDRANT_COLLECTION", default="project_memories")
+    decay_full_scan_trigger_count = _get_int_env("DECAY_FULL_SCAN_TRIGGER_COUNT", default=40)
+    decay_min_score = _get_float_env("DECAY_MIN_SCORE", default=0.05)
+    decay_archive_threshold = _get_float_env("DECAY_ARCHIVE_THRESHOLD", default=0.12)
+    decay_archive_age_days = _get_float_env("DECAY_ARCHIVE_AGE_DAYS", default=45.0)
+    decay_archive_confidence_threshold = _get_float_env(
+        "DECAY_ARCHIVE_CONFIDENCE_THRESHOLD",
+        default=0.72,
+    )
+    decay_archive_usage_threshold = _get_int_env("DECAY_ARCHIVE_USAGE_THRESHOLD", default=1)
+    decay_log_enabled = _get_bool_env("DECAY_LOG_ENABLED", default=True)
+    decay_log_echo = _get_bool_env("DECAY_LOG_ECHO", default=False)
 
     return AppConfig(
         api_key=api_key,
@@ -98,4 +123,12 @@ def load_config() -> AppConfig:
         qdrant_url=qdrant_url,
         qdrant_api_key=qdrant_api_key,
         qdrant_collection=qdrant_collection,
+        decay_full_scan_trigger_count=decay_full_scan_trigger_count,
+        decay_min_score=decay_min_score,
+        decay_archive_threshold=decay_archive_threshold,
+        decay_archive_age_days=decay_archive_age_days,
+        decay_archive_confidence_threshold=decay_archive_confidence_threshold,
+        decay_archive_usage_threshold=decay_archive_usage_threshold,
+        decay_log_enabled=decay_log_enabled,
+        decay_log_echo=decay_log_echo,
     )

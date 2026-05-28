@@ -4,7 +4,7 @@ import time
 from pathlib import Path
 
 
-# 默认日志文件名，统一写到项目根目录
+# 默认日志文件名，统一写到项目根目录。
 DEFAULT_LOG_FILE = "debug.log"
 
 
@@ -13,15 +13,25 @@ def _format_now() -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
 
 
-def log_event(message: str, log_file: str = DEFAULT_LOG_FILE) -> None:
-    """把一条日志同时输出到控制台和文件。"""
-    # 拼出最终日志行，方便统一检索
+def log_event(
+    message: str,
+    log_file: str = DEFAULT_LOG_FILE,
+    *,
+    echo: bool = True,
+) -> None:
+    """
+    记录一条日志。
+
+    参数说明：
+    - `message`: 要写入的日志内容
+    - `log_file`: 日志文件路径，默认写入项目根目录下的 `debug.log`
+    - `echo`: 是否同时回显到控制台。默认开启；某些低频运维日志可以只写文件不打扰主链路输出
+    """
     line = f"[{_format_now()}] {message}"
 
-    # 打印到控制台，便于实时观察
-    print(line)
+    if echo:
+        print(line)
 
-    # 追加写入日志文件，保留排查现场
     path = Path(log_file)
     with path.open("a", encoding="utf-8") as file:
         file.write(line + "\n")
