@@ -110,6 +110,65 @@ class MemoryVectorIndex:
             wait=True,
         )
 
+    def delete_memories(self, memory_ids: list[str]) -> None:
+        """
+        按 memory id 批量删除 Qdrant 中的点位。
+
+        这里删除时仍然使用本地 memory id，
+        内部会先转换成稳定 UUID，保证和 upsert 时使用的是同一套映射规则。
+        """
+        point_ids = [
+            self._build_qdrant_point_id(memory_id)
+            for memory_id in memory_ids
+            if memory_id.strip()
+        ]
+        if not point_ids:
+            return
+
+        self.qdrant.delete(  # type: ignore
+            collection_name=self.collection_name,
+            points_selector=self._qdrant_models.PointIdsList(
+                points=point_ids,
+            ),
+            wait=True,
+        )
+
+    def list_memory_ids(self) -> set[str]:
+        """
+        列出当前 collection 中全部 payload.memory_id。
+
+        这个接口主要给“收敛同步”用：
+        - 找出 Qdrant 中多出来的孤儿点
+        - 删除那些本地 JSON 已经不存在的旧向量
+        """
+        collections_info = self.qdrant.get_collections()
+        collection_names = {item.name for item in collections_info.collections}
+        if self.collection_name not in collection_names:
+            return set()
+
+        result: set[str] = set()
+        offset: Any | None = None
+        while True:
+            points, next_offset = self.qdrant.scroll(  # type: ignore
+                collection_name=self.collection_name,
+                scroll_filter=None,
+                limit=256,
+                offset=offset,
+                with_payload=True,
+                with_vectors=False,
+            )
+            for point in points:
+                payload = dict(point.payload or {})
+                memory_id = str(payload.get("memory_id", "")).strip()
+                if memory_id:
+                    result.add(memory_id)
+
+            if next_offset is None:
+                break
+            offset = next_offset
+
+        return result
+
     def search_similar_memories(
         self,
         *,

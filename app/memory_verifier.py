@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -40,6 +41,95 @@ class MemoryVerificationDecision:
     action: VerificationAction
     reason: str = ""
     matched_memory_id: str = ""
+
+
+VALID_VERIFICATION_ACTIONS: set[str] = {
+    "store",
+    "supersede_store",
+    "duplicate",
+    "conflict",
+    "reject",
+}
+
+MATCH_REQUIRED_ACTIONS: set[str] = {
+    "supersede_store",
+    "duplicate",
+    "conflict",
+}
+
+# 这些词通常意味着“当前规则更新了旧规则”，应优先考虑 supersede_store。
+SUPERSEDE_MARKERS: tuple[str, ...] = (
+    "统一",
+    "改为",
+    "切换到",
+    "迁移到",
+    "替换为",
+    "不再",
+    "只允许",
+    "固定为",
+    "以后",
+    "必须",
+    "采用",
+    "保留",
+    "唯一",
+    "默认",
+    "switch to",
+    "change to",
+    "migrate to",
+    "replace with",
+    "use only",
+    "no longer",
+)
+
+# 这些词往往是过程性、临时性或低稳定度信息，不适合直接写入长期记忆。
+REJECT_MARKERS: tuple[str, ...] = (
+    "临时",
+    "暂时",
+    "先这样",
+    "试试",
+    "待确认",
+    "猜测",
+    "可能",
+    "也许",
+    "todo",
+    "fixme",
+    "wip",
+    "for now",
+    "temporary",
+    "maybe",
+    "probably",
+    "guess",
+)
+
+NON_PERSISTENT_PATTERNS: tuple[str, ...] = (
+    r"\bthanks?\b",
+    r"\bok\b",
+    r"\bhello\b",
+    r"\bhi\b",
+    r"\b收到\b",
+    r"\b好的\b",
+    r"\b明白\b",
+    r"\b已处理\b",
+    r"\b稍后\b",
+    r"\b回头\b",
+    r"\b今天\b",
+    r"\b明天\b",
+    r"\b刚刚\b",
+)
+
+NEGATION_MARKERS: tuple[str, ...] = (
+    "不要",
+    "不能",
+    "禁止",
+    "避免",
+    "不再",
+    "avoid",
+    "do not",
+    "don't",
+    "never",
+    "must not",
+    "no longer",
+)
 
 
 class MemoryVerifier:
@@ -121,6 +211,13 @@ class MemoryVerifier:
         就不要被 conflict 直接拦住，而是允许它入库，
         再由 curator 让旧版本退位。
         """
+        candidate_reject_reason = self._get_candidate_reject_reason(candidate)
+        if candidate_reject_reason:
+            return MemoryVerificationDecision(
+                action="reject",
+                reason=candidate_reject_reason,
+            )
+
         if not similar_entries:
             return MemoryVerificationDecision(
                 action="store",
@@ -252,6 +349,12 @@ class MemoryVerifier:
 - conflict: 不允许写入，因为与已有记忆方向相反，但无法判断为“新版本替代旧版本”
 - reject: 不允许写入，因为内容本身不够稳定、不够长期、或过于临时
 
+先判断候选本身是否值得进入长期记忆。下面这些内容默认应判 reject：
+- 礼貌回复、确认语、会话衔接句，例如“收到”“好的”“我来处理”
+- 一次性执行过程、临时计划、今天/稍后再做之类的短时安排
+- TODO、WIP、待确认、猜测、可能、也许、试试看之类的未稳定信息
+- 只描述本轮上下文而没有可复用规则/事实/偏好的内容
+
 你必须优先区分以下两类情况：
 
 一、什么时候必须判为 supersede_store
@@ -260,6 +363,9 @@ class MemoryVerifier:
 - 新记忆明确带有“更新/替代/切换”语气
 - 新记忆像是在给出“现在起生效的新规范”
 - 旧记忆不是错主题，而是被新规则替代
+
+“同主题更新”指的是：它们在同一 scope 下约束同一对象、同一决策面、同一规则层级。
+例如都在谈 embedding provider、默认数据库、接口约定、目录规范。
 
 常见替代标记包括但不限于：
 - 中文：统一、改为、不再、只允许、固定为、以后、必须、采用、保留、默认
@@ -277,6 +383,9 @@ class MemoryVerifier:
 - 或者两条记忆来自不同假设、不同方案、不同上下文
 - 或者候选内容太模糊，无法确认它是在替代旧记忆
 
+“普通相似”不等于 duplicate，也不等于 conflict。
+如果只是主题接近、共享一些词、补充了不同维度信息，但没有表达同一条规则重复，也没有方向冲突，应判 store。
+
 典型例子：
 - 旧：优先使用 REST API
 - 新：GraphQL 更适合复杂查询
@@ -288,10 +397,13 @@ class MemoryVerifier:
 - store: 与已有记忆相关，但不是重复，也不是替代更新，也不是明显冲突
 
 硬性约束：
+- store / reject 时 matched_memory_id 必须留空
 - 不要因为只是“主题接近”就判 duplicate
 - 不要因为“方向相反”就直接判 conflict，先检查是否属于 supersede_store
 - 只要能合理判断为“新规则替代旧规则”，优先判 supersede_store
 - 如果 matched_memory_id 留空，则 action 不能是 supersede_store / duplicate / conflict
+- duplicate / conflict / supersede_store 必须命中一条最相关旧记忆，且 id 必须来自提供的相似旧记忆列表
+- reason 必须简洁具体，直接说明“为何是重复 / 更新 / 冲突 / 拒绝”，不要写空话
 
 只返回 JSON，不要返回解释性文本：
 {
@@ -319,24 +431,13 @@ class MemoryVerifier:
         if not isinstance(payload, dict):
             return None
 
-        action = str(payload.get("action", "")).strip().lower()
-        if action not in {
-            "store",
-            "supersede_store",
-            "duplicate",
-            "conflict",
-            "reject",
-        }:
-            return None
-
-        reason = " ".join(str(payload.get("reason", "")).strip().split())
-        matched_memory_id = str(payload.get("matched_memory_id", "")).strip()
-        if action in {"supersede_store", "duplicate", "conflict"} and not matched_memory_id:
-            return None
-        return MemoryVerificationDecision(
-            action=action,  # type: ignore[arg-type]
-            reason=reason,
-            matched_memory_id=matched_memory_id,
+        return self._normalize_decision(
+            candidate,
+            similar_entries,
+            action=payload.get("action", ""),
+            reason=payload.get("reason", ""),
+            matched_memory_id=payload.get("matched_memory_id", ""),
+            reason_prefix="模型判定",
         )
 
     def _fallback_verify(
@@ -355,15 +456,26 @@ class MemoryVerifier:
         """
         normalized_candidate = self._normalize_text(candidate.content)
         candidate_category = self._normalize_text(candidate.category)
+        best_topic_entry: MemoryEntry | None = None
+        best_topic_score = 0.0
 
         for entry in similar_entries:
             normalized_existing = self._normalize_text(entry.content)
             similarity = self._jaccard_similarity(normalized_candidate, normalized_existing)
+            same_topic_score = self._same_topic_score(candidate, entry)
+            if same_topic_score > best_topic_score:
+                best_topic_score = same_topic_score
+                best_topic_entry = entry
 
-            if similarity >= 0.92 or normalized_candidate == normalized_existing:
-                return MemoryVerificationDecision(
+            if (
+                same_topic_score >= 0.78
+                and not self._looks_conflicting(entry.content, candidate.content)
+                and not self._looks_like_superseding_update(candidate, entry)
+                and (similarity >= 0.92 or normalized_candidate == normalized_existing)
+            ):
+                return self._build_decision(
                     action="duplicate",
-                    reason=f"本地兜底判定为重复，相似度 {similarity:.2f}",
+                    reason=f"本地兜底判定为同主题重复，相似度 {similarity:.2f}",
                     matched_memory_id=entry.id,
                 )
 
@@ -373,24 +485,31 @@ class MemoryVerifier:
             if (
                 similarity >= 0.35
                 and self._normalize_text(entry.category) == candidate_category
+                and same_topic_score >= 0.72
                 and self._looks_conflicting(entry.content, candidate.content)
             ):
                 if self._looks_like_superseding_update(candidate, entry):
-                    return MemoryVerificationDecision(
+                    return self._build_decision(
                         action="supersede_store",
                         reason=f"本地兜底判定为同主题替代更新，相似度 {similarity:.2f}",
                         matched_memory_id=entry.id,
                     )
 
-                return MemoryVerificationDecision(
+                return self._build_decision(
                     action="conflict",
-                    reason=f"本地兜底判定为冲突，相似度 {similarity:.2f}",
+                    reason=f"本地兜底判定为同主题冲突，相似度 {similarity:.2f}",
                     matched_memory_id=entry.id,
                 )
 
-        return MemoryVerificationDecision(
+        if best_topic_entry is not None and best_topic_score >= 0.72:
+            return self._build_decision(
+                action="store",
+                reason="本地兜底判定为同主题补充信息，不构成重复或冲突",
+            )
+
+        return self._build_decision(
             action="store",
-            reason="本地兜底未发现重复或冲突",
+            reason="本地兜底未发现重复、替代更新或冲突",
         )
 
     def _looks_like_superseding_update(
@@ -437,6 +556,185 @@ class MemoryVerifier:
 
         return True
 
+    def _get_candidate_reject_reason(self, candidate: MemoryEntry) -> str:
+        """
+        在调模型前先做一层本地过滤。
+
+        这层只拦截明显不适合进入长期记忆的内容，避免把
+        “礼貌回复 / 临时安排 / 未稳定猜测”送进后续 duplicate/conflict 判定。
+        """
+        normalized_content = self._normalize_text(candidate.content)
+        if not normalized_content:
+            return "候选内容为空，不适合写入长期记忆"
+
+        if len(normalized_content) < 6:
+            return "候选内容过短，缺少稳定可复用信息"
+
+        if any(marker in normalized_content for marker in REJECT_MARKERS):
+            return "候选内容含有临时或未确认表达，不适合写入长期记忆"
+
+        if re.search("|".join(NON_PERSISTENT_PATTERNS), normalized_content):
+            return "候选内容更像礼貌回复或短时会话，不适合写入长期记忆"
+
+        return ""
+
+    def _normalize_decision(
+        self,
+        candidate: MemoryEntry,
+        similar_entries: list[MemoryEntry],
+        *,
+        action: Any,
+        reason: Any,
+        matched_memory_id: Any,
+        reason_prefix: str,
+    ) -> MemoryVerificationDecision | None:
+        """
+        统一兜底模型/规则产物，保证动作、命中 id 和 reason 都合法。
+
+        这里宁可返回 None 走下游 fallback，也不接受结构脏数据。
+        """
+        normalized_action = self._normalize_text(action)
+        if normalized_action not in VALID_VERIFICATION_ACTIONS:
+            return None
+
+        normalized_reason = " ".join(str(reason).strip().split())
+        normalized_matched_id = str(matched_memory_id).strip()
+
+        matched_entry = self._find_matched_entry(candidate, similar_entries, normalized_matched_id)
+        if normalized_action in MATCH_REQUIRED_ACTIONS:
+            if matched_entry is None:
+                return None
+            normalized_matched_id = matched_entry.id
+        else:
+            normalized_matched_id = ""
+
+        if not normalized_reason:
+            normalized_reason = self._default_reason_for_action(
+                normalized_action,
+                matched_entry,
+                prefix=reason_prefix,
+            )
+
+        if normalized_action == "reject":
+            candidate_reject_reason = self._get_candidate_reject_reason(candidate)
+            if candidate_reject_reason:
+                normalized_reason = candidate_reject_reason
+
+        return self._build_decision(
+            action=normalized_action,
+            reason=normalized_reason,
+            matched_memory_id=normalized_matched_id,
+        )
+
+    def _build_decision(
+        self,
+        *,
+        action: str,
+        reason: str,
+        matched_memory_id: str = "",
+    ) -> MemoryVerificationDecision:
+        """
+        统一构造最终 decision。
+
+        关键约束：
+        - 需要命中旧记忆的动作必须带 id
+        - 不需要命中旧记忆的动作必须清空 id
+        - reason 至少保留一句可读原因，避免日志出现空串
+        """
+        normalized_reason = " ".join(str(reason).strip().split()) or "未提供原因"
+        normalized_matched_id = str(matched_memory_id).strip()
+
+        if action in MATCH_REQUIRED_ACTIONS and not normalized_matched_id:
+            action = "reject"
+            normalized_reason = "缺少关联旧记忆 id，无法安全执行需要命中旧记忆的动作"
+
+        if action not in MATCH_REQUIRED_ACTIONS:
+            normalized_matched_id = ""
+
+        return MemoryVerificationDecision(
+            action=action,  # type: ignore[arg-type]
+            reason=normalized_reason,
+            matched_memory_id=normalized_matched_id,
+        )
+
+    def _find_matched_entry(
+        self,
+        candidate: MemoryEntry,
+        similar_entries: list[MemoryEntry],
+        matched_memory_id: str,
+    ) -> MemoryEntry | None:
+        """
+        优先使用模型返回的 matched_memory_id。
+
+        如果模型没给、给错或给了列表外 id，再按“同主题得分 + 文本相似度”
+        重新挑一个最稳妥的候选，避免把动作绑到错误旧记忆上。
+        """
+        entry_by_id = {entry.id: entry for entry in similar_entries if entry.id}
+        normalized_id = str(matched_memory_id).strip()
+        if normalized_id and normalized_id in entry_by_id:
+            return entry_by_id[normalized_id]
+
+        best_entry: MemoryEntry | None = None
+        best_score = 0.0
+        for entry in similar_entries:
+            score = self._same_topic_score(candidate, entry)
+            score += self._jaccard_similarity(candidate.content, entry.content) * 0.35
+            if score > best_score:
+                best_score = score
+                best_entry = entry
+
+        if best_entry is None or best_score < 0.75:
+            return None
+        return best_entry
+
+    def _default_reason_for_action(
+        self,
+        action: str,
+        matched_entry: MemoryEntry | None,
+        *,
+        prefix: str,
+    ) -> str:
+        """给空 reason 提供最小可读兜底，便于日志排查。"""
+        relation_suffix = f"，命中旧记忆 {matched_entry.id}" if matched_entry else ""
+        if action == "store":
+            return f"{prefix}为新增稳定信息"
+        if action == "supersede_store":
+            return f"{prefix}为同主题新版本替代旧版本{relation_suffix}"
+        if action == "duplicate":
+            return f"{prefix}为同主题重复信息{relation_suffix}"
+        if action == "conflict":
+            return f"{prefix}为同主题冲突信息{relation_suffix}"
+        return f"{prefix}为不适合持久化的内容"
+
+    def _same_topic_score(self, candidate: MemoryEntry, existing: MemoryEntry) -> float:
+        """
+        判断两条记忆是否在说同一个“决策面”。
+
+        这个分数专门用来区分：
+        - 同主题更新 / 冲突 / 重复
+        - 只是普通相似、共享少量词的相关内容
+        """
+        score = 0.0
+
+        if self._normalize_text(candidate.scope) == self._normalize_text(existing.scope):
+            score += 0.30
+        if self._normalize_text(candidate.category) == self._normalize_text(existing.category):
+            score += 0.20
+
+        candidate_tags = set(self._normalize_tag_list(candidate.tags))
+        existing_tags = set(self._normalize_tag_list(existing.tags))
+        tag_overlap = len(candidate_tags & existing_tags)
+        score += min(0.20, tag_overlap * 0.08)
+
+        candidate_domains = {self._normalize_text(domain) for domain in candidate.domains}
+        existing_domains = {self._normalize_text(domain) for domain in existing.domains}
+        domain_overlap = len(candidate_domains & existing_domains)
+        score += min(0.15, domain_overlap * 0.07)
+
+        content_similarity = self._jaccard_similarity(candidate.content, existing.content)
+        score += min(0.15, content_similarity * 0.30)
+        return score
+
     def _build_candidate_query_text(self, candidate: MemoryEntry) -> str:
         """把候选记忆整理成语义召回查询文本。"""
         parts = [
@@ -470,9 +768,12 @@ class MemoryVerifier:
             f"content: {candidate.content}",
             "",
             "## 验证提醒",
+            "- 先判断候选本身是否适合进入长期记忆；如果是礼貌回复、临时安排、未确认猜测，直接判 reject",
             "- 先判断是否是 duplicate",
             "- 如果不是 duplicate，再优先判断是否属于 supersede_store",
             "- 只有在无法证明是替代更新时，才可以判 conflict",
+            "- “同主题更新”要求新旧记忆约束同一对象、同一规则层级；普通相关或普通相似不算同主题更新",
+            "- 如果只是补充了另一个维度的信息，或者只是在相关话题上相近，但不是同一条规则，请判 store",
             "- 尤其注意候选内容里是否包含“统一 / 改为 / 不再 / 只允许 / switch to / replace with / no longer”等更新语气",
             "",
             "## 相似旧记忆",

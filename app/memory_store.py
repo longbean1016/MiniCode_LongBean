@@ -176,6 +176,9 @@ class MemoryStore(Protocol):
     def add_memory(self, entry: MemoryEntry) -> MemoryEntry:
         ...
 
+    def reconcile_vector_index(self, entries: list[MemoryEntry] | None = None) -> None:
+        ...
+
     def get_memory_by_id(self, memory_id: str) -> MemoryEntry | None:
         ...
 
@@ -313,7 +316,12 @@ class JsonMemoryStore:
             changed = True
 
         if changed:
-            self.save_memories(list(by_id.values()))
+            # 访问统计也属于正式 metadata，
+            # 因此这里同步更新 JSON 和 Qdrant payload，避免两边长期漂移。
+            self.save_memories_and_sync(
+                list(by_id.values()),
+                changed_entry_ids=list(normalized_ids),
+            )
 
     def save_memories(self, entries: list[MemoryEntry]) -> None:
         """把全部长期记忆完整写回 JSON 文件。"""
@@ -342,6 +350,7 @@ class JsonMemoryStore:
         """
         previous_text = ""
         had_previous_file = self.memory_file.exists()
+        previous_entries = self.load_memories() if had_previous_file else []
         if had_previous_file:
             previous_text = self.memory_file.read_text(encoding="utf-8")
 
@@ -352,20 +361,26 @@ class JsonMemoryStore:
             for item in (changed_entry_ids or [])
             if item.strip()
         }
-        if self.vector_index is None or not normalized_changed_ids:
+        if self.vector_index is None:
             return
-
+        previous_ids = {entry.id for entry in previous_entries if entry.id.strip()}
+        current_ids = {entry.id for entry in entries if entry.id.strip()}
+        removed_ids = sorted(previous_ids - current_ids)
         by_id = {entry.id: entry for entry in entries}
-        changed_entries = [
-            by_id[memory_id]
-            for memory_id in normalized_changed_ids
-            if memory_id in by_id
-        ]
-        if not changed_entries:
-            return
+        changed_entries = sorted(normalized_changed_ids | set(removed_ids))
 
         try:
-            self.sync_entries_to_vector(changed_entries)
+            if removed_ids:
+                self.vector_index.delete_memories(removed_ids)
+
+            if normalized_changed_ids:
+                self.sync_entries_to_vector(
+                    [
+                        by_id[memory_id]
+                        for memory_id in changed_entries
+                        if memory_id in by_id
+                    ]
+                )
         except Exception:
             # 如果 Qdrant 同步失败，就恢复 JSON，避免本地与向量库状态不一致。
             if had_previous_file:
@@ -376,6 +391,33 @@ class JsonMemoryStore:
                 except OSError:
                     pass
             raise
+
+    def reconcile_vector_index(self, entries: list[MemoryEntry] | None = None) -> None:
+        """
+        把 Qdrant 收敛到与本地 JSON 一致。
+
+        这个方法用于两类场景：
+        1. 启动时做一次全量对齐，清理历史遗留孤儿点
+        2. 需要人工修复时，拿本地权威数据重新覆盖向量索引
+        """
+        if self.vector_index is None:
+            return
+
+        current_entries = entries if entries is not None else self.load_memories()
+        current_by_id = {
+            entry.id: entry
+            for entry in current_entries
+            if entry.id.strip()
+        }
+        current_ids = set(current_by_id.keys())
+        vector_ids = self.vector_index.list_memory_ids()
+        orphan_ids = sorted(vector_ids - current_ids)
+
+        if orphan_ids:
+            self.vector_index.delete_memories(orphan_ids)
+
+        if current_by_id:
+            self.sync_entries_to_vector(list(current_by_id.values()))
 
     def sync_entries_to_vector(self, entries: list[MemoryEntry]) -> None:
         """

@@ -343,6 +343,13 @@ def main() -> None:
         vector_index=vector_index,
     )
 
+    # 启动时先做一次全量收敛：
+    # - 让 Qdrant payload 跟上本地最新 metadata
+    # - 删除历史测试或异常遗留的孤儿点
+    # 本地 JSON 仍然是权威来源，向量库只做语义检索和重复判断。
+    if vector_index is not None:
+        memory_store.reconcile_vector_index()
+
     # 当前会话的短期工作记忆
     working_memory = WorkingMemory()
 
