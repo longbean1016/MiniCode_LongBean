@@ -99,6 +99,69 @@ def load_config() -> AppConfig:
     qdrant_url = _get_env("QDRANT_URL", default="http://localhost:6333")
     qdrant_api_key = _get_env("QDRANT_API_KEY", default="")
     qdrant_collection = _get_env("QDRANT_COLLECTION", default="project_memories")
+    model_retry_max_attempts = _get_int_env("MODEL_RETRY_MAX_ATTEMPTS", default=3)
+    model_retry_base_delay_seconds = _get_float_env(
+        "MODEL_RETRY_BASE_DELAY_SECONDS",
+        default=0.8,
+    )
+    model_retry_backoff_multiplier = _get_float_env(
+        "MODEL_RETRY_BACKOFF_MULTIPLIER",
+        default=2.0,
+    )
+    model_retry_max_delay_seconds = _get_float_env(
+        "MODEL_RETRY_MAX_DELAY_SECONDS",
+        default=4.0,
+    )
+    model_circuit_failure_threshold = _get_int_env(
+        "MODEL_CIRCUIT_FAILURE_THRESHOLD",
+        default=3,
+    )
+    model_circuit_recovery_timeout_seconds = _get_float_env(
+        "MODEL_CIRCUIT_RECOVERY_TIMEOUT_SECONDS",
+        default=30.0,
+    )
+    aux_model_retry_max_attempts = _get_int_env("AUX_MODEL_RETRY_MAX_ATTEMPTS", default=3)
+    aux_model_retry_base_delay_seconds = _get_float_env(
+        "AUX_MODEL_RETRY_BASE_DELAY_SECONDS",
+        default=0.8,
+    )
+    aux_model_retry_backoff_multiplier = _get_float_env(
+        "AUX_MODEL_RETRY_BACKOFF_MULTIPLIER",
+        default=2.0,
+    )
+    aux_model_retry_max_delay_seconds = _get_float_env(
+        "AUX_MODEL_RETRY_MAX_DELAY_SECONDS",
+        default=4.0,
+    )
+    aux_model_circuit_failure_threshold = _get_int_env(
+        "AUX_MODEL_CIRCUIT_FAILURE_THRESHOLD",
+        default=3,
+    )
+    aux_model_circuit_recovery_timeout_seconds = _get_float_env(
+        "AUX_MODEL_CIRCUIT_RECOVERY_TIMEOUT_SECONDS",
+        default=45.0,
+    )
+    vector_retry_max_attempts = _get_int_env("VECTOR_RETRY_MAX_ATTEMPTS", default=3)
+    vector_retry_base_delay_seconds = _get_float_env(
+        "VECTOR_RETRY_BASE_DELAY_SECONDS",
+        default=0.8,
+    )
+    vector_retry_backoff_multiplier = _get_float_env(
+        "VECTOR_RETRY_BACKOFF_MULTIPLIER",
+        default=2.0,
+    )
+    vector_retry_max_delay_seconds = _get_float_env(
+        "VECTOR_RETRY_MAX_DELAY_SECONDS",
+        default=4.0,
+    )
+    vector_circuit_failure_threshold = _get_int_env(
+        "VECTOR_CIRCUIT_FAILURE_THRESHOLD",
+        default=3,
+    )
+    vector_circuit_recovery_timeout_seconds = _get_float_env(
+        "VECTOR_CIRCUIT_RECOVERY_TIMEOUT_SECONDS",
+        default=45.0,
+    )
     decay_full_scan_trigger_count = _get_int_env("DECAY_FULL_SCAN_TRIGGER_COUNT", default=40)
     decay_min_score = _get_float_env("DECAY_MIN_SCORE", default=0.05)
     decay_archive_threshold = _get_float_env("DECAY_ARCHIVE_THRESHOLD", default=0.12)
@@ -124,6 +187,24 @@ def load_config() -> AppConfig:
         qdrant_url=qdrant_url,
         qdrant_api_key=qdrant_api_key,
         qdrant_collection=qdrant_collection,
+        model_retry_max_attempts=model_retry_max_attempts,
+        model_retry_base_delay_seconds=model_retry_base_delay_seconds,
+        model_retry_backoff_multiplier=model_retry_backoff_multiplier,
+        model_retry_max_delay_seconds=model_retry_max_delay_seconds,
+        model_circuit_failure_threshold=model_circuit_failure_threshold,
+        model_circuit_recovery_timeout_seconds=model_circuit_recovery_timeout_seconds,
+        aux_model_retry_max_attempts=aux_model_retry_max_attempts,
+        aux_model_retry_base_delay_seconds=aux_model_retry_base_delay_seconds,
+        aux_model_retry_backoff_multiplier=aux_model_retry_backoff_multiplier,
+        aux_model_retry_max_delay_seconds=aux_model_retry_max_delay_seconds,
+        aux_model_circuit_failure_threshold=aux_model_circuit_failure_threshold,
+        aux_model_circuit_recovery_timeout_seconds=aux_model_circuit_recovery_timeout_seconds,
+        vector_retry_max_attempts=vector_retry_max_attempts,
+        vector_retry_base_delay_seconds=vector_retry_base_delay_seconds,
+        vector_retry_backoff_multiplier=vector_retry_backoff_multiplier,
+        vector_retry_max_delay_seconds=vector_retry_max_delay_seconds,
+        vector_circuit_failure_threshold=vector_circuit_failure_threshold,
+        vector_circuit_recovery_timeout_seconds=vector_circuit_recovery_timeout_seconds,
         decay_full_scan_trigger_count=decay_full_scan_trigger_count,
         decay_min_score=decay_min_score,
         decay_archive_threshold=decay_archive_threshold,

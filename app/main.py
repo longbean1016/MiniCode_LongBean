@@ -10,6 +10,10 @@ from app.logger import log_event
 from app.memory_curator import MemoryCurator
 from app.memory_extractor import LongTermMemoryExtractor
 from app.memory_guard import MemoryWriteGuard
+from app.memory_reflection_policy import (
+    decide_project_reflection,
+    should_reflect_long_term_memory,
+)
 from app.memory_store import JsonMemoryStore, MemoryEntry
 from app.memory_vector_index import MemoryVectorIndex
 from app.memory_verifier import MemoryVerifier
@@ -168,52 +172,6 @@ def _collect_reflection_entries(
     return result
 
 
-def _should_reflect_long_term_memory(step: AgentStep) -> bool:
-    """判断这次最终回复是否满足自动长期记忆反思时机。"""
-    if step.type != "assistant":
-        return False
-
-    text = step.content.strip()
-    if not text:
-        return False
-
-    # 这些是内部兜底回复，不适合作为长期记忆反思的最终结果。
-    blocked_prefixes = (
-        "模型调用失败:",
-        "已达到最大循环步数",
-        "未识别的模型返回类型",
-        "模型返回了空的工具调用",
-    )
-    if text.startswith(blocked_prefixes):
-        return False
-
-    # 第一阶段先保守处理，只在“完成 / 阶段完成 / 稳定结论”语气下触发。
-    stable_markers = (
-        "已完成",
-        "已经完成",
-        "完成了",
-        "阶段完成",
-        "已实现",
-        "实现了",
-        "已修复",
-        "修复了",
-        "最终",
-        "结论",
-        "可以确定",
-        "建议采用",
-        "改为",
-        "保留",
-        "done",
-        "completed",
-        "implemented",
-        "fixed",
-        "conclusion",
-        "final",
-    )
-    lowered = text.lower()
-    return any(marker in text or marker in lowered for marker in stable_markers)
-
-
 def _persist_extracted_memories(
     memory_store: JsonMemoryStore,
     memory_guard: MemoryWriteGuard,
@@ -315,6 +273,12 @@ def main() -> None:
         base_url=config.base_url,
         model_name=config.model,
         tool_registry=tool_registry,
+        retry_max_attempts=config.model_retry_max_attempts,
+        retry_base_delay_seconds=config.model_retry_base_delay_seconds,
+        retry_backoff_multiplier=config.model_retry_backoff_multiplier,
+        retry_max_delay_seconds=config.model_retry_max_delay_seconds,
+        circuit_failure_threshold=config.model_circuit_failure_threshold,
+        circuit_recovery_timeout_seconds=config.model_circuit_recovery_timeout_seconds,
     )  # type: ignore[arg-type]
 
     # 当前工具默认在工作区根目录下执行
@@ -334,6 +298,12 @@ def main() -> None:
             qdrant_url=config.qdrant_url,
             qdrant_api_key=config.qdrant_api_key,
             collection_name=config.qdrant_collection,
+            retry_max_attempts=config.vector_retry_max_attempts,
+            retry_base_delay_seconds=config.vector_retry_base_delay_seconds,
+            retry_backoff_multiplier=config.vector_retry_backoff_multiplier,
+            retry_max_delay_seconds=config.vector_retry_max_delay_seconds,
+            circuit_failure_threshold=config.vector_circuit_failure_threshold,
+            circuit_recovery_timeout_seconds=config.vector_circuit_recovery_timeout_seconds,
         )
 
     # 长期记忆的权威存储仍然是本地 JSON。
@@ -348,7 +318,14 @@ def main() -> None:
     # - 删除历史测试或异常遗留的孤儿点
     # 本地 JSON 仍然是权威来源，向量库只做语义检索和重复判断。
     if vector_index is not None:
-        memory_store.reconcile_vector_index()
+        try:
+            memory_store.reconcile_vector_index()
+        except Exception as error:
+            # 向量索引初始化收敛属于非主链路能力。
+            # 即使这里失败，也应该允许主 agent 继续启动和回答。
+            log_event(
+                f"[session=startup] 向量索引初始化收敛失败，已降级继续运行: {error}"
+            )
 
     # 当前会话的短期工作记忆
     working_memory = WorkingMemory()
@@ -358,6 +335,12 @@ def main() -> None:
         api_key=config.api_key,
         base_url=config.base_url,
         model_name=config.model,
+        retry_max_attempts=config.aux_model_retry_max_attempts,
+        retry_base_delay_seconds=config.aux_model_retry_base_delay_seconds,
+        retry_backoff_multiplier=config.aux_model_retry_backoff_multiplier,
+        retry_max_delay_seconds=config.aux_model_retry_max_delay_seconds,
+        circuit_failure_threshold=config.aux_model_circuit_failure_threshold,
+        circuit_recovery_timeout_seconds=config.aux_model_circuit_recovery_timeout_seconds,
     )
     memory_guard = MemoryWriteGuard()
     memory_verifier = MemoryVerifier(
@@ -365,6 +348,12 @@ def main() -> None:
         base_url=config.base_url,
         model_name=config.model,
         vector_index=vector_index,
+        retry_max_attempts=config.aux_model_retry_max_attempts,
+        retry_base_delay_seconds=config.aux_model_retry_base_delay_seconds,
+        retry_backoff_multiplier=config.aux_model_retry_backoff_multiplier,
+        retry_max_delay_seconds=config.aux_model_retry_max_delay_seconds,
+        circuit_failure_threshold=config.aux_model_circuit_failure_threshold,
+        circuit_recovery_timeout_seconds=config.aux_model_circuit_recovery_timeout_seconds,
     )
     memory_curator = MemoryCurator(memory_store)
     memory_decay = MemoryDecay(
@@ -383,6 +372,12 @@ def main() -> None:
         api_key=config.api_key,
         base_url=config.base_url,
         model_name=config.model,
+        retry_max_attempts=config.aux_model_retry_max_attempts,
+        retry_base_delay_seconds=config.aux_model_retry_base_delay_seconds,
+        retry_backoff_multiplier=config.aux_model_retry_backoff_multiplier,
+        retry_max_delay_seconds=config.aux_model_retry_max_delay_seconds,
+        circuit_failure_threshold=config.aux_model_circuit_failure_threshold,
+        circuit_recovery_timeout_seconds=config.aux_model_circuit_recovery_timeout_seconds,
     )
 
     session = _load_or_create_session(
@@ -513,7 +508,7 @@ def main() -> None:
                 continue
 
         # 只有命中“任务完成 / 阶段完成 / 稳定结论”时，才尝试做长期记忆反思。
-        if _should_reflect_long_term_memory(step):
+        if should_reflect_long_term_memory(step):
             try:
                 # 只用当前最后一轮消息做反思，不拿整段全量历史直接抽记忆。
                 last_round_messages = get_last_round_messages(history)
@@ -532,6 +527,21 @@ def main() -> None:
                     "reflection_file",
                     limit=10,
                 )
+                reflection_decision = decide_project_reflection(
+                    files_touched=files_touched,
+                    failures=failures,
+                )
+
+                if not reflection_decision.should_reflect:
+                    log_event(
+                        (
+                            f"[session={session.session_id}] "
+                            f"跳过自动长期记忆反思: {reflection_decision.reason}"
+                        ),
+                        echo=False,
+                    )
+                    print(f"Agent> {step.content}")
+                    continue
 
                 # 基于“任务描述 + 最终结果 + 当前轮完整消息链”做 task reflection。
                 extracted_memories = memory_extractor.extract_from_task(
@@ -541,7 +551,7 @@ def main() -> None:
                     session_id=session.session_id,
                     key_decisions=key_decisions,
                     failures=failures,
-                    files_touched=files_touched,
+                    files_touched=reflection_decision.project_files_touched,
                 )
 
                 # 候选记忆先过 guard，再允许落盘。

@@ -4,8 +4,11 @@ import hashlib
 
 from openai import OpenAI
 
+from app.circuit_breaker import CircuitBreaker
 from app.compaction_policy import build_compaction_policy
 from app.history_window import build_older_history_summary
+from app.logger import log_event
+from app.retry import RetryPolicy, run_with_retry, should_retry_model_error
 from app.session import SessionData
 from app.types import ChatMessage
 
@@ -31,6 +34,12 @@ class OlderHistorySummarizer:
         max_summary_chars: int = 600,
         min_message_count: int = 6,
         min_total_chars: int = 500,
+        retry_max_attempts: int = 3,
+        retry_base_delay_seconds: float = 0.8,
+        retry_backoff_multiplier: float = 2.0,
+        retry_max_delay_seconds: float = 4.0,
+        circuit_failure_threshold: int = 3,
+        circuit_recovery_timeout_seconds: float = 45.0,
     ) -> None:
         self.client = OpenAI(
             api_key=api_key,
@@ -41,6 +50,18 @@ class OlderHistorySummarizer:
         self.max_summary_chars = max_summary_chars
         self.min_message_count = min_message_count
         self.min_total_chars = min_total_chars
+        # 历史摘要失败时有 fallback summary，所以这里采用保守重试策略即可。
+        self.retry_policy = RetryPolicy(
+            max_attempts=retry_max_attempts,
+            base_delay_seconds=retry_base_delay_seconds,
+            backoff_multiplier=retry_backoff_multiplier,
+            max_delay_seconds=retry_max_delay_seconds,
+        )
+        self.circuit_breaker = CircuitBreaker(
+            name="history_summarizer",
+            failure_threshold=circuit_failure_threshold,
+            recovery_timeout_seconds=circuit_recovery_timeout_seconds,
+        )
 
     def summarize(
         self,
@@ -204,14 +225,37 @@ class OlderHistorySummarizer:
             f"{context_text}"
         )
 
-        response = self.client.chat.completions.create(
-            model=self.model_name,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            extra_body={"thinking": {"type": "disabled"}},
-        )
+        if not self.circuit_breaker.allow_request():
+            raise RuntimeError("history_summarizer 熔断中")
+
+        def _request_model() -> object:
+            return self.client.chat.completions.create(
+                model=self.model_name,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                extra_body={"thinking": {"type": "disabled"}},
+            )
+
+        try:
+            response = run_with_retry(
+                _request_model,
+                policy=self.retry_policy,
+                should_retry=should_retry_model_error,
+                on_retry=lambda attempt, error, delay: log_event(
+                    (
+                        f"旧历史摘要模型调用失败，准备第 {attempt + 1} 次尝试："
+                        f"{type(error).__name__}: {error}，等待 {delay:.1f}s"
+                    ),
+                    echo=False,
+                ),
+            )
+        except Exception as error:
+            self.circuit_breaker.record_failure(error)
+            raise
+
+        self.circuit_breaker.record_success()
         return response.choices[0].message.content or ""
 
     def _save_session_state(

@@ -6,18 +6,19 @@ from typing import Any
 
 from openai import OpenAI
 
+from app.circuit_breaker import CircuitBreaker
+from app.logger import log_event
+from app.retry import RetryPolicy, run_with_retry, should_retry_model_error
 from app.types import AgentStep, ChatMessage
 
 
-# 自动 reflection 当前只允许产出这四类项目级长期记忆。
+# 自动 reflection 当前只保留两类“项目执行经验”。
 ALLOWED_MEMORY_CATEGORIES = {
-    "preference",  # 当前项目协作中长期稳定有效的偏好
-    "convention",  # 项目约定、实现约束、工作方式
-    "conclusion",  # 已验证的重要结论、方案、架构判断
-    "failure",  # 可复用的失败经验、踩坑结论、风险警告
+    "convention",
+    "failure",
 }
 
-# 明显属于过程性、礼貌性、临时性的表达，不应该进入长期记忆。
+# 明显属于过程性、临时性、礼貌性的表达，不应该进入长期记忆。
 TEMPORARY_CONTENT_MARKERS = {
     "本轮",
     "这一轮",
@@ -60,12 +61,12 @@ class TaskReflectionInput:
     而是把当前任务整理成 task description + execution trace 风格的输入。
     """
 
-    task_description: str  # 当前任务描述，通常来自本轮用户输入
-    final_step: AgentStep  # 本轮最终 assistant 输出对应的 step
-    turn_messages: list[ChatMessage]  # 本轮完整消息链，用来提取执行轨迹
-    key_decisions: list[str] = field(default_factory=list)  # 本轮关键决策列表
-    failures: list[str] = field(default_factory=list)  # 本轮失败、报错、阻断、风险列表
-    files_touched: list[str] = field(default_factory=list)  # 本轮涉及的重要文件路径
+    task_description: str
+    final_step: AgentStep
+    turn_messages: list[ChatMessage]
+    key_decisions: list[str] = field(default_factory=list)
+    failures: list[str] = field(default_factory=list)
+    files_touched: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -73,8 +74,8 @@ class ReflectionMemoryCandidate:
     """
     反思模型返回的一条候选长期记忆。
 
-    这里仍然只是“候选”，
-    后续还要经过本地过滤和 guard 才会真正落盘。
+    这里只是候选结果，
+    后面还要经过 guard 和 verifier 才会真正写入。
     """
 
     content: str
@@ -86,12 +87,12 @@ class ReflectionMemoryCandidate:
 
 class TaskMemoryReflectionEngine:
     """
-    基于任务的长期记忆反思引擎。
+    基于任务执行经验的长期记忆反思引擎。
 
-    职责：
-    1. 把当前任务执行整理成结构化上下文
-    2. 让模型提炼“未来仍值得复用”的项目级记忆
-    3. 对模型输出做本地清洗，减少乱合并、乱拆分和过程性污染
+    对齐当前的 project-memory 设计后，
+    它只负责从一次真实仓库任务执行中提炼：
+    - `convention`: 项目约定、实现约束、工作方式
+    - `failure`: 可复用的失败经验、风险警告
     """
 
     def __init__(
@@ -102,6 +103,12 @@ class TaskMemoryReflectionEngine:
         *,
         max_context_chars: int = 7000,
         max_candidates: int = 4,
+        retry_max_attempts: int = 3,
+        retry_base_delay_seconds: float = 0.8,
+        retry_backoff_multiplier: float = 2.0,
+        retry_max_delay_seconds: float = 4.0,
+        circuit_failure_threshold: int = 3,
+        circuit_recovery_timeout_seconds: float = 45.0,
     ) -> None:
         self.client = OpenAI(
             api_key=api_key,
@@ -110,6 +117,17 @@ class TaskMemoryReflectionEngine:
         self.model_name = model_name
         self.max_context_chars = max_context_chars
         self.max_candidates = max_candidates
+        self.retry_policy = RetryPolicy(
+            max_attempts=retry_max_attempts,
+            base_delay_seconds=retry_base_delay_seconds,
+            backoff_multiplier=retry_backoff_multiplier,
+            max_delay_seconds=retry_max_delay_seconds,
+        )
+        self.circuit_breaker = CircuitBreaker(
+            name="memory_reflection",
+            failure_threshold=circuit_failure_threshold,
+            recovery_timeout_seconds=circuit_recovery_timeout_seconds,
+        )
 
     def reflect(self, reflection_input: TaskReflectionInput) -> list[ReflectionMemoryCandidate]:
         """
@@ -118,7 +136,7 @@ class TaskMemoryReflectionEngine:
         流程：
         1. 构造反思上下文
         2. 调模型生成候选记忆
-        3. 对候选结果做一层本地清洗
+        3. 对候选结果做本地过滤
         """
         context_text = self._build_reflection_context(reflection_input)
         if not context_text:
@@ -128,15 +146,7 @@ class TaskMemoryReflectionEngine:
         return self._post_filter_candidates(raw_candidates)
 
     def _build_reflection_context(self, reflection_input: TaskReflectionInput) -> str:
-        """
-        构造发给 reflection 模型的结构化上下文。
-
-        模型需要看到的是：
-        - 当前任务是什么
-        - 最终结果是什么
-        - 中间有哪些关键决策、失败、文件触点
-        - 本轮执行轨迹的大致摘要
-        """
+        """构造发给 reflection 模型的结构化上下文。"""
         parts: list[str] = []
 
         task_description = reflection_input.task_description.strip()
@@ -179,12 +189,7 @@ class TaskMemoryReflectionEngine:
         return self._shorten(combined, self.max_context_chars)
 
     def _collect_turn_trace(self, turn_messages: list[ChatMessage]) -> list[str]:
-        """
-        从当前轮消息中提炼轻量 execution trace。
-
-        这里不直接把所有原始消息整段塞给模型，
-        只保留对长期记忆提炼更有用的轨迹信息。
-        """
+        """从当前轮消息中提取轻量 execution trace。"""
         trace_lines: list[str] = []
 
         for message in turn_messages:
@@ -210,72 +215,52 @@ class TaskMemoryReflectionEngine:
         return trace_lines
 
     def _call_reflection_model(self, context_text: str) -> list[ReflectionMemoryCandidate]:
-        """
-        调模型做 task reflection。
-
-        当前阶段重点有两类约束：
-        1. 只留下稳定、可复用、项目级的记忆
-        2. 尽量避免把多个独立约定乱合并，或把同一个约定拆成碎片
-        """
+        """调用模型做任务执行经验反思。"""
         system_prompt = """
-你是一个代码 Agent 的长期记忆反思器。
+你是一个代码 Agent 的任务执行经验反思器。
+你的任务不是总结聊天内容，也不是提炼通用知识，而是从一次任务执行中提炼“未来仍值得复用”的项目执行经验。
 
-你的任务不是总结聊天内容，而是从一次任务执行中提炼“未来仍值得复用”的项目级长期记忆。
+只允许输出以下两类记忆：
+1. convention: 与当前仓库直接相关的项目约定、实现约束、工作方式
+2. failure: 与当前仓库执行过程直接相关、未来可复用的失败经验或风险警告
 
-只允许输出以下几类记忆：
-1. preference: 在当前项目协作中长期稳定有效的偏好
-2. convention: 项目约定、实现约束、工作方式
-3. conclusion: 已验证的重要结论、方案、架构判断
-4. failure: 可复用的失败经验、踩坑结论、风险警告
+请严格遵守下面的准则：
+- 候选记忆默认会写入 project scope，所以内容必须对当前仓库的后续协作有长期价值
+- 如果内容回答的是“这个问题怎么解”，而不是“这个仓库以后该怎么做”，不要输出
+- 如果内容只是一次性实验、临时脚本、普通问答、题解模板、通用算法知识，不要输出
+- 如果内容只是“这轮做了什么”，而不是“以后应记住什么”，不要输出
+- 如果拿不准，宁可少写，不要多写
 
-你输出的是“候选长期记忆”，不是执行总结，也不是礼貌回复改写。
-
-严格抽取原则：
-- 只保留稳定、可复用、跨轮次仍有价值的信息
-- 只保留未来再次协作时值得提醒模型的内容
-- 默认这些记忆都会写入 project scope，所以不要输出只适合瞬时局部任务的内容
-- 如果内容只是“这轮做了什么”，而不是“未来应记住什么”，不要输出
-
-下面这些内容不能高分，通常应该直接不输出：
+下面这些内容不能高分，通常应直接不输出：
 - 本轮过程描述
 - 一次性临时操作
-- 没有长期复用价值的解释
 - 礼貌性回复、确认性回复、寒暄
 - 还未验证的猜测
 - 只适合当前瞬时上下文的细节
 
-下面这些内容才可以高分：
+下面这些内容可以高分：
 - 项目长期约定
-- 已验证的重要结论
+- 当前仓库中长期稳定的实现约束
+- 当前仓库执行中暴露出的稳定风险与规避方式
 - 可复用的失败经验
-- 当前项目语境下长期稳定的协作偏好
 
-关于“合并 / 拆分”，必须遵守下面规则：
-- 如果两条信息属于同一个稳定约定的两个部分，可以合并成一条
-- 如果两条信息分别对应两个独立约定，必须拆成两条，不要硬合并
-- 不要把“主约定 + 附带说明 + 礼貌结尾”拼成一条
-- 一条 memory 最好只表达一个核心规则或一个核心结论
-- 如果一条 memory 中出现“；”、“以及”、“并且”连接了两个不同规则，优先拆开
-- 但如果两部分本质上是在共同描述同一个约定，也可以保留为一条
+关于拆分规则：
+- 如果是两个独立约定，必须拆成两条
+- 如果只是同一条约定的不同表达，只保留更清晰的一条
+- 一条 memory 最好只表达一个核心规则或一个核心失败经验
 
-confidence 打分规则必须严格使用以下口径：
-- 0.90-1.00: 高度稳定、已验证、未来多次复用都成立的项目级记忆
-- 0.75-0.89: 较稳定且有复用价值，但验证强度略弱于最高档
-- 0.50-0.74: 有一定价值，但稳定性不足、范围偏窄、或仍带过程性痕迹
-- 0.00-0.49: 不应写入长期记忆的内容；这类内容尽量不要输出
-
-额外约束：
-- 若拿不准，宁可少写，不要多写
-- 单次最多输出 4 条
-- content 必须写成一句清晰、可复用、去上下文依赖的规则或结论
-- 不要在 content 里提“本轮”“刚刚”“这次先”“稍后再看”这类临时表达
+confidence 评分规则：
+- 0.90-1.00: 高度稳定、已验证、未来多次复用都成立的项目执行经验
+- 0.75-0.89: 较稳定且有复用价值，但验证强度略低于最高档
+- 0.50-0.74: 有一定价值，但稳定性不足、范围偏窄、或仍带过程痕迹
+- 0.00-0.49: 不应写入长期记忆的内容，这类内容尽量不要输出
 
 只返回 JSON，格式如下：
 {
   "memories": [
     {
       "content": "......",
-      "category": "preference|convention|conclusion|failure",
+      "category": "convention|failure",
       "tags": ["tag1", "tag2"],
       "confidence": 0.0,
       "domains": ["memory", "session"]
@@ -285,21 +270,23 @@ confidence 打分规则必须严格使用以下口径：
 """.strip()
 
         user_prompt = f"""
-请基于下面这次任务执行信息，提炼值得长期保留的项目级记忆候选。
+请基于下面这次任务执行信息，提炼值得长期保留的项目执行经验候选。
 
 注意：
 - 不要复述执行过程
 - 不要产出临时说明
 - 不要产出礼貌性语句
-- 只有在“未来仍值得保留”时才输出
-- 如果两条候选分别代表两个独立约定，请拆成两条
-- 如果只是同一个约定的两种表述，请只保留一条更清晰的版本
+- 只有当内容与当前仓库实现或执行方式直接相关时才输出
+- 如果这更像普通知识答案、算法题回答、tmp 实验结果，请直接输出空数组
 
 {context_text}
 """.strip()
 
-        try:
-            response = self.client.chat.completions.create(
+        if not self.circuit_breaker.allow_request():
+            return []
+
+        def _request_model() -> Any:
+            return self.client.chat.completions.create(
                 model=self.model_name,
                 messages=[
                     {"role": "system", "content": system_prompt},
@@ -307,8 +294,25 @@ confidence 打分规则必须严格使用以下口径：
                 ],
                 extra_body={"thinking": {"type": "disabled"}},
             )
-        except Exception:
+
+        try:
+            response = run_with_retry(
+                _request_model,
+                policy=self.retry_policy,
+                should_retry=should_retry_model_error,
+                on_retry=lambda attempt, error, delay: log_event(
+                    (
+                        f"长期记忆反思模型调用失败，准备第 {attempt + 1} 次尝试："
+                        f"{type(error).__name__}: {error}，等待 {delay:.1f}s"
+                    ),
+                    echo=False,
+                ),
+            )
+        except Exception as error:
+            self.circuit_breaker.record_failure(error)
             return []
+
+        self.circuit_breaker.record_success()
 
         raw_content = response.choices[0].message.content or ""
         payload = self._parse_json_payload(raw_content)
@@ -363,15 +367,10 @@ confidence 打分规则必须严格使用以下口径：
         candidates: list[ReflectionMemoryCandidate],
     ) -> list[ReflectionMemoryCandidate]:
         """
-        对模型输出做本地清洗。
+        对模型候选做本地清洗。
 
-        这里不让 confidence 单独决定一切。
-        除了 confidence 之外，还会同时看：
-        - category 是否在白名单
-        - 内容是否明显属于过程性、礼貌性、临时性
-        - 内容长度和信息密度是否达标
-        - 同一轮候选内是否重复
-        - 是否出现“一个 content 混了多个独立约定”的迹象
+        这里刻意不再依赖“算法题 / LeetCode / 某道题名”这类主题关键词，
+        而是只保留与长期 project memory 结构相关的兜底规则。
         """
         result: list[ReflectionMemoryCandidate] = []
         seen_keys: set[str] = set()
@@ -379,22 +378,16 @@ confidence 打分规则必须严格使用以下口径：
         for item in candidates:
             if not item.content:
                 continue
-
             if item.category not in ALLOWED_MEMORY_CATEGORIES:
                 continue
-
             if len(item.content) < 12:
                 continue
-
             if self._looks_too_temporary(item.content):
                 continue
-
             if self._looks_like_low_value_response(item.content):
                 continue
-
             if self._confidence_is_too_low_for_category(item):
                 continue
-
             if self._looks_over_merged(item):
                 continue
 
@@ -408,7 +401,7 @@ confidence 打分规则必须严格使用以下口径：
         return result
 
     def _parse_json_payload(self, text: str) -> Any:
-        """解析模型返回的 JSON，兼容 ```json 代码块。"""
+        """解析模型返回的 JSON，并兼容 ```json 代码块。"""
         raw = text.strip()
 
         if raw.startswith("```"):
@@ -423,24 +416,14 @@ confidence 打分规则必须严格使用以下口径：
             return None
 
     def _looks_too_temporary(self, content: str) -> bool:
-        """
-        判断候选记忆是否过于临时。
-
-        第一阶段先用启发式规则挡掉明显过程性内容，
-        避免把“刚刚做了什么”直接写成长期记忆。
-        """
+        """过滤明显带有临时过程痕迹的表述。"""
         lowered = content.lower()
         return any(marker in lowered for marker in TEMPORARY_CONTENT_MARKERS)
 
     def _looks_like_low_value_response(self, content: str) -> bool:
-        """
-        过滤明显低价值的应答式内容。
-
-        这类内容常见于礼貌回复、简单确认、执行状态播报，
-        即便模型误给了较高 confidence，也不应该进入长期记忆。
-        """
+        """过滤礼貌回复、执行播报等低价值表述。"""
         lowered = content.lower()
-        if any(phrase in lowered for phrase in LOW_VALUE_PHRASES):
+        if any(phrase.lower() in lowered for phrase in LOW_VALUE_PHRASES):
             return True
 
         if len(content) <= 24 and ("可以" in content or "好的" in content or "收到" in content):
@@ -449,30 +432,17 @@ confidence 打分规则必须严格使用以下口径：
         return False
 
     def _confidence_is_too_low_for_category(self, item: ReflectionMemoryCandidate) -> bool:
-        """
-        根据类别设置更保守的最低 confidence。
-
-        这样可以避免模型把过程性内容打到 0.5-0.7 之间时仍然被放过。
-        """
+        """按类别设置更保守的最低 confidence。"""
         min_confidence_by_category = {
-            "preference": 0.82,
             "convention": 0.80,
-            "conclusion": 0.78,
             "failure": 0.78,
         }
         threshold = min_confidence_by_category.get(item.category, 0.80)
         return item.confidence < threshold
 
     def _looks_over_merged(self, item: ReflectionMemoryCandidate) -> bool:
-        """
-        识别“多个独立约定被硬合并到一条 memory”。
-
-        这里只做保守拦截：
-        - 只对 convention / conclusion 做这层检查
-        - 如果 content 过长，同时出现多个强连接词，并且 tags 数量也偏多，
-          通常说明模型把多个独立规则揉到了一条里
-        """
-        if item.category not in {"convention", "conclusion"}:
+        """识别单条候选里是否混入了多个独立约定。"""
+        if item.category != "convention":
             return False
 
         content = item.content

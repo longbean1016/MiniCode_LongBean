@@ -135,6 +135,60 @@ class AppConfig:
     # 长期记忆向量集合名
     qdrant_collection: str
 
+    # 主聊天模型调用的最大重试次数
+    model_retry_max_attempts: int
+
+    # 主聊天模型重试的基础等待秒数
+    model_retry_base_delay_seconds: float
+
+    # 主聊天模型重试的退避倍数
+    model_retry_backoff_multiplier: float
+
+    # 主聊天模型单次重试等待上限
+    model_retry_max_delay_seconds: float
+
+    # 主聊天模型连续失败多少次后触发熔断
+    model_circuit_failure_threshold: int
+
+    # 主聊天模型熔断冷却时间（秒）
+    model_circuit_recovery_timeout_seconds: float
+
+    # 反思/验证/历史摘要这类辅助模型调用的最大重试次数
+    aux_model_retry_max_attempts: int
+
+    # 辅助模型调用重试的基础等待秒数
+    aux_model_retry_base_delay_seconds: float
+
+    # 辅助模型调用重试的退避倍数
+    aux_model_retry_backoff_multiplier: float
+
+    # 辅助模型调用单次重试等待上限
+    aux_model_retry_max_delay_seconds: float
+
+    # 辅助模型连续失败多少次后触发熔断
+    aux_model_circuit_failure_threshold: int
+
+    # 辅助模型熔断冷却时间（秒）
+    aux_model_circuit_recovery_timeout_seconds: float
+
+    # embedding / Qdrant 这类向量链路调用的最大重试次数
+    vector_retry_max_attempts: int
+
+    # 向量链路重试的基础等待秒数
+    vector_retry_base_delay_seconds: float
+
+    # 向量链路重试的退避倍数
+    vector_retry_backoff_multiplier: float
+
+    # 向量链路单次重试等待上限
+    vector_retry_max_delay_seconds: float
+
+    # 向量链路连续失败多少次后触发熔断
+    vector_circuit_failure_threshold: int
+
+    # 向量链路熔断冷却时间（秒）
+    vector_circuit_recovery_timeout_seconds: float
+
     # active project 记忆达到这个数量阈值时，允许触发一次低频全量 decay 刷新
     decay_full_scan_trigger_count: int
 

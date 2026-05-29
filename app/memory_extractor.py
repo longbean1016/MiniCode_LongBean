@@ -20,12 +20,26 @@ class LongTermMemoryExtractor:
         api_key: str,
         base_url: str,
         model_name: str,
+        *,
+        retry_max_attempts: int = 3,
+        retry_base_delay_seconds: float = 0.8,
+        retry_backoff_multiplier: float = 2.0,
+        retry_max_delay_seconds: float = 4.0,
+        circuit_failure_threshold: int = 3,
+        circuit_recovery_timeout_seconds: float = 45.0,
     ) -> None:
-        # 真正负责 task-based reflection 的引擎。
+        # 抽取器本身只做编排。
+        # 真正的模型调用、重试和熔断逻辑都放在 reflection engine 里。
         self.reflection_engine = TaskMemoryReflectionEngine(
             api_key=api_key,
             base_url=base_url,
             model_name=model_name,
+            retry_max_attempts=retry_max_attempts,
+            retry_base_delay_seconds=retry_base_delay_seconds,
+            retry_backoff_multiplier=retry_backoff_multiplier,
+            retry_max_delay_seconds=retry_max_delay_seconds,
+            circuit_failure_threshold=circuit_failure_threshold,
+            circuit_recovery_timeout_seconds=circuit_recovery_timeout_seconds,
         )
 
     def extract_from_task(
@@ -49,21 +63,19 @@ class LongTermMemoryExtractor:
         - `session_id`: 当前会话 id
         - `key_decisions`: 本轮关键决策列表
         - `failures`: 本轮失败、报错、阻断、风险列表
-        - `files_touched`: 本轮涉及的重要文件路径列表
-
-        这里的职责只有两件事：
-        1. 把反思输入交给 reflection engine
-        2. 把候选结果转成统一的 `MemoryEntry`
-
-        真正的写入门槛判断不在这里做，而是交给 `MemoryWriteGuard`。
+        - `files_touched`: 本轮涉及的重要项目文件路径列表
         """
+        normalized_key_decisions = list(key_decisions or [])
+        normalized_failures = list(failures or [])
+        normalized_files_touched = list(files_touched or [])
+
         reflection_input = TaskReflectionInput(
             task_description=task_description,
             final_step=final_step,
             turn_messages=turn_messages,
-            key_decisions=list(key_decisions or []),
-            failures=list(failures or []),
-            files_touched=list(files_touched or []),
+            key_decisions=normalized_key_decisions,
+            failures=normalized_failures,
+            files_touched=normalized_files_touched,
         )
 
         candidates = self.reflection_engine.reflect(reflection_input)
@@ -80,6 +92,13 @@ class LongTermMemoryExtractor:
                     scope="project",
                     domains=list(candidate.domains),
                     confidence=candidate.confidence,
+                    extra={
+                        # 给 guard / verifier / 后续审计保留结构化证据，
+                        # 避免再回退到主题关键词判断。
+                        "project_files_touched": normalized_files_touched,
+                        "reflection_failure_count": len(normalized_failures),
+                        "reflection_decision_count": len(normalized_key_decisions),
+                    },
                 )
             )
 

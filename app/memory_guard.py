@@ -10,8 +10,9 @@ class MemoryWriteDecision:
     """
     一条候选记忆的快速门禁结果。
 
-    - `should_store`: 是否允许进入下一阶段
-    - `reason`: 拦截原因，便于日志和排查
+    字段说明：
+    - `should_store`: 是否允许继续进入 verifier 阶段
+    - `reason`: 拦截原因，便于日志排查
     """
 
     should_store: bool
@@ -20,42 +21,32 @@ class MemoryWriteDecision:
 
 class MemoryWriteGuard:
     """
-    写入前保护层。
+    长期记忆写入前的快速门禁层。
 
-    这一层只做“快速门禁”，不再负责复杂的 duplicate / conflict 判定。
-    它的职责是尽快挡掉明显不该写入的候选，减少后续 verifier 的负担。
+    这一层不负责复杂的 duplicate / conflict 语义判断，
+    只负责尽快挡掉明显不该进入长期记忆的候选内容。
 
-    当前保留的检查项：
-    1. confidence 过低不写
-    2. 空内容不写
-    3. 非 project scope 不写
-    4. 明显低价值、过程性、礼貌性内容不写
+    当前约束重点：
+    - 自动 reflection 只允许写入 `project` scope
+    - 自动 reflection 只允许写入 `convention / failure`
+    - 自动 reflection 必须带有真实项目文件触点
+    - 过程性、临时性、礼貌性表达不进入长期记忆
     """
 
-    def __init__(
-        self,
-        *,
-        min_confidence: float = 0.78,
-    ) -> None:
+    def __init__(self, *, min_confidence: float = 0.78) -> None:
         self.min_confidence = min_confidence
 
     def should_store(self, candidate: MemoryEntry) -> MemoryWriteDecision:
-        """
-        判断候选记忆是否应该进入 verifier 阶段。
-
-        注意：
-        - 这里只做快速拦截
-        - duplicate / conflict 交给 `MemoryVerifier`
-        """
+        """判断候选记忆是否允许继续进入 verifier 阶段。"""
         confidence = self._get_confidence(candidate)
         if confidence < self.min_confidence:
             return MemoryWriteDecision(
                 should_store=False,
-                reason=f"confidence 太低: {confidence:.2f}",
+                reason=f"confidence 过低: {confidence:.2f}",
             )
 
-        normalized_candidate = self._normalize_text(candidate.content)
-        if not normalized_candidate:
+        normalized_content = self._normalize_text(candidate.content)
+        if not normalized_content:
             return MemoryWriteDecision(
                 should_store=False,
                 reason="空内容",
@@ -64,35 +55,69 @@ class MemoryWriteGuard:
         if candidate.scope.strip().lower() != "project":
             return MemoryWriteDecision(
                 should_store=False,
-                reason="自动 reflection 只允许写 project scope",
+                reason="自动 reflection 只允许写入 project scope",
             )
+
+        if candidate.source.strip().lower() == "task_reflection":
+            if candidate.category.strip().lower() not in {"convention", "failure"}:
+                return MemoryWriteDecision(
+                    should_store=False,
+                    reason="自动 reflection 只允许写入 convention / failure",
+                )
+
+            if not self._has_project_file_evidence(candidate):
+                return MemoryWriteDecision(
+                    should_store=False,
+                    reason="缺少真实项目文件触点，不允许自动写入 project memory",
+                )
 
         if self._looks_low_value(candidate):
             return MemoryWriteDecision(
                 should_store=False,
-                reason="内容更像过程性说明或低价值回复",
+                reason="内容更像临时过程说明、礼貌回复或一次性结果",
             )
 
         return MemoryWriteDecision(should_store=True)
 
     def _get_confidence(self, entry: MemoryEntry) -> float:
-        """从 `entry.extra` 中读取 confidence。"""
+        """读取候选记忆上的 confidence。"""
         try:
             return float(entry.confidence)
         except (TypeError, ValueError):
             return 0.0
 
+    def _has_project_file_evidence(self, entry: MemoryEntry) -> bool:
+        """
+        判断这条自动反思候选是否带有真实项目文件触点。
+
+        这里不再靠“算法/题解/LeetCode”之类的主题关键词做硬编码判断，
+        而是直接看这条候选是否有仓库执行证据。
+        """
+        raw_paths = entry.extra.get("project_files_touched", [])
+        if not isinstance(raw_paths, list):
+            return False
+
+        valid_paths = [
+            str(path).strip()
+            for path in raw_paths
+            if str(path).strip()
+        ]
+        return len(valid_paths) > 0
+
     def _looks_low_value(self, entry: MemoryEntry) -> bool:
         """
         用本地规则过滤明显低价值候选。
 
-        即使 confidence 勉强达标，只要内容明显像过程播报、临时说明、
-        或礼貌性回复，也不应该进入长期记忆。
+        这层只保留结构化、稳定的规则：
+        - 过程播报
+        - 临时说明
+        - 礼貌性确认
+        - 太短且不像失败经验的片段
         """
         content = self._normalize_text(entry.content)
         category = self._normalize_text(entry.category)
 
-        low_value_markers = {
+        temporary_markers = {
             "本轮",
             "这一轮",
             "刚刚",
@@ -100,23 +125,42 @@ class MemoryWriteGuard:
             "暂时",
             "稍后",
             "马上",
-            "好的",
-            "收到",
-            "没问题",
-            "我来帮你",
+            "待会",
+            "这次先",
+            "先这样",
+            "this turn",
             "just now",
             "temporarily",
             "for now",
+            "later",
         }
-        if any(marker.lower() in content for marker in low_value_markers):
+        if any(marker.lower() in content for marker in temporary_markers):
             return True
 
-        # 过短且不像规则/结论/失败经验的内容，通常不值得长期保留。
-        if len(content) < 18 and category not in {"failure", "conclusion"}:
+        low_value_phrases = {
+            "好的",
+            "收到",
+            "明白",
+            "没问题",
+            "已处理",
+            "我来帮你",
+            "我可以继续",
+            "thanks",
+            "thank you",
+            "got it",
+            "sounds good",
+        }
+        if any(phrase.lower() in content for phrase in low_value_phrases):
+            return True
+
+        if "tmp\\" in content or "tmp/" in content:
+            return True
+
+        if len(content) < 18 and category != "failure":
             return True
 
         return False
 
     def _normalize_text(self, text: str) -> str:
-        """标准化文本，便于本地规则判断。"""
-        return " ".join(text.strip().lower().split())
+        """标准化文本，便于规则判断。"""
+        return " ".join(str(text).strip().lower().split())
