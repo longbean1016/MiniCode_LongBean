@@ -5,6 +5,7 @@ import re
 import time
 from typing import Iterable
 
+from app.logger import log_event
 from app.memory_store import MemoryEntry, MemoryStore
 from app.session import SessionData
 from app.working_memory import WorkingMemory
@@ -159,6 +160,53 @@ def _rerank_related_memories(
     return [entry for _, entry in scored_entries[:max_items]]
 
 
+def _build_memory_debug_lines(
+    *,
+    query_text: str,
+    related_memories: list[MemoryEntry],
+    picked_memories: list[MemoryEntry],
+) -> list[str]:
+    """
+    构造长期记忆检索调试日志。
+
+    这里把三类信息分开打印：
+    1. 本轮检索 query
+    2. 召回候选
+    3. 最终注入的记忆
+    """
+    lines: list[str] = []
+    normalized_query = _shorten(query_text, 400)
+    lines.append(f"[memory-retrieval] query={normalized_query}")
+
+    if related_memories:
+        candidate_parts: list[str] = []
+        for entry in related_memories[:8]:
+            candidate_score = _score_memory_for_injection(entry, query_text)
+            candidate_parts.append(
+                f"{entry.id}:{entry.category}:score={candidate_score:.3f}:archived={entry.archived}"
+            )
+        lines.append(
+            "[memory-retrieval] candidates=" + " | ".join(candidate_parts)
+        )
+    else:
+        lines.append("[memory-retrieval] candidates=(none)")
+
+    if picked_memories:
+        injected_parts: list[str] = []
+        for entry in picked_memories:
+            injected_score = _score_memory_for_injection(entry, query_text)
+            injected_parts.append(
+                f"{entry.id}:{entry.category}:score={injected_score:.3f}"
+            )
+        lines.append(
+            "[memory-retrieval] injected=" + " | ".join(injected_parts)
+        )
+    else:
+        lines.append("[memory-retrieval] injected=(none)")
+
+    return lines
+
+
 def _format_long_term_memories(
     entries: list[MemoryEntry],
     max_chars_per_item: int,
@@ -255,6 +303,13 @@ def build_memory_context(
             query_text=query_text,
             max_items=top_k,
         )
+
+        for line in _build_memory_debug_lines(
+            query_text=query_text,
+            related_memories=related_memories,
+            picked_memories=picked_memories,
+        ):
+            log_event(line, echo=False)
 
         # 只有真正被注入 prompt 的记忆，才标记为“被访问”。
         if picked_memories:

@@ -29,7 +29,7 @@ class MemoryWriteGuard:
     当前约束重点：
     - 自动 reflection 只允许写入 `project` scope
     - 自动 reflection 只允许写入 `convention / failure`
-    - 自动 reflection 必须带有真实项目文件触点
+    - 自动 reflection 要么带有真实项目文件证据，要么带有较强任务执行信号
     - 过程性、临时性、礼貌性表达不进入长期记忆
     """
 
@@ -65,10 +65,10 @@ class MemoryWriteGuard:
                     reason="自动 reflection 只允许写入 convention / failure",
                 )
 
-            if not self._has_project_file_evidence(candidate):
+            if not self._has_reflection_admission(candidate):
                 return MemoryWriteDecision(
                     should_store=False,
-                    reason="缺少真实项目文件触点，不允许自动写入 project memory",
+                    reason="缺少反思准入证据，不允许自动写入 project memory",
                 )
 
         if self._looks_low_value(candidate):
@@ -86,29 +86,26 @@ class MemoryWriteGuard:
         except (TypeError, ValueError):
             return 0.0
 
-    def _has_project_file_evidence(self, entry: MemoryEntry) -> bool:
+    def _has_reflection_admission(self, entry: MemoryEntry) -> bool:
         """
-        判断这条自动反思候选是否带有真实项目文件触点。
+        判断这条自动反思候选是否具备准入证据。
 
-        这里不再靠“算法/题解/LeetCode”之类的主题关键词做硬编码判断，
-        而是直接看这条候选是否有仓库执行证据。
+        当前允许两种来源：
+        1. `project_file_evidence`
+           这轮任务确实改到了真实项目文件
+        2. `execution_signal`
+           虽然没有文件触点，但准入层已经认定它像稳定项目执行经验
         """
-        raw_paths = entry.extra.get("project_files_touched", [])
-        if not isinstance(raw_paths, list):
-            return False
-
-        valid_paths = [
-            str(path).strip()
-            for path in raw_paths
-            if str(path).strip()
-        ]
-        return len(valid_paths) > 0
+        admission_source = self._normalize_text(
+            entry.extra.get("reflection_admission_source", "")
+        )
+        return admission_source in {"project_file_evidence", "execution_signal"}
 
     def _looks_low_value(self, entry: MemoryEntry) -> bool:
         """
         用本地规则过滤明显低价值候选。
 
-        这层只保留结构化、稳定的规则：
+        这一层只保留结构化、稳定的规则：
         - 过程播报
         - 临时说明
         - 礼貌性确认

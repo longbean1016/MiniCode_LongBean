@@ -224,19 +224,20 @@ class MemoryVectorIndex:
             exclude_ids=exclude_ids or [],
         )
 
+        # 兼容不同版本的 qdrant-client：
+        # - 新版本使用 `query_points`
+        # - 旧版本仍然可能暴露 `search`
         search_result = self._call_qdrant(
             operation_name="search_similar_memories",
-            operation=lambda: self.qdrant.search(  # type: ignore
-                collection_name=self.collection_name,
+            operation=lambda: self._query_similar_points(
                 query_vector=query_vector,
                 query_filter=query_filter,
-                limit=top_k,
-                with_payload=True,
+                top_k=top_k,
             ),
         )
 
         hits: list[VectorSearchHit] = []
-        for item in search_result:
+        for item in self._extract_search_points(search_result):
             payload = dict(item.payload or {})
             memory_id = str(payload.get("memory_id", "")).strip() or str(item.id)
             hits.append(
@@ -248,6 +249,52 @@ class MemoryVectorIndex:
             )
 
         return hits
+
+    def _query_similar_points(
+        self,
+        *,
+        query_vector: list[float],
+        query_filter: Any,
+        top_k: int,
+    ) -> Any:
+        """
+        对 Qdrant 发起语义相似检索。
+
+        兼容策略：
+        - 当前环境如果只有 `query_points`，走新接口
+        - 如果未来回到旧版客户端，再回退到 `search`
+        """
+        if hasattr(self.qdrant, "query_points"):
+            return self.qdrant.query_points(  # type: ignore[attr-defined]
+                collection_name=self.collection_name,
+                query=query_vector,
+                query_filter=query_filter,
+                limit=top_k,
+                with_payload=True,
+                with_vectors=False,
+            )
+
+        return self.qdrant.search(  # type: ignore[attr-defined]
+            collection_name=self.collection_name,
+            query_vector=query_vector,
+            query_filter=query_filter,
+            limit=top_k,
+            with_payload=True,
+        )
+
+    def _extract_search_points(self, search_result: Any) -> list[Any]:
+        """
+        把不同 Qdrant 客户端版本返回的搜索结果统一成 points 列表。
+
+        - `query_points` 返回 `QueryResponse`，结果在 `.points`
+        - 旧版 `search` 直接返回点列表
+        """
+        points = getattr(search_result, "points", None)
+        if isinstance(points, list):
+            return points
+        if isinstance(search_result, list):
+            return search_result
+        return []
 
     def _build_embedding_text(self, entry: MemoryEntry) -> str:
         """

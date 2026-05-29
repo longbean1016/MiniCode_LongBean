@@ -223,6 +223,27 @@ def _persist_extracted_memories(
     return stored_entries
 
 
+def _annotate_reflection_candidates(
+    entries: list[MemoryEntry],
+    reflection_decision: object,
+) -> None:
+    """
+    把反思准入阶段的判定结果附加到候选记忆上。
+
+    这样 guard / verifier 在只看单条候选时，
+    也能知道这条记忆是靠“真实文件证据”还是“任务执行信号”进入准入阶段。
+    """
+    admission_source = getattr(reflection_decision, "admission_source", "blocked")
+    project_files_touched = list(
+        getattr(reflection_decision, "project_files_touched", []) or []
+    )
+
+    for entry in entries:
+        entry.extra["reflection_admission_source"] = str(admission_source)
+        entry.extra["reflection_has_project_file_evidence"] = bool(project_files_touched)
+        entry.extra["project_files_touched"] = project_files_touched
+
+
 def _log_decay_run_result(
     *,
     session_id: str,
@@ -528,8 +549,11 @@ def main() -> None:
                     limit=10,
                 )
                 reflection_decision = decide_project_reflection(
-                    files_touched=files_touched,
+                    task_description=user_input,
+                    final_response=step.content,
+                    key_decisions=key_decisions,
                     failures=failures,
+                    files_touched=files_touched,
                 )
 
                 if not reflection_decision.should_reflect:
@@ -552,6 +576,10 @@ def main() -> None:
                     key_decisions=key_decisions,
                     failures=failures,
                     files_touched=reflection_decision.project_files_touched,
+                )
+                _annotate_reflection_candidates(
+                    extracted_memories,
+                    reflection_decision,
                 )
 
                 # 候选记忆先过 guard，再允许落盘。
