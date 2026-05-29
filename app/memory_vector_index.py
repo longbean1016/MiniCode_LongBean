@@ -128,7 +128,7 @@ class MemoryVectorIndex:
         self.qdrant.delete(  # type: ignore
             collection_name=self.collection_name,
             points_selector=self._qdrant_models.PointIdsList(
-                points=point_ids,
+                points=point_ids, # type: ignore
             ),
             wait=True,
         )

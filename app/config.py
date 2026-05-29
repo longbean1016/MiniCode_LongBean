@@ -10,8 +10,8 @@ from app.types import AppConfig
 
 # 加载当前项目目录下的 .env 文件。
 # 这里故意不覆盖已经存在的系统环境变量，
-# 这样在做隔离测试时，可以通过临时环境变量覆盖 .env 中的默认配置。
-load_dotenv(override=False)
+# 改为False这样在做隔离测试时，可以通过临时环境变量覆盖 .env 中的默认配置。
+load_dotenv(override=True)
 
 
 def _get_env(name: str, default: str | None = None, required: bool = False) -> str:
