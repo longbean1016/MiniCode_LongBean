@@ -6,8 +6,7 @@ from app.compaction_policy import build_compaction_policy
 from app.history_window import build_older_history_summary, select_history_window
 from app.history_summarizer import OlderHistorySummarizer
 from app.logger import log_event
-from app.memory_context_builder import build_memory_context
-from app.memory_store import MemoryStore
+from app.memory_pipeline import MemoryPipeline
 from app.message_builder import MessageBuilder
 from app.prompt import build_system_prompt
 from app.session import SessionData
@@ -28,7 +27,7 @@ def run_agent_once(
     tool_context: ToolContext,
     session: SessionData,
     working_memory: WorkingMemory,
-    memory_store: MemoryStore | None,
+    memory_pipeline: MemoryPipeline | None,
     history_summarizer: OlderHistorySummarizer | None = None,
     history: list[ChatMessage] | None = None,
     max_steps: int = 8,
@@ -53,7 +52,7 @@ def run_agent_once(
         session=session,
         max_steps=max_steps,
         working_memory=working_memory,
-        memory_store=memory_store,
+        memory_pipeline=memory_pipeline,
         history_summarizer=history_summarizer,
         session_id=session_id,
     )
@@ -66,7 +65,7 @@ def continue_agent_from_history(
     tool_context: ToolContext,
     session: SessionData,
     working_memory: WorkingMemory,
-    memory_store: MemoryStore | None,
+    memory_pipeline: MemoryPipeline | None,
     history_summarizer: OlderHistorySummarizer | None = None,
     max_steps: int = 8,
     session_id: str = "",
@@ -82,7 +81,7 @@ def continue_agent_from_history(
         session=session,
         max_steps=max_steps,
         working_memory=working_memory,
-        memory_store=memory_store,
+        memory_pipeline=memory_pipeline,
         history_summarizer=history_summarizer,
         session_id=session_id,
     )
@@ -96,7 +95,7 @@ def _run_agent_loop(
     session: SessionData,
     max_steps: int,
     working_memory: WorkingMemory,
-    memory_store: MemoryStore | None,
+    memory_pipeline: MemoryPipeline | None,
     history_summarizer: OlderHistorySummarizer | None,
     session_id: str,
 ) -> tuple[AgentStep, list[ChatMessage]]:
@@ -166,13 +165,15 @@ def _run_agent_loop(
 
         # 把“会话摘要 + 短期工作记忆 + 长期记忆检索结果”拼成一段辅助上下文。
         # 这段内容会被注入 system prompt，而不是直接改写原始 history 结构。
-        memory_context = build_memory_context(
-            user_input=working_memory.get_primary_user_intent(),
-            session=session_snapshot,
-            working_memory=working_memory,
-            memory_store=memory_store,
-            session_summary_override=older_history_summary,
-        )
+        memory_context = ""
+        if memory_pipeline is not None:
+            memory_context_result = memory_pipeline.build_prompt_context(
+                user_input=working_memory.get_primary_user_intent(),
+                session=session_snapshot,
+                working_memory=working_memory,
+                session_summary_override=older_history_summary,
+            )
+            memory_context = memory_context_result.prompt_context
 
         # 每一轮都按最新记忆上下文重新构造系统提示词，
         # 这样模型能看到刚刚更新过的 summary / working memory / 长期记忆。
@@ -236,21 +237,26 @@ def _run_agent_loop(
 
             # 从最终 assistant 回复里尝试抽一条关键决策。
             # 这不是为了记录所有回答，而是尽量保留“已经确认的方向或约束”。
-            decision = extract_decision_from_assistant(step.content)
-            if decision:
-                working_memory.protect(
-                    decision,
-                    entry_type="key_decision",
-                    ttl_seconds=3600,
-                    importance=0.95,
+            if memory_pipeline is not None:
+                memory_pipeline.record_assistant_reply(
+                    working_memory,
+                    content=step.content,
                 )
-                # 这类条目只用于本轮 task reflection 输入，不注入后续 prompt。
-                working_memory.protect(
-                    decision,
-                    entry_type="reflection_decision",
-                    ttl_seconds=3600,
-                    importance=0.95,
-                )
+            else:
+                decision = extract_decision_from_assistant(step.content)
+                if decision:
+                    working_memory.protect(
+                        decision,
+                        entry_type="key_decision",
+                        ttl_seconds=3600,
+                        importance=0.95,
+                    )
+                    working_memory.protect(
+                        decision,
+                        entry_type="reflection_decision",
+                        ttl_seconds=3600,
+                        importance=0.95,
+                    )
 
             # 记录当前 step 和整轮总耗时
             step_cost = time.perf_counter() - step_started_at
@@ -284,20 +290,26 @@ def _run_agent_loop(
 
                 # 从工具输入里尽量提取活跃路径。
                 # 这一步会覆盖 path / file_path / directory / run_command 等常见形式。
-                for path in extract_active_paths(tool_name, tool_input):
-                    working_memory.protect(
-                        path,
-                        entry_type="active_task",
-                        ttl_seconds=1800,
-                        importance=0.8,
+                if memory_pipeline is not None:
+                    memory_pipeline.record_tool_call(
+                        working_memory,
+                        tool_name=tool_name,
+                        tool_input=tool_input,
                     )
-                    # 单独记录本轮触及的文件/路径，供长期记忆反思使用。
-                    working_memory.protect(
-                        path,
-                        entry_type="reflection_file",
-                        ttl_seconds=1800,
-                        importance=0.7,
-                    )
+                else:
+                    for path in extract_active_paths(tool_name, tool_input):
+                        working_memory.protect(
+                            path,
+                            entry_type="active_task",
+                            ttl_seconds=1800,
+                            importance=0.8,
+                        )
+                        working_memory.protect(
+                            path,
+                            entry_type="reflection_file",
+                            ttl_seconds=1800,
+                            importance=0.7,
+                        )
 
                 # 先把工具调用请求记到历史里
                 builder.add_tool_call(
@@ -344,19 +356,26 @@ def _run_agent_loop(
 
                 # 工具失败时，把错误压成短摘要写进短期工作记忆。
                 if not result.ok:
-                    failure_summary = summarize_failure(tool_name, result)
-                    working_memory.protect(
-                        failure_summary,
-                        entry_type="error_context",
-                        ttl_seconds=1800,
-                        importance=0.9,
-                    )
-                    working_memory.protect(
-                        failure_summary,
-                        entry_type="reflection_failure",
-                        ttl_seconds=1800,
-                        importance=0.9,
-                    )
+                    if memory_pipeline is not None:
+                        memory_pipeline.record_tool_failure(
+                            working_memory,
+                            tool_name=tool_name,
+                            result=result,
+                        )
+                    else:
+                        failure_summary = summarize_failure(tool_name, result)
+                        working_memory.protect(
+                            failure_summary,
+                            entry_type="error_context",
+                            ttl_seconds=1800,
+                            importance=0.9,
+                        )
+                        working_memory.protect(
+                            failure_summary,
+                            entry_type="reflection_failure",
+                            ttl_seconds=1800,
+                            importance=0.9,
+                        )
 
                 # 命中“需要授权”时，不继续喂模型，而是把审批请求返回给 main
                 if result.error=="PERMISSION_REQUIRED":

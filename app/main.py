@@ -4,19 +4,19 @@ import argparse
 
 from app.agent_loop import continue_agent_from_history, run_agent_once
 from app.config import load_config
-from app.memory_decay import DecayRunResult, MemoryDecay
+from app.memory_decay import MemoryDecay
 from app.history_summarizer import OlderHistorySummarizer
 from app.logger import log_event
 from app.memory_curator import MemoryCurator
 from app.memory_extractor import LongTermMemoryExtractor
+from app.memory_feedback import MemoryFeedbackStore
 from app.memory_guard import MemoryWriteGuard
-from app.memory_reflection_policy import (
-    decide_project_reflection,
-    should_reflect_long_term_memory,
-)
-from app.memory_store import JsonMemoryStore, MemoryEntry
+from app.memory_pipeline import MemoryPipeline
+from app.memory_read_pipeline import MemoryReadPipeline
+from app.memory_store import JsonMemoryStore
 from app.memory_vector_index import MemoryVectorIndex
 from app.memory_verifier import MemoryVerifier
+from app.memory_write_pipeline import MemoryWritePipeline
 from app.model_registry import OpenAIModelAdapter
 from app.session import (
     SessionData,
@@ -31,7 +31,6 @@ from app.turn_history import get_last_round_messages
 from app.tools import build_tool_registry
 from app.types import AgentStep, ChatMessage, ToolContext
 from app.working_memory import WorkingMemory
-from app.working_memory_updater import extract_active_paths, summarize_failure
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
@@ -128,152 +127,6 @@ def _replace_pending_tool_result(
         )
 
     return updated_history
-
-
-def _clear_reflection_runtime_context(working_memory: WorkingMemory) -> None:
-    """
-    清理上一轮留下的 reflection 运行时条目。
-
-    这些条目只服务当前一轮的 task reflection，
-    不应该泄漏到下一轮继续参与反思。
-    """
-    working_memory.clear_entries_by_type(
-        "reflection_decision",
-        "reflection_failure",
-        "reflection_file",
-    )
-
-
-def _collect_reflection_entries(
-    working_memory: WorkingMemory,
-    entry_type: str,
-    *,
-    limit: int,
-) -> list[str]:
-    """
-    从运行时工作记忆里取出当前轮的反思辅助条目，并做轻量去重。
-
-    参数说明：
-    - `entry_type`: 需要读取的运行时条目类型
-    - `limit`: 最多返回多少条，避免单轮反思输入失控
-    """
-    result: list[str] = []
-    seen: set[str] = set()
-
-    for entry in working_memory.get_entries_by_type(entry_type):
-        content = entry.content.strip()
-        if not content or content in seen:
-            continue
-        seen.add(content)
-        result.append(content)
-        if len(result) >= limit:
-            break
-
-    return result
-
-
-def _persist_extracted_memories(
-    memory_store: JsonMemoryStore,
-    memory_guard: MemoryWriteGuard,
-    memory_verifier: MemoryVerifier,
-    entries: list[MemoryEntry],
-) -> list[MemoryEntry]:
-    """
-    把抽取出来的长期记忆写入 memory store。
-
-    当前阶段的写入流程是：
-    1. 先读取已有长期记忆
-    2. 逐条走 `MemoryWriteGuard` 做快速门禁
-    3. 再走 `MemoryVerifier` 做 duplicate / conflict / reject / supersede_store 判断
-    4. 只有 verifier 判定为 `store` 或 `supersede_store` 才真正落盘
-
-    `supersede_store` 是 minicode 风格更新链路的关键：
-    - 新记忆先允许入库
-    - 再把“它替代的是哪条旧记忆”一起记到 extra 里
-    - 后面的 curator 会根据这条显式关系，把旧记忆降级成 superseded
-    """
-    existing_entries = memory_store.load_memories()
-    stored_entries: list[MemoryEntry] = []
-
-    for entry in entries:
-        guard_decision = memory_guard.should_store(entry)
-        if not guard_decision.should_store:
-            continue
-
-        similar_entries = memory_verifier.find_similar_entries(entry, existing_entries)
-        verify_decision = memory_verifier.verify(entry, similar_entries)
-        if verify_decision.action not in {"store", "supersede_store"}:
-            continue
-
-        # 如果 verifier 已经确认“这是一条替代更新”，
-        # 就把被替代的旧记忆 id 显式写入 extra。
-        # 这样 curator 后面不必完全依赖启发式猜测关系，
-        # 能更稳定地把旧版本归档出主检索面。
-        if (
-            verify_decision.action == "supersede_store"
-            and verify_decision.matched_memory_id.strip()
-        ):
-            entry.extra["supersedes_memory_id"] = verify_decision.matched_memory_id.strip()
-            entry.extra["write_action"] = "supersede_store"
-
-        stored_entry = memory_store.add_memory(entry)
-        existing_entries.append(stored_entry)
-        stored_entries.append(stored_entry)
-
-    return stored_entries
-
-
-def _annotate_reflection_candidates(
-    entries: list[MemoryEntry],
-    reflection_decision: object,
-) -> None:
-    """
-    把反思准入阶段的判定结果附加到候选记忆上。
-
-    这样 guard / verifier 在只看单条候选时，
-    也能知道这条记忆是靠“真实文件证据”还是“任务执行信号”进入准入阶段。
-    """
-    admission_source = getattr(reflection_decision, "admission_source", "blocked")
-    project_files_touched = list(
-        getattr(reflection_decision, "project_files_touched", []) or []
-    )
-
-    for entry in entries:
-        entry.extra["reflection_admission_source"] = str(admission_source)
-        entry.extra["reflection_has_project_file_evidence"] = bool(project_files_touched)
-        entry.extra["project_files_touched"] = project_files_touched
-
-
-def _log_decay_run_result(
-    *,
-    session_id: str,
-    stage: str,
-    result: DecayRunResult,
-    enabled: bool,
-    echo: bool,
-) -> None:
-    """
-    记录一轮 decay 的摘要日志。
-
-    这里只记录汇总信息：
-    - 扫描了多少条
-    - 发生了多少次分数刷新或归档
-    - 其中有多少条被归档
-    避免把细节日志直接打满正常对话输出。
-    """
-    if not enabled or result.changed_count <= 0:
-        return
-
-    log_event(
-        (
-            f"[session={session_id}] decay[{stage}] "
-            f"scanned={result.scanned_count} "
-            f"changed={result.changed_count} "
-            f"archived={result.archived_count()}"
-        ),
-        echo=echo,
-    )
-
 
 def main() -> None:
     """程序入口：加载配置、恢复会话、启动命令行对话循环。"""
@@ -386,6 +239,18 @@ def main() -> None:
         archive_confidence_threshold=config.decay_archive_confidence_threshold,
         archive_usage_threshold=config.decay_archive_usage_threshold,
     )
+    memory_pipeline = MemoryPipeline(
+        read_pipeline=MemoryReadPipeline(memory_store),
+        write_pipeline=MemoryWritePipeline(
+            memory_store=memory_store,
+            memory_extractor=memory_extractor,
+            memory_verifier=memory_verifier,
+            memory_curator=memory_curator,
+            memory_decay=memory_decay,
+            memory_guard=memory_guard,
+        ),
+        feedback_store=MemoryFeedbackStore(memory_store),
+    )
 
     # 旧历史摘要器只服务于 prompt 构造时的 older history summary。
     # 它带运行期缓存，避免每轮循环都重复调用模型做摘要。
@@ -417,23 +282,28 @@ def main() -> None:
         if not user_input:
             continue
 
-        # 每一轮开始前先清掉上一轮的反思辅助条目。
-        _clear_reflection_runtime_context(working_memory)
-
-        # 先把本轮用户输入记为当前主要目标
-        working_memory.protect(
-            user_input,
-            entry_type="user_intent",
-            ttl_seconds=3600,
-            importance=1.0,
-            replace_latest_of_type=True,
-        )
+        memory_pipeline.reset_turn_runtime(working_memory)
+        memory_pipeline.remember_user_intent(working_memory, user_input)
 
         if user_input.lower() in {"quit", "exit"}:
             session.replace_messages(history)
             save_session(session)
             print("Bye!")
             break
+
+        explicit_result = memory_pipeline.handle_explicit_input(
+            user_input=user_input,
+            session_id=session.session_id,
+            history=history,
+            decay_log_enabled=config.decay_log_enabled,
+            decay_log_echo=config.decay_log_echo,
+        )
+        if explicit_result.handled:
+            history = explicit_result.history
+            session.replace_messages(history)
+            save_session(session)
+            print(f"Agent> {explicit_result.assistant_text}")
+            continue
 
         step, history = run_agent_once(
             user_input=user_input,
@@ -442,7 +312,7 @@ def main() -> None:
             tool_context=tool_context,
             session=session,
             working_memory=working_memory,
-            memory_store=memory_store,
+            memory_pipeline=memory_pipeline,
             history_summarizer=history_summarizer,
             history=history,
             session_id=session.session_id,
@@ -463,38 +333,16 @@ def main() -> None:
                     context=tool_context,
                 )
 
-                # 授权后的工具执行不会经过 agent_loop 的常规工具分支，
-                # 所以这里手动补齐反思输入采集，避免漏掉路径触点和失败摘要。
-                for path in extract_active_paths(
-                    step.approval.tool_name,
-                    step.approval.input_data,
-                ):
-                    working_memory.protect(
-                        path,
-                        entry_type="active_task",
-                        ttl_seconds=1800,
-                        importance=0.8,
-                    )
-                    working_memory.protect(
-                        path,
-                        entry_type="reflection_file",
-                        ttl_seconds=1800,
-                        importance=0.7,
-                    )
-
+                memory_pipeline.record_tool_call(
+                    working_memory,
+                    tool_name=step.approval.tool_name,
+                    tool_input=step.approval.input_data,
+                )
                 if not result.ok:
-                    failure_summary = summarize_failure(step.approval.tool_name, result)
-                    working_memory.protect(
-                        failure_summary,
-                        entry_type="error_context",
-                        ttl_seconds=1800,
-                        importance=0.9,
-                    )
-                    working_memory.protect(
-                        failure_summary,
-                        entry_type="reflection_failure",
-                        ttl_seconds=1800,
-                        importance=0.9,
+                    memory_pipeline.record_tool_failure(
+                        working_memory,
+                        tool_name=step.approval.tool_name,
+                        result=result,
                     )
 
                 approved_history = _replace_pending_tool_result(
@@ -513,7 +361,7 @@ def main() -> None:
                     tool_context=tool_context,
                     session=session,
                     working_memory=working_memory,
-                    memory_store=memory_store,
+                    memory_pipeline=memory_pipeline,
                     history_summarizer=history_summarizer,
                     session_id=session.session_id,
                 )
@@ -528,114 +376,18 @@ def main() -> None:
                 print("Agent> 用户已拒绝此次高风险操作。")
                 continue
 
-        # 只有命中“任务完成 / 阶段完成 / 稳定结论”时，才尝试做长期记忆反思。
-        if should_reflect_long_term_memory(step):
+        if step.type == "assistant":
             try:
-                # 只用当前最后一轮消息做反思，不拿整段全量历史直接抽记忆。
-                last_round_messages = get_last_round_messages(history)
-                key_decisions = _collect_reflection_entries(
-                    working_memory,
-                    "reflection_decision",
-                    limit=6,
-                )
-                failures = _collect_reflection_entries(
-                    working_memory,
-                    "reflection_failure",
-                    limit=6,
-                )
-                files_touched = _collect_reflection_entries(
-                    working_memory,
-                    "reflection_file",
-                    limit=10,
-                )
-                reflection_decision = decide_project_reflection(
-                    task_description=user_input,
-                    final_response=step.content,
-                    key_decisions=key_decisions,
-                    failures=failures,
-                    files_touched=files_touched,
-                )
-
-                if not reflection_decision.should_reflect:
-                    log_event(
-                        (
-                            f"[session={session.session_id}] "
-                            f"跳过自动长期记忆反思: {reflection_decision.reason}"
-                        ),
-                        echo=False,
-                    )
-                    print(f"Agent> {step.content}")
-                    continue
-
-                # 基于“任务描述 + 最终结果 + 当前轮完整消息链”做 task reflection。
-                extracted_memories = memory_extractor.extract_from_task(
+                memory_pipeline.finalize_turn(
                     task_description=user_input,
                     final_step=step,
-                    turn_messages=last_round_messages,
+                    turn_messages=get_last_round_messages(history),
                     session_id=session.session_id,
-                    key_decisions=key_decisions,
-                    failures=failures,
-                    files_touched=reflection_decision.project_files_touched,
+                    working_memory=working_memory,
+                    decay_log_enabled=config.decay_log_enabled,
+                    decay_log_echo=config.decay_log_echo,
                 )
-                _annotate_reflection_candidates(
-                    extracted_memories,
-                    reflection_decision,
-                )
-
-                # 候选记忆先过 guard，再允许落盘。
-                stored_entries = _persist_extracted_memories(
-                    memory_store,
-                    memory_guard,
-                    memory_verifier,
-                    extracted_memories,
-                )
-
-                # 只围绕本次新写入的 project 记忆做增量整理。
-                # curator 的职责是让长期记忆“逐步收敛”，
-                # 避免系统长期运行后只增不减、重复堆积。
-                if stored_entries:
-                    memory_curator.curate_new_entries(stored_entries)
-                    try:
-                        incremental_decay_result = memory_decay.refresh_new_entries(
-                            stored_entries
-                        )
-                    except Exception as error:
-                        log_event(
-                            f"[session={session.session_id}] decay[incremental] 执行失败: {error}",
-                            echo=config.decay_log_echo,
-                        )
-                    else:
-                        _log_decay_run_result(
-                            session_id=session.session_id,
-                            stage="incremental",
-                            result=incremental_decay_result,
-                            enabled=config.decay_log_enabled,
-                            echo=config.decay_log_echo,
-                        )
-
-                    # 当 active project 记忆增长到一定规模后，
-                    # 再额外触发一次低频全量整理，避免只做增量时留下历史脏数据。
-                    if memory_curator.should_run_full_scan():
-                        memory_curator.curate_project_memories()
-                    if memory_decay.should_run_full_refresh():
-                        try:
-                            full_decay_result = memory_decay.refresh_project_memories()
-                        except Exception as error:
-                            log_event(
-                                f"[session={session.session_id}] decay[full] 执行失败: {error}",
-                                echo=config.decay_log_echo,
-                            )
-                        else:
-                            _log_decay_run_result(
-                                session_id=session.session_id,
-                                stage="full",
-                                result=full_decay_result,
-                                enabled=config.decay_log_enabled,
-                                echo=config.decay_log_echo,
-                            )
             except Exception as error:
-                # 长期记忆反思失败不能影响主流程回答，
-                # 但必须把原因打印并写日志，否则会变成“静默丢记忆”，很难排查。
                 log_event(
                     f"[session={session.session_id}] 长期记忆写入失败: {error}"
                 )
