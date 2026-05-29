@@ -43,6 +43,7 @@ class MemoryPipeline:
         session_summary_override: str = "",
         top_k: int = 4,
         retrieval_top_k: int = 8,
+        max_memory_chars_per_item: int = 180,
     ) -> MemoryContextResult:
         result = self.read_pipeline.build_context(
             user_input=user_input,
@@ -51,6 +52,7 @@ class MemoryPipeline:
             session_summary_override=session_summary_override,
             top_k=top_k,
             retrieval_top_k=retrieval_top_k,
+            max_memory_chars_per_item=max_memory_chars_per_item,
         )
         self._remember_injected_entries(working_memory, result.injected_entries)
         return result

@@ -1,151 +1,254 @@
-﻿ 
+from __future__ import annotations
+
+import re
 from dataclasses import dataclass
 from typing import Any, Callable
- 
 
 from app.types import ToolContext, ToolResult
 
 
+Validator = Callable[[Any], Any]
+Runner = Callable[[Any, ToolContext], ToolResult]
 
-
-# 工具执行函数类型
-# 输入任意类型，返回检验/转换后的数据(也就是对输入的格式进行统一)，如果输入不合法则抛出异常
-Validator=Callable[[Any], Any]
-
-# 工具执行函数类型
-# 接收处理后的输入和工具上下文，返回ToolResult(拿到处理后的输入格式后，工具执行函数就不需要关心输入是否合法了，只需要专注于工具的核心功能实现)
-Runner=Callable[[Any, ToolContext], ToolResult]
+# 不同工具类型适合不同的上下文保留策略。
+_TOOL_OUTPUT_LIMITS: dict[str, int] = {
+    "read_file": 40_000,
+    "grep_files": 16_000,
+    "list_files": 12_000,
+    "run_command": 30_000,
+}
+_DEFAULT_MAX_OUTPUT = 18_000
 
 
 @dataclass(slots=True)
 class ToolDefinition:
-    """
-    表示一个工具的定义信息
-    """
+    """表示一个工具的定义信息。"""
 
-    name: str # 工具名称，必须唯一
-    description: str # 工具描述信息，供模型参考使用
-    validator: Validator # 参数校验函数
-    runner: Runner # 工具执行函数
-    input_schema:dict[str, Any] # 工具的参数结构，给 function call 使用
+    name: str
+    description: str
+    validator: Validator
+    runner: Runner
+    input_schema: dict[str, Any]
 
 
 class ToolRegistry:
-    """
-    工具注册表：负责统一管理和执行所有工具。
-    """
+    """工具注册表：统一管理工具，并在返回前做工具级输出治理。"""
 
-    def __init__(
-            self,
-            tools:list[ToolDefinition],
-            max_output_lines:int=120, #超长输出最大保留行数
-            )->None:
-        # 保存工具列表，便于后续遍历展示
-        self._tools=tools
-        # 使用字典建立工具名到工具定义的映射，方便后续根据工具名快速找到对应的工具定义和执行函数
-        self._tool_index:dict[str,ToolDefinition]={tool.name: tool for tool in tools}
-        self._max_output_lines = max_output_lines  # 输出摘要阈值
+    def __init__(self, tools: list[ToolDefinition], max_output_lines: int = 120) -> None:
+        self._tools = tools
+        self._tool_index: dict[str, ToolDefinition] = {tool.name: tool for tool in tools}
+        self._max_output_lines = max_output_lines
 
-    def list_tools(self)->list[ToolDefinition]:
-        """
-        返回当前注册的所有工具定义列表
-        """
+    def list_tools(self) -> list[ToolDefinition]:
         return list(self._tools)
-    
-    def list_tool_name(self)->list[str]:
-        """
-        返回当前注册的所有工具名称列表
-        """
-        return list(self._tool_index.keys())
-    
 
-    def find_tool(self,name:str)->ToolDefinition|None:
-        """
-        根据工具名称查找对应的工具定义，如果找不到则返回 None
-        """
+    def list_tool_name(self) -> list[str]:
+        return list(self._tool_index.keys())
+
+    def find_tool(self, name: str) -> ToolDefinition | None:
         return self._tool_index.get(name)
-    
+
     def _normalize_output(self, text: Any) -> str:
-        """把输出统一转成字符串，并处理空输出。"""
+        """把工具输出统一转成字符串，并兜底空输出。"""
         if text is None:
             return "工具执行完成，但没有输出。"
-        s = str(text).strip()
-        if not s:
-            return "工具执行完成，但没有输出。"
-        return s
-    
-    def _summarize_output(self, text: str) -> tuple[str, bool, int]:
-        """按行截断超大输出，返回(文本, 是否截断, 原始行数)。"""
-        lines = text.splitlines()
-        total = len(lines)
-        if total <= self._max_output_lines:
-            return text, False, total
 
-        kept = lines[: self._max_output_lines]
-        remain = total - self._max_output_lines
-        kept.append(f"[输出已截断：共 {total} 行，仅保留前 {self._max_output_lines} 行，省略 {remain} 行]")
-        return "\n".join(kept), True, total
+        normalized = str(text)
+        if not normalized.strip():
+            return "工具执行完成，但没有输出。"
+        return normalized
+
+    def _smart_truncate_output(self, output: str, tool_name: str) -> str:
+        """按工具类型压缩超大输出，尽量保留对推理最有价值的部分。"""
+        if not output:
+            return output
+
+        limit = _TOOL_OUTPUT_LIMITS.get(tool_name, _DEFAULT_MAX_OUTPUT)
+        if len(output) <= limit:
+            return output
+
+        lines = output.splitlines()
+        total_lines = max(1, len(lines))
+        total_chars = len(output)
+        average_line_length = max(1, total_chars / total_lines)
+        max_lines = max(8, int(limit / max(40, average_line_length)))
+
+        if tool_name == "read_file":
+            # read_file 已经天然支持分段，因此二次截断时优先保留头信息和正文头尾。
+            return self._truncate_head_tail(lines, total_chars, max_lines, head_ratio=0.6)
+
+        if tool_name in {"grep_files"}:
+            # grep 结果通常有结构化头部，二次截断时要保留统计信息和首尾样本。
+            return self._truncate_structured_collection_output(
+                lines,
+                total_chars,
+                max_lines,
+            )
+
+        if tool_name in {"list_files"}:
+            # 目录列表和 grep 一样属于集合输出，适合保留头部统计和首尾目录项。
+            return self._truncate_structured_collection_output(
+                lines,
+                total_chars,
+                max_lines,
+            )
+
+        if tool_name in {"run_command"}:
+            # 命令输出经常要保留报错行，因此在头尾之外尽量补一些 error/warning 行。
+            error_lines = self._extract_error_lines(lines, max_keep=10)
+            base = self._truncate_head_tail(lines, total_chars, max_lines, head_ratio=0.4, tail_ratio=0.4)
+            if error_lines:
+                error_block = "\n".join(error_lines)
+                return f"{base}\n\n--- Error Highlights ---\n{error_block}"
+            return base
+
+        return self._truncate_head_tail(lines, total_chars, max_lines)
+
+    def _truncate_structured_collection_output(
+        self,
+        lines: list[str],
+        total_chars: int,
+        max_lines: int,
+    ) -> str:
+        """为 grep/list 这类集合输出保留统计头和首尾样本。"""
+        total_lines = len(lines)
+        if total_lines <= max_lines:
+            return "\n".join(lines)
+
+        header_lines, body_lines = self._split_structured_header(lines)
+        if not body_lines:
+            return self._truncate_head_tail(lines, total_chars, max_lines)
+
+        header_budget = len(header_lines)
+        remaining_budget = max_lines - header_budget - 1
+        if remaining_budget < 4:
+            return self._truncate_head_tail(lines, total_chars, max_lines)
+
+        head_count = max(2, int(remaining_budget * 0.6))
+        tail_count = max(2, remaining_budget - head_count)
+        while head_count + tail_count > remaining_budget and tail_count > 1:
+            tail_count -= 1
+
+        head_body = body_lines[:head_count]
+        tail_body = body_lines[-tail_count:] if tail_count > 0 else []
+        omitted = max(0, len(body_lines) - len(head_body) - len(tail_body))
+
+        parts: list[str] = []
+        parts.extend(header_lines)
+        parts.extend(head_body)
+        if omitted > 0:
+            parts.append(f"... [中间省略 {omitted} 行（输出过大：{total_chars} 字符）] ...")
+        if tail_body:
+            parts.extend(tail_body)
+        return "\n".join(parts)
+
+    def _truncate_head_tail(
+        self,
+        lines: list[str],
+        total_chars: int,
+        max_lines: int,
+        *,
+        head_ratio: float = 0.5,
+        tail_ratio: float | None = None,
+    ) -> str:
+        """通用头尾截断，用于保留输出开头和结尾的关键信息。"""
+        total_lines = len(lines)
+        if total_lines <= max_lines:
+            return "\n".join(lines)
+
+        effective_tail_ratio = tail_ratio if tail_ratio is not None else (1.0 - head_ratio)
+        head_lines = max(1, int(max_lines * head_ratio))
+        tail_lines = max(1, int(max_lines * effective_tail_ratio))
+
+        # 避免 head + tail 超出目标行数太多。
+        while head_lines + tail_lines > max_lines and tail_lines > 1:
+            tail_lines -= 1
+
+        head = "\n".join(lines[:head_lines])
+        tail = "\n".join(lines[-tail_lines:])
+        omitted = max(0, total_lines - head_lines - tail_lines)
+        return (
+            f"{head}\n"
+            f"\n... [中间省略 {omitted} 行（输出过大：{total_chars} 字符）] ...\n\n"
+            f"{tail}"
+        )
+
+    def _split_structured_header(self, lines: list[str]) -> tuple[list[str], list[str]]:
+        """拆分带空行分隔的结构化头部，便于集合结果做首尾保留。"""
+        if "" not in lines:
+            return [], lines
+
+        separator_index = lines.index("")
+        header_lines = lines[:separator_index + 1]
+        body_lines = lines[separator_index + 1:]
+        return header_lines, body_lines
+
+    def _extract_error_lines(self, lines: list[str], *, max_keep: int) -> list[str]:
+        """从命令输出里挑出显眼的错误/告警行，帮助模型快速定位失败原因。"""
+        error_pattern = re.compile(r"(?i)(error|fail|exception|traceback|warning)")
+        error_lines: list[str] = []
+        for line in lines:
+            if error_pattern.search(line):
+                error_lines.append(line)
+            if len(error_lines) >= max_keep:
+                break
+        return error_lines
 
     def _normalize_result(self, tool_name: str, result: ToolResult) -> ToolResult:
-        """统一返回结构：空输出兜底 + 超大输出摘要 + meta 填充。"""
-        # 保证 output 永远是字符串
+        """统一返回结构，并在必要时做按工具类型的 smart truncate。"""
         output = self._normalize_output(result.output)
+        raw_output = output
+        summarized_output = self._smart_truncate_output(output, tool_name)
+        truncated = summarized_output != raw_output
+        total_lines = len(raw_output.splitlines())
 
-        # 超大输出做摘要
-        summarized_output, truncated, total_lines = self._summarize_output(output)
-
-        # 统一错误字段（失败但没填 error 时自动补）
         error = result.error
         if not result.ok and not error:
             error = f"工具 {tool_name} 执行失败"
 
-        # 合并 meta，不覆盖已有键
         meta = dict(result.meta)
         meta.setdefault("tool_name", tool_name)
-        meta.setdefault("truncated", truncated)
-        meta.setdefault("total_lines", total_lines)
-        meta.setdefault("max_output_lines", self._max_output_lines)
+        meta["truncated"] = truncated
+        meta["total_lines"] = total_lines
+        meta["max_output_lines"] = self._max_output_lines
+        meta["output_limit_chars"] = _TOOL_OUTPUT_LIMITS.get(tool_name, _DEFAULT_MAX_OUTPUT)
+        meta["raw_output_chars"] = len(raw_output)
+        if truncated:
+            # 保留完整原文，供后续 context compactor 落盘或调试使用。
+            meta["raw_output"] = raw_output
 
-        # 返回标准化后的 ToolResult
         return ToolResult(
             ok=result.ok,
             output=summarized_output,
             error=error,
             meta=meta,
         )
-    
-    def execute_tool(self,tool_name:str,input_data:Any,context:ToolContext)->ToolResult:
+
+    def execute_tool(self, tool_name: str, input_data: Any, context: ToolContext) -> ToolResult:
         """
-        统一执行一个工具。
+        统一执行工具。
 
-        执行流程：
-        1. 先根据名称找到工具
-        2. 调用 validator 校验输入
-        3. 调用 run 执行工具
-        4. 返回 ToolResult
-
-        如果发生问题：
-        - 工具不存在：返回失败结果
-        - 输入校验失败：返回失败结果
-        - 工具执行异常：返回失败结果
+        流程：
+        1. 找到工具
+        2. 校验输入
+        3. 执行工具
+        4. 统一做输出治理
         """
-
-        tool=self.find_tool(tool_name)
+        tool = self.find_tool(tool_name)
         if not tool:
             return self._normalize_result(
                 tool_name,
                 ToolResult(
-                ok=False,
-                output=f"不存在名称为 {tool_name} 的工具",
-                error="TOOL_NOT_FOUND",
-                meta={"tool_name": tool_name},
+                    ok=False,
+                    output=f"不存在名称为 {tool_name} 的工具",
+                    error="TOOL_NOT_FOUND",
+                    meta={"tool_name": tool_name},
                 ),
             )
+
         try:
-            # 先做输入校验与规范化
             parsed_input = tool.validator(input_data)
         except (ValueError, TypeError, KeyError) as error:
-            # 输入不合法：返回失败结果，不抛异常
             return self._normalize_result(
                 tool_name,
                 ToolResult(
@@ -157,10 +260,8 @@ class ToolRegistry:
             )
 
         try:
-            # 调用工具核心逻辑
             raw_result = tool.runner(parsed_input, context)
         except Exception as error:
-            # 工具运行异常：兜底返回，避免主循环崩溃
             return self._normalize_result(
                 tool_name,
                 ToolResult(
@@ -171,7 +272,6 @@ class ToolRegistry:
                 ),
             )
 
-        # runner 若返回 None（防御式兜底）
         if raw_result is None:
             raw_result = ToolResult(
                 ok=False,
@@ -180,7 +280,6 @@ class ToolRegistry:
                 meta={"tool_name": tool_name},
             )
 
-        # runner 返回类型不正确时兜底，避免后续访问属性报错
         if not isinstance(raw_result, ToolResult):
             raw_result = ToolResult(
                 ok=False,
@@ -189,13 +288,4 @@ class ToolRegistry:
                 meta={"tool_name": tool_name},
             )
 
-        # 最后统一标准化结果结构
         return self._normalize_result(tool_name, raw_result)
-
-    
-    
-
-
-
-
-

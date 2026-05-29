@@ -1,3 +1,4 @@
+from __future__ import annotations
 
 from typing import Any
 
@@ -5,55 +6,56 @@ from app.permissions import PermissionManager
 from app.tooling import ToolDefinition
 from app.types import ToolContext, ToolResult
 
+# 搜索类工具不一定要做 offset/limit 分页，
+# 但必须把“总命中数”和“当前返回多少条”明确告诉模型。
+DEFAULT_MAX_MATCHES = 200
+MAX_MAX_MATCHES = 1_000
 
-def _validate(input_data: Any) -> dict[str, str]:
-    """
-    校验 grep_files 的输入。
-    第一版要求必须有 pattern，path 可以省略，默认当前目录。
-    """
-    # 输入必须是字典，后面才能安全取出 pattern 和 path 字段
+
+def _validate(input_data: Any) -> dict[str, int | str]:
+    """校验 grep_files 输入，并支持 max_matches 控制返回条数。"""
     if not isinstance(input_data, dict):
         raise ValueError("grep_files 输入必须是一个字典，包含 pattern 和 path 字段。")
 
-    # pattern 是必须的，用来表示要搜索的文本
     pattern = input_data.get("pattern")
     if not isinstance(pattern, str) or not pattern.strip():
         raise ValueError("pattern 必须是非空字符串")
 
-    # path 是可选的，默认值是当前目录 "."
     path = input_data.get("path", ".")
     if not isinstance(path, str):
         raise ValueError("path 必须是字符串")
 
-    # 返回规范化后的输入
+    raw_max_matches = input_data.get("max_matches", DEFAULT_MAX_MATCHES)
+    try:
+        max_matches = int(raw_max_matches)
+    except (TypeError, ValueError) as error:
+        raise ValueError("max_matches 必须是整数") from error
+
+    if max_matches < 1 or max_matches > MAX_MAX_MATCHES:
+        raise ValueError(f"max_matches 必须在 1 到 {MAX_MAX_MATCHES} 之间")
+
     return {
         "pattern": pattern.strip(),
         "path": path.strip(),
+        "max_matches": max_matches,
     }
 
 
-def _run(validated_input: dict[str, str], context: ToolContext) -> ToolResult:
-    """
-    在指定目录下递归搜索文本内容。
-    """
-    # 创建权限管理器，限制工具只能在工作目录内访问文件
+def _run(validated_input: dict[str, int | str], context: ToolContext) -> ToolResult:
+    """在目录内递归搜索文本，并返回显式的截断说明。"""
     permission_manager = PermissionManager(context.cwd)
 
-    # 取出搜索关键字和目标目录
-    pattern = validated_input["pattern"]
-    raw_path = validated_input["path"]
-
-    # 检查路径是否合法，并解析成绝对路径
+    pattern = str(validated_input["pattern"])
+    raw_path = str(validated_input["path"])
+    max_matches = int(validated_input["max_matches"])
     target_path = permission_manager.ensure_path_access(raw_path)
 
-    # 路径不存在时，直接返回失败结果
     if not target_path.exists():
         return ToolResult(
             ok=False,
             output=f"路径不存在：{raw_path}",
         )
 
-    # 第一版只允许搜索目录，不处理单文件搜索
     if not target_path.is_dir():
         return ToolResult(
             ok=False,
@@ -61,45 +63,76 @@ def _run(validated_input: dict[str, str], context: ToolContext) -> ToolResult:
         )
 
     matches: list[str] = []
+    total_matches = 0
+    truncated = False
 
-    # 递归搜索目录下的所有文件
     for file_path in target_path.rglob("*"):
-        # 跳过目录，只处理文件
         if not file_path.is_file():
             continue
 
-        # 读取文件内容，第一版先固定使用 utf-8 编码
         try:
             content = file_path.read_text(encoding="utf-8")
         except Exception:
-            # 读取文件失败时，先跳过该文件，避免中断整个搜索
+            # 保持现有宽松行为：读不了的文件直接跳过，避免一次搜索整体失败。
             continue
 
-        # 按行遍历，查找包含搜索关键字的行
+        relative_path = file_path.relative_to(target_path)
         for line_num, line in enumerate(content.splitlines(), start=1):
-            if pattern in line:
-                # 找到匹配时，记录相对路径、行号和行内容
-                relative_path = file_path.relative_to(target_path)
-                matches.append(f"{relative_path}:{line_num}: {line}")
+            if pattern not in line:
+                continue
 
-    # 如果没有找到任何匹配行，返回一个明确提示
-    if not matches:
+            total_matches += 1
+            if len(matches) < max_matches:
+                matches.append(f"{relative_path}:{line_num}: {line}")
+            else:
+                truncated = True
+
+    if total_matches == 0:
         return ToolResult(
             ok=True,
-            output="没有找到匹配的内容",
+            output=(
+                f"PATTERN: {pattern}\n"
+                f"ROOT: {raw_path}\n"
+                "TOTAL_MATCHES: 0\n"
+                "RETURNED_MATCHES: 0\n"
+                "TRUNCATED: no\n\n"
+                "没有找到匹配的内容。"
+            ),
+            meta={
+                "pattern": pattern,
+                "search_root": raw_path,
+                "total_matches": 0,
+                "returned_matches": 0,
+                "truncated": False,
+            },
         )
 
-    # 第一版先限制返回前 200 条，避免输出过长
+    header_lines = [
+        f"PATTERN: {pattern}",
+        f"ROOT: {raw_path}",
+        f"TOTAL_MATCHES: {total_matches}",
+        f"RETURNED_MATCHES: {len(matches)}",
+        f"TRUNCATED: {'yes' if truncated else 'no'}",
+        "",
+    ]
+    output = "\n".join(header_lines + matches)
+
     return ToolResult(
         ok=True,
-        output="\n".join(matches[:200]),
+        output=output,
+        meta={
+            "pattern": pattern,
+            "search_root": raw_path,
+            "total_matches": total_matches,
+            "returned_matches": len(matches),
+            "truncated": truncated,
+        },
     )
 
 
-# 把 grep_files 工具注册成统一定义
 grep_files_tool = ToolDefinition(
     name="grep_files",
-    description="在指定目录中搜索包含目标文本的文件内容",
+    description="在指定目录中搜索包含目标文本的文件内容，并显式返回命中统计。",
     validator=_validate,
     runner=_run,
     input_schema={
@@ -107,13 +140,17 @@ grep_files_tool = ToolDefinition(
         "properties": {
             "pattern": {
                 "type": "string",
-                "description": "要搜索的文本内容，必填",
+                "description": "要搜索的文本内容，必填。",
             },
             "path": {
                 "type": "string",
-                "description": "要搜索的目录路径，选填，默认为当前目录",
+                "description": "要搜索的目录路径，选填，默认为当前目录。",
+            },
+            "max_matches": {
+                "type": "integer",
+                "description": f"最多返回多少条匹配，默认 {DEFAULT_MAX_MATCHES}，最大 {MAX_MAX_MATCHES}。",
             },
         },
         "required": ["pattern"],
-    }
+    },
 )

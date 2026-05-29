@@ -24,6 +24,7 @@ class ChatMessage(TypedDict,total=False):
     tool_name: str # 这次工具调用的工具名称。
     input: Any # 工具调用时的输入参数。
     is_error: bool # 表示这条消息是不是错误结果。
+    meta: dict[str, Any] # 附加元信息，例如工具原始输出、截断标记等。
 
 class ToolCall(TypedDict):
     """

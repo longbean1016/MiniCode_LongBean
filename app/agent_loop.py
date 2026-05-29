@@ -2,13 +2,15 @@
 
 import time
 
-from app.compaction_policy import build_compaction_policy
-from app.history_window import build_older_history_summary, select_history_window
+from app.context_reactive_compact import (
+    is_context_overflow_error,
+    recover_from_context_overflow,
+)
+from app.context_runtime import prepare_agent_context
 from app.history_summarizer import OlderHistorySummarizer
 from app.logger import log_event
 from app.memory_pipeline import MemoryPipeline
 from app.message_builder import MessageBuilder
-from app.prompt import build_system_prompt
 from app.session import SessionData
 from app.tooling import ToolRegistry
 from app.types import AgentStep, ApprovalRequest, ChatMessage, ModelAdapter, ToolContext, ToolResult
@@ -123,74 +125,42 @@ def _run_agent_loop(
         # 不会整段原样发给模型。
         full_history = list(builder.build())
 
-        # 按 user 消息把完整历史切成多轮，只保留最近几轮完整消息。
-        # 更老的历史转交给摘要层，避免上下文无限增长。
-        compaction_policy = build_compaction_policy(session)
-
-        history_window = select_history_window(
-            history=full_history,
-            keep_rounds=compaction_policy.keep_rounds,
+        # 把上下文准备工作委托给专门模块，避免主循环里塞入过多策略细节。
+        prepared_context = prepare_agent_context(
+            full_history=full_history,
+            session=session,
+            tool_registry=tool_registry,
+            working_memory=working_memory,
+            memory_pipeline=memory_pipeline,
+            history_summarizer=history_summarizer,
         )
 
-        # 旧历史只保留主线摘要，不再原样透传。
-        # 旧历史摘要优先走模型版摘要器。
-        # 如果外面没有传摘要器，就自动退回现有的规则摘要。
-        if history_summarizer is not None:
-            older_history_summary = history_summarizer.summarize(
-                session=session,
-                older_messages=history_window.older_messages,
-                older_round_count=history_window.older_round_count,
-            )
-        else:
-            older_history_summary = build_older_history_summary(
-                history_window.older_messages,
-            )
-
-        # 记录本轮上下文裁剪结果，方便观察最近窗口策略是否生效。
+        # 记录本轮上下文裁剪结果和 token 占用情况，便于观察策略是否生效。
         log_event(
             f"[session={session_id or '-'}] 第 {step_index + 1} 轮上下文窗口: "
-            f"level={compaction_policy.level} keep_rounds={compaction_policy.keep_rounds} older={len(history_window.older_messages)} recent={len(history_window.recent_messages)}"
+            f"level={prepared_context.policy.level} keep_rounds={prepared_context.policy.keep_rounds} "
+            f"older={len(prepared_context.history_window.older_messages)} recent={len(prepared_context.history_window.recent_messages)} "
+            f"tool_truncated={prepared_context.compaction_result.truncated_tool_results} "
+            f"tool_cleared={prepared_context.compaction_result.cleared_old_tool_results}"
+        )
+        log_event(
+            f"[session={session_id or '-'}] 第 {step_index + 1} 轮压缩前预估: "
+            f"preview_total={prepared_context.preview_stats.total_tokens} "
+            f"preview_usage={prepared_context.preview_stats.usage_ratio:.1%} "
+            f"preview_budget={prepared_context.preview_stats.usable_budget} "
+            f"preview_recent={prepared_context.preview_stats.recent_tokens} "
+            f"preview_memory={prepared_context.preview_stats.memory_tokens} "
+            f"preview_tool_results={prepared_context.preview_stats.tool_result_tokens}"
+        )
+        log_event(
+            f"[session={session_id or '-'}] 第 {step_index + 1} 轮 token统计: "
+            f"total={prepared_context.stats.total_tokens} usage={prepared_context.stats.usage_ratio:.1%} "
+            f"budget={prepared_context.stats.usable_budget} system={prepared_context.stats.system_tokens} "
+            f"recent={prepared_context.stats.recent_tokens} memory={prepared_context.stats.memory_tokens} "
+            f"tool_results={prepared_context.stats.tool_result_tokens}"
         )
 
-        # 用最近几轮原始消息构造临时会话快照。
-        # 这样 session_snapshot 更接近本轮真正要发给模型的原始消息窗口。
-        session_snapshot = SessionData(
-            session_id=session.session_id,
-            created_at=session.created_at,
-            updated_at=session.updated_at,
-            workspace=session.workspace,
-            messages=list(history_window.recent_messages),
-            extra=dict(session.extra),
-        )
-
-        # 把“会话摘要 + 短期工作记忆 + 长期记忆检索结果”拼成一段辅助上下文。
-        # 这段内容会被注入 system prompt，而不是直接改写原始 history 结构。
-        memory_context = ""
-        if memory_pipeline is not None:
-            memory_context_result = memory_pipeline.build_prompt_context(
-                user_input=working_memory.get_primary_user_intent(),
-                session=session_snapshot,
-                working_memory=working_memory,
-                session_summary_override=older_history_summary,
-            )
-            memory_context = memory_context_result.prompt_context
-
-        # 每一轮都按最新记忆上下文重新构造系统提示词，
-        # 这样模型能看到刚刚更新过的 summary / working memory / 长期记忆。
-        system_prompt = build_system_prompt(
-            tool_registry=tool_registry,
-            memory_context=memory_context,
-        )
-
-        # 每一轮都只发送最近几轮完整消息。
-        # 更老的历史已经进入 older_history_summary，不再重复占上下文窗口。
-        messages: list[ChatMessage] = [
-            {
-                "role": "system",
-                "content": system_prompt,
-            }
-        ]
-        messages.extend(history_window.recent_messages)
+        messages = prepared_context.messages
 
         try:
             # 记录即将请求模型
@@ -206,6 +176,57 @@ def _run_agent_loop(
                 f"[session={session_id or '-'}] 第 {step_index + 1} 轮模型返回类型: {step.type}"
             )
         except Exception as error:
+            if is_context_overflow_error(error):
+                recovery_result = recover_from_context_overflow(
+                    messages=messages,
+                    usable_budget=prepared_context.stats.usable_budget,
+                )
+                if recovery_result.recovered:
+                    log_event(
+                        f"[session={session_id or '-'}] 第 {step_index + 1} 轮触发 Reactive Compact Recover: "
+                        f"strategy={recovery_result.strategy} "
+                        f"before={recovery_result.tokens_before} after={recovery_result.tokens_after}"
+                    )
+                    try:
+                        step = model.next(messages=recovery_result.messages)
+                        log_event(
+                            f"[session={session_id or '-'}] 第 {step_index + 1} 轮恢复后模型返回类型: {step.type}"
+                        )
+                    except Exception as retry_error:
+                        error = retry_error
+                    else:
+                        if step.type == "assistant":
+                            builder.add_assistant(step.content)
+
+                            if memory_pipeline is not None:
+                                memory_pipeline.record_assistant_reply(
+                                    working_memory,
+                                    content=step.content,
+                                )
+                            else:
+                                decision = extract_decision_from_assistant(step.content)
+                                if decision:
+                                    working_memory.protect(
+                                        decision,
+                                        entry_type="key_decision",
+                                        ttl_seconds=3600,
+                                        importance=0.95,
+                                    )
+                                    working_memory.protect(
+                                        decision,
+                                        entry_type="reflection_decision",
+                                        ttl_seconds=3600,
+                                        importance=0.95,
+                                    )
+
+                            step_cost = time.perf_counter() - step_started_at
+                            total_cost = time.perf_counter() - loop_started_at
+                            log_event(
+                                f"[session={session_id or '-'}] 第 {step_index + 1} 轮恢复后直接返回答案 "
+                                f"step耗时={step_cost:.3f}s 总耗时={total_cost:.3f}s"
+                            )
+                            return step, builder.build()
+
             # 模型调用异常时兜底为最终回答，避免主循环直接崩掉
             log_event(
                 f"[session={session_id or '-'}] 第 {step_index + 1} 轮模型调用异常: {error}"
@@ -390,6 +411,7 @@ def _run_agent_loop(
                         tool_name=tool_name,
                         content="该操作需要用户授权，当前尚未执行。",
                         is_error=True,
+                        meta=dict(result.meta),
                     )
 
                     approval_message = (
@@ -418,6 +440,7 @@ def _run_agent_loop(
                     tool_name=tool_name,
                     content=result.output,
                     is_error=not result.ok,
+                    meta=dict(result.meta),
                 )
 
             # 记录当前工具阶段结束
