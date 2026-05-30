@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from dataclasses import dataclass
 from unittest.mock import patch
 
 from app.agent_loop import run_agent_once
@@ -63,6 +64,53 @@ class ContextManagerTests(unittest.TestCase):
         self.assertEqual(policy.keep_rounds, 3)
         self.assertEqual(policy.memory_top_k, 1)
         self.assertLessEqual(policy.memory_item_chars, 80)
+
+    def test_user_profile_loader_parses_user_md_into_resolved_preferences(self) -> None:
+        from app.user_profile import load_user_profile
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            user_md_path = f"{tmpdir}\\USER.md"
+            with open(user_md_path, "w", encoding="utf-8") as handle:
+                handle.write(
+                    "# User Profile\n\n"
+                    "## Preferences\n"
+                    "- **Language**: zh-CN\n"
+                    "- **Verbosity**: concise\n"
+                    "- **Response Style**: technical\n\n"
+                    "## Coding Style\n"
+                    "- **Comments**: 中文注释\n\n"
+                    "## Custom Instructions\n"
+                    "尽量最小改动。\n"
+                )
+
+            profile = load_user_profile(tmpdir)
+
+            self.assertIsNotNone(profile)
+            assert profile is not None
+            self.assertIn("默认使用中文回答", profile.to_preference_lines())
+            self.assertIn("回答尽量简洁", profile.to_preference_lines())
+            self.assertIn("修改代码时加中文注释", profile.to_preference_lines())
+            self.assertIn("尽量最小改动", profile.to_preference_lines())
+
+    def test_user_profile_loader_accepts_loose_manual_text_in_user_md(self) -> None:
+        from app.user_profile import load_user_profile
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            user_md_path = f"{tmpdir}\\USER.md"
+            with open(user_md_path, "w", encoding="utf-8") as handle:
+                handle.write(
+                    "# User Profile\n\n"
+                    "这里是我手动写的一些偏好。\n"
+                    "回答尽量直接。\n"
+                    "修改代码时加中文注释。\n"
+                )
+
+            profile = load_user_profile(tmpdir)
+
+            self.assertIsNotNone(profile)
+            assert profile is not None
+            self.assertIn("回答尽量直接", profile.to_preference_lines())
+            self.assertIn("修改代码时加中文注释", profile.to_preference_lines())
 
 
 class ContextCompactorTests(unittest.TestCase):
@@ -263,6 +311,47 @@ class _RecordingMemoryPipeline:
         return None
 
 
+class _NoopExtractor:
+    def extract_from_task(self, **_: object) -> list[object]:
+        return []
+
+
+@dataclass
+class _NoopVerifierDecision:
+    action: str = "store"
+    matched_memory_id: str = ""
+
+
+class _NoopVerifier:
+    def find_similar_entries(self, candidate: object, existing_entries: list[object]) -> list[object]:
+        return []
+
+    def verify(self, candidate: object, similar_entries: list[object]) -> _NoopVerifierDecision:
+        return _NoopVerifierDecision()
+
+
+class _NoopCurator:
+    def curate_new_entries(self, new_entries: list[object]) -> None:
+        return None
+
+    def should_run_full_scan(self) -> bool:
+        return False
+
+    def curate_project_memories(self) -> None:
+        return None
+
+
+class _NoopDecay:
+    def refresh_new_entries(self, new_entries: list[object]) -> object:
+        return object()
+
+    def should_run_full_refresh(self) -> bool:
+        return False
+
+    def refresh_project_memories(self) -> object:
+        return object()
+
+
 class AgentLoopContextPolicyTests(unittest.TestCase):
     def test_agent_loop_logs_preview_token_stats_before_final_stats(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -343,6 +432,15 @@ class AgentLoopContextPolicyTests(unittest.TestCase):
         from app.context_state import load_context_state
 
         with tempfile.TemporaryDirectory() as tmpdir:
+            with open(f"{tmpdir}\\USER.md", "w", encoding="utf-8") as handle:
+                handle.write(
+                    "# User Profile\n\n"
+                    "## Preferences\n"
+                    "- **Language**: zh-CN\n\n"
+                    "## Coding Style\n"
+                    "- **Comments**: 中文注释\n"
+                )
+
             tool_registry = _FakeToolRegistry()
             memory_pipeline = _RecordingMemoryPipeline()
             session = create_new_session(tmpdir)
@@ -370,6 +468,125 @@ class AgentLoopContextPolicyTests(unittest.TestCase):
             self.assertEqual(state.compaction_level, prepared.policy.level)
             self.assertTrue(state.compacted_messages)
             self.assertIn("preview_total", state.last_token_stats)
+            self.assertTrue(state.compact_memory_context.strip())
+            self.assertIn("默认使用中文回答", state.resolved_user_preferences)
+
+    def test_prepare_agent_context_resolves_project_constraints_from_project_memory(self) -> None:
+        from app.context_runtime import prepare_agent_context
+        from app.context_state import load_context_state
+        from app.memory_read_pipeline import MemoryReadPipeline
+        from app.memory_store import JsonMemoryStore, create_memory_entry
+        from app.memory_write_pipeline import MemoryWritePipeline
+        from app.memory_pipeline import MemoryPipeline
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with open(f"{tmpdir}\\USER.md", "w", encoding="utf-8") as handle:
+                handle.write(
+                    "# User Profile\n\n"
+                    "## Preferences\n"
+                    "- **Language**: zh-CN\n"
+                )
+
+            memory_store = JsonMemoryStore(tmpdir)
+            memory_store.add_memory(
+                create_memory_entry(
+                    content="不要把太多上下文管理逻辑放进 main.py 和 agent_loop.py",
+                    category="constraint",
+                    tags=["constraint", "context_management"],
+                    scope="project",
+                    confidence=0.95,
+                    source="task_reflection",
+                )
+            )
+            memory_store.add_memory(
+                create_memory_entry(
+                    content="token 只按中文和英文估算",
+                    category="convention",
+                    tags=["constraint", "token_budget"],
+                    scope="project",
+                    confidence=0.93,
+                    source="task_reflection",
+                )
+            )
+
+            memory_pipeline = MemoryPipeline(
+                read_pipeline=MemoryReadPipeline(memory_store),
+                write_pipeline=MemoryWritePipeline(
+                    memory_store=memory_store,
+                    memory_extractor=_NoopExtractor(),
+                    memory_verifier=_NoopVerifier(),
+                    memory_curator=_NoopCurator(),
+                    memory_decay=_NoopDecay(),
+                ),
+            )
+            tool_registry = _FakeToolRegistry()
+            session = create_new_session(tmpdir)
+            working_memory = WorkingMemory()
+            working_memory.protect("整理上下文约束", entry_type="user_intent")
+
+            prepared = prepare_agent_context(
+                full_history=[{"role": "user", "content": "继续整理上下文压缩逻辑"}],
+                session=session,
+                tool_registry=tool_registry,
+                working_memory=working_memory,
+                memory_pipeline=memory_pipeline,
+                history_summarizer=None,
+            )
+
+            state = load_context_state(tmpdir, session.session_id)
+            self.assertIsNotNone(state)
+            assert state is not None
+            self.assertTrue(state.resolved_project_constraints)
+            self.assertIn("默认使用中文回答", state.resolved_user_preferences)
+            self.assertTrue(
+                any("main.py" in item or "token" in item for item in state.resolved_project_constraints)
+            )
+            self.assertIn("项目约束", prepared.compact_memory_context)
+
+    def test_build_compact_memory_context_merges_summary_and_working_memory(self) -> None:
+        from app.context_compact_memory import build_compact_memory_context
+
+        working_memory = WorkingMemory()
+        working_memory.protect("用户偏好：回答时优先用中文", entry_type="user_preference")
+        working_memory.protect("项目约束：尽量不要改动 main.py", entry_type="project_constraint")
+        working_memory.protect("最近风险：上下文过长时需要优先压缩工具结果", entry_type="error_context")
+
+        compact_memory_context = build_compact_memory_context(
+            older_history_summary="旧对话摘要：最近主要在整理上下文压缩链路。",
+            working_memory=working_memory,
+        )
+
+        self.assertIn("压缩记忆基线", compact_memory_context)
+        self.assertIn("旧对话摘要", compact_memory_context)
+        self.assertIn("用户偏好", compact_memory_context)
+        self.assertIn("项目约束", compact_memory_context)
+        self.assertIn("最近风险", compact_memory_context)
+
+    def test_build_compact_memory_context_prioritizes_preferences_constraints_and_risks(self) -> None:
+        from app.context_compact_memory import build_compact_memory_context
+
+        working_memory = WorkingMemory()
+        working_memory.protect("默认使用中文回答，并尽量把结论放在前面。", entry_type="user_preference", importance=1.0)
+        working_memory.protect("不要把太多上下文管理逻辑放进 main.py。", entry_type="project_constraint", importance=1.0)
+        working_memory.protect("最近风险：大 tool_result 可能堆积并挤占 recent window。", entry_type="recent_risk", importance=1.0)
+
+        for index in range(8):
+            working_memory.protect(
+                f"普通活跃任务 {index}: 继续整理上下文链路的辅助细节。",
+                entry_type="active_task",
+                importance=0.4,
+            )
+
+        compact_memory_context = build_compact_memory_context(
+            older_history_summary="旧对话摘要：" + ("这里是一些较长但优先级更低的上下文。 " * 20),
+            working_memory=working_memory,
+        )
+
+        self.assertIn("用户偏好", compact_memory_context)
+        self.assertIn("项目约束", compact_memory_context)
+        self.assertIn("最近风险", compact_memory_context)
+        self.assertIn("main.py", compact_memory_context)
+        self.assertIn("tool_result", compact_memory_context)
 
     def test_prepare_agent_context_records_auto_compact_history_when_pressure_remains_high(self) -> None:
         from app.context_runtime import prepare_agent_context
@@ -415,6 +632,85 @@ class AgentLoopContextPolicyTests(unittest.TestCase):
                     for message in state.compacted_messages
                 )
             )
+
+    def test_run_auto_compact_uses_compact_memory_context_in_summary_base(self) -> None:
+        from app.context_auto_compact import run_auto_compact
+
+        messages = [
+            {"role": "user", "content": "第0条消息：当前要验证 session memory compact 优先使用压缩记忆基线。" * 8},
+            {"role": "assistant", "content": "第1条消息：当前要验证 session memory compact 优先使用压缩记忆基线。" * 8},
+            {"role": "user", "content": "第2条消息：当前要验证 session memory compact 优先使用压缩记忆基线。" * 8},
+            {"role": "assistant", "content": "第3条消息：当前要验证 session memory compact 优先使用压缩记忆基线。" * 8},
+            {"role": "user", "content": "第4条消息：当前要验证 session memory compact 优先使用压缩记忆基线。" * 8},
+        ]
+
+        result = run_auto_compact(
+            messages=messages,
+            usable_budget=500,
+            summary_base="MEMORY_BASELINE_TOKEN\n1. 当前目标是复用上一次压缩基线，而不是重新拼 older_history_summary。",
+            fixed_overhead_tokens=0,
+        )
+
+        self.assertTrue(result.applied)
+        self.assertTrue(result.messages)
+        self.assertEqual(result.messages[0]["role"], "system")
+        self.assertIn("MEMORY_BASELINE_TOKEN", str(result.messages[0]["content"]))
+
+    def test_prepare_agent_context_restores_compact_memory_context_from_cached_state(self) -> None:
+        from app.context_runtime import prepare_agent_context
+        from app.context_state import ContextStateData, build_history_fingerprint, load_context_state, save_context_state
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tool_registry = _FakeToolRegistry()
+            session = create_new_session(tmpdir)
+            session.extra["usable_context_budget"] = 700
+            working_memory = WorkingMemory()
+            working_memory.protect("继续处理上下文压缩恢复", entry_type="user_intent")
+
+            cached_compact_memory_context = (
+                "压缩记忆基线\n"
+                "## 稳定事实\n"
+                "1. 当前目标是复用上一次压缩基线，而不是重新拼 older_history_summary。"
+            )
+            save_context_state(
+                tmpdir,
+                ContextStateData(
+                    session_id=session.session_id,
+                    source_message_count=0,
+                    source_history_fingerprint=build_history_fingerprint([]),
+                    compacted_messages=[],
+                    older_history_summary="旧摘要：这段文字不应该优先进入会话压缩摘要。",
+                    compact_memory_context=cached_compact_memory_context,
+                ),
+            )
+
+            full_history = [
+                {"role": "user", "content": "先整理旧对话摘要和压缩状态的关系，确认恢复阶段不能直接复制整段 older_history_summary。" * 10},
+                {"role": "assistant", "content": "需要把压缩用基线和普通记忆注入拆开，否则摘要会重复膨胀。" * 9},
+                {"role": "user", "content": "再检查命中 context_state 之后，为什么 session memory compact 应该优先复用已有压缩基线。" * 10},
+                {"role": "assistant", "content": "因为这份基线已经是上次压缩阶段沉淀过的信息，比重新拼接更稳定。" * 9},
+                {"role": "user", "content": "同时还要保证最近几轮完整消息继续保留，不然模型会丢掉紧邻当前问题的上下文。" * 10},
+                {"role": "assistant", "content": "所以 session compact 只应该折叠较早消息，把尾部 recent window 继续保留下来。" * 9},
+                {"role": "user", "content": "如果恢复后又遇到高压，就继续用 compact_memory_context 作为摘要基线，而不是回退到旧摘要。" * 10},
+                {"role": "assistant", "content": "最后还要确认新的 context_state 会继续保存这份基线，供下一轮同 session 复用。" * 9},
+            ]
+
+            prepared = prepare_agent_context(
+                full_history=full_history,
+                session=session,
+                tool_registry=tool_registry,
+                working_memory=working_memory,
+                memory_pipeline=None,
+                history_summarizer=None,
+            )
+
+            state = load_context_state(tmpdir, session.session_id)
+            self.assertIsNotNone(state)
+            assert state is not None
+            self.assertIn("复用上一次压缩基线", prepared.compact_memory_context)
+            self.assertIn("复用上一次压缩基线", state.compact_memory_context)
+            self.assertTrue(state.compacted_messages)
+            self.assertIn("preview_total", state.last_token_stats)
 
     def test_prepare_agent_context_auto_compact_handles_large_text_history(self) -> None:
         from app.context_runtime import prepare_agent_context

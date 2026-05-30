@@ -236,6 +236,7 @@ class ToolContext:
 
     cwd: str # 当前工具执行时的工作目录
     approved_actions: set[str] = field(default_factory=set)  # 当前会话内已批准的动作键
+    read_file_signatures: set[str] = field(default_factory=set)  # 当前这轮请求里已经读取过的文件区间签名
 
 
 

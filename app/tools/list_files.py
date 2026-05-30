@@ -1,4 +1,4 @@
-
+from pathlib import Path
 from typing import Any
 
 from app.permissions import PermissionManager
@@ -7,6 +7,9 @@ from app.types import ToolContext, ToolResult
 
 DEFAULT_MAX_ENTRIES = 200
 MAX_MAX_ENTRIES = 1_000
+MAX_ENTRY_LINE_CHARS = 180
+MAX_OUTPUT_CHARS = 8_000
+_BLOCKED_INTERNAL_DIRS = {".cache", "cache", ".sessions", "sessions", ".context_state", "context_state"}
 
 
 def _validate(input_data: Any) -> dict[str, int | str]:
@@ -61,6 +64,25 @@ def _run(validated_input: dict[str, int | str], context: ToolContext) -> ToolRes
     # 如果路径越界，比如跑到工作目录外面，会直接抛出 PermissionError
     target_path = permission_manager.ensure_path_access(raw_path)
     max_entries = int(validated_input["max_entries"])
+    normalized_path = _to_workspace_relative_path(target_path, context.cwd)
+
+    # 默认不允许把内部上下文目录再喂回模型，避免 agent 看到这些目录后继续空转。
+    blocked_reason = _match_blocked_internal_path(normalized_path)
+    if blocked_reason is not None:
+        return ToolResult(
+            ok=False,
+            output=(
+                f"默认不允许列出内部上下文目录：{raw_path}\n"
+                f"原因：{blocked_reason}\n"
+                "请优先查看正常源码、配置或业务目录。"
+            ),
+            error="LIST_POLICY_BLOCKED",
+            meta={
+                "path": str(raw_path),
+                "normalized_path": normalized_path,
+                "blocked_reason": blocked_reason,
+            },
+        )
 
     # 第四步：检查路径是否存在
     if not target_path.exists():
@@ -116,17 +138,38 @@ def _run(validated_input: dict[str, int | str], context: ToolContext) -> ToolRes
     # 第八步：把每个子项转换成文本行
     # 目录前面标记 dir，文件前面标记 file
     lines: list[str] = []
-    for entry in entries:
-        prefix = "dir " if entry.is_dir() else "file"
-        lines.append(f"{prefix} {entry.name}")
+    omitted_internal_entries = 0
+    output_budget_hit = False
 
-    returned_lines = lines[:max_entries]
-    truncated = len(lines) > max_entries
+    for entry in entries:
+        # 目录工具默认把内部上下文目录藏起来，减少模型继续钻进 .cache/.sessions 这类路径。
+        if _is_internal_context_name(entry.name):
+            omitted_internal_entries += 1
+            continue
+
+        prefix = "dir " if entry.is_dir() else "file"
+        line = _clip_entry_line(f"{prefix} {entry.name}")
+        lines.append(line)
+
+    returned_lines: list[str] = []
+    current_chars = 0
+    for line in lines[:max_entries]:
+        projected_chars = current_chars + len(line) + 1
+        # 在工具层先做总字符预算，避免大量长文件名直接把上下文撑肥。
+        if projected_chars > MAX_OUTPUT_CHARS and returned_lines:
+            output_budget_hit = True
+            break
+        returned_lines.append(line)
+        current_chars = projected_chars
+
+    truncated = len(lines) > len(returned_lines)
     header_lines = [
         f"ROOT: {raw_path}",
         f"TOTAL_ENTRIES: {len(lines)}",
         f"RETURNED_ENTRIES: {len(returned_lines)}",
         f"TRUNCATED: {'yes' if truncated else 'no'}",
+        f"OMITTED_INTERNAL_ENTRIES: {omitted_internal_entries}",
+        f"OUTPUT_BUDGET_HIT: {'yes' if output_budget_hit else 'no'}",
         "",
     ]
 
@@ -140,8 +183,45 @@ def _run(validated_input: dict[str, int | str], context: ToolContext) -> ToolRes
             "total_entries": len(lines),
             "returned_entries": len(returned_lines),
             "truncated": truncated,
+            "omitted_internal_entries": omitted_internal_entries,
+            "output_budget_hit": output_budget_hit,
         },
     )
+
+
+def _to_workspace_relative_path(target_path: Path, cwd: str) -> str:
+    """把绝对路径转成工作区相对路径，便于做内部目录识别。"""
+    workspace_root = Path(cwd).resolve()
+    try:
+        relative_path = target_path.resolve().relative_to(workspace_root)
+    except ValueError:
+        return target_path.resolve().as_posix()
+    return relative_path.as_posix()
+
+
+def _match_blocked_internal_path(relative_path: str) -> str | None:
+    """判断当前列目录请求是否落在内部上下文目录下。"""
+    normalized = relative_path.replace("\\", "/").lstrip("./")
+    if not normalized:
+        return None
+
+    first_part = normalized.split("/", 1)[0].lower()
+    if first_part in _BLOCKED_INTERNAL_DIRS:
+        return "这是内部上下文目录，默认不作为分析入口。"
+    return None
+
+
+def _is_internal_context_name(name: str) -> bool:
+    """判断目录项名字是否属于内部上下文产物。"""
+    return name.strip().lower() in _BLOCKED_INTERNAL_DIRS
+
+
+def _clip_entry_line(text: str) -> str:
+    """裁剪过长目录项，避免单个超长文件名污染整体输出。"""
+    if len(text) <= MAX_ENTRY_LINE_CHARS:
+        return text
+    keep = max(40, MAX_ENTRY_LINE_CHARS - 24)
+    return f"{text[:keep]} ...[文件名过长已截断]"
 
 # 第十步：把上面的校验函数和执行函数组装成一个正式工具定义
 # 后面 ToolRegistry 注册的就是这个对象

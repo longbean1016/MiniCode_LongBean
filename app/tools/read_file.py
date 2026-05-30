@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import re
 from typing import Any
 
 from app.permissions import PermissionManager
@@ -11,6 +12,8 @@ from app.types import ToolContext, ToolResult
 # 避免“一次性把整份大文件塞进上下文”。
 DEFAULT_READ_LIMIT = 8_000
 MAX_READ_LIMIT = 20_000
+_BLOCKED_STATE_DIRS = {".sessions", "sessions", ".context_state", "context_state"}
+_BLOCKED_CACHE_FILE_PATTERN = re.compile(r"^(?:\.cache|cache)[\\/](?:\.?tool_result_).+", re.IGNORECASE)
 
 
 def _validate(input_data: Any) -> dict[str, int | str]:
@@ -53,6 +56,25 @@ def _run(validated_input: dict[str, int | str], context: ToolContext) -> ToolRes
 
     raw_path = str(validated_input["path"])
     target_path = permission_manager.ensure_path_access(raw_path)
+    relative_path = _to_workspace_relative_path(target_path, context.cwd)
+
+    # 先拦掉内部状态与大工具结果归档文件，避免模型把这些“调试产物”当成主分析材料反复回读。
+    blocked_reason = _match_blocked_internal_path(relative_path)
+    if blocked_reason is not None:
+        return ToolResult(
+            ok=False,
+            output=(
+                f"默认不允许读取内部上下文文件：{raw_path}\n"
+                f"原因：{blocked_reason}\n"
+                "请优先改用正常源码、配置或工具摘要继续分析。"
+            ),
+            error="READ_POLICY_BLOCKED",
+            meta={
+                "path": raw_path,
+                "normalized_path": relative_path,
+                "blocked_reason": blocked_reason,
+            },
+        )
 
     if not target_path.exists():
         return ToolResult(
@@ -72,6 +94,28 @@ def _run(validated_input: dict[str, int | str], context: ToolContext) -> ToolRes
 
     offset = int(validated_input["offset"])
     limit = int(validated_input["limit"])
+    read_signature = _build_read_signature(relative_path, offset, limit)
+
+    # 同一轮里同一路径、同一区间再次读取，通常意味着模型开始打转。
+    # 这里直接短路，逼它换工具或换区间，避免无效上下文堆积。
+    if read_signature in context.read_file_signatures:
+        return ToolResult(
+            ok=False,
+            output=(
+                f"同一轮里已经读取过相同区间：{raw_path}\n"
+                f"offset={offset}, limit={limit}\n"
+                "请改读新的 offset/limit 区间，或改用 grep_files / file_overview 等工具。"
+            ),
+            error="READ_REPEAT_BLOCKED",
+            meta={
+                "path": raw_path,
+                "normalized_path": relative_path,
+                "offset": offset,
+                "limit": limit,
+            },
+        )
+
+    context.read_file_signatures.add(read_signature)
     end = min(len(content), offset + limit)
     chunk = content[offset:end]
     truncated = end < len(content)
@@ -114,6 +158,38 @@ def _read_text_with_fallback(target_path: Path) -> str:
 
     # 最后一层兜底：忽略非法字节，至少保留可读片段。
     return raw_bytes.decode("utf-8", errors="ignore")
+
+
+def _to_workspace_relative_path(target_path: Path, cwd: str) -> str:
+    """把绝对路径稳定转成相对工作区路径，便于做策略判断和去重签名。"""
+    workspace_root = Path(cwd).resolve()
+    try:
+        relative_path = target_path.resolve().relative_to(workspace_root)
+    except ValueError:
+        return target_path.resolve().as_posix()
+    return relative_path.as_posix()
+
+
+def _match_blocked_internal_path(relative_path: str) -> str | None:
+    """识别默认不应该被 read_file 回读的内部上下文文件。"""
+    normalized = relative_path.replace("\\", "/").lstrip("./")
+    if not normalized:
+        return None
+
+    first_part = normalized.split("/", 1)[0].lower()
+    if first_part in _BLOCKED_STATE_DIRS:
+        return "这是会话状态/历史文件，默认不作为当前分析上下文直接回读。"
+
+    if _BLOCKED_CACHE_FILE_PATTERN.match(normalized):
+        return "这是大工具结果归档文件，默认不作为当前分析上下文直接回读。"
+
+    return None
+
+
+def _build_read_signature(relative_path: str, offset: int, limit: int) -> str:
+    """为同轮重复读取熔断生成稳定签名。"""
+    normalized = relative_path.replace("\\", "/")
+    return f"{normalized}::{offset}::{limit}"
 
 
 read_file_tool = ToolDefinition(

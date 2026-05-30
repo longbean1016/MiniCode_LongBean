@@ -5,6 +5,8 @@ import unittest
 from dataclasses import dataclass
 
 from app.explicit_memory import parse_manual_memory_input
+from app.memory_guard import MemoryWriteGuard
+from app.memory_reflection import ReflectionMemoryCandidate, TaskMemoryReflectionEngine
 from app.memory_decay import DecayRunResult
 from app.memory_feedback import MemoryFeedbackStore
 from app.memory_pipeline import MemoryPipeline
@@ -12,7 +14,7 @@ from app.memory_read_pipeline import MemoryReadPipeline
 from app.memory_store import JsonMemoryStore, MemoryEntry, create_memory_entry
 from app.memory_write_pipeline import MemoryWritePipeline
 from app.session import create_new_session
-from app.types import AgentStep
+from app.types import AgentStep, ToolResult
 from app.working_memory import WorkingMemory
 
 
@@ -71,6 +73,98 @@ class _FakeDecay:
 
 
 class MemoryPipelineTests(unittest.TestCase):
+    def test_memory_guard_allows_constraint_task_reflection_with_admission_evidence(self) -> None:
+        candidate = create_memory_entry(
+            content="上下文管理相关约束尽量沉到独立模块，不要把主要逻辑堆进 main.py。",
+            category="constraint",
+            tags=["constraint", "context_management"],
+            scope="project",
+            confidence=0.9,
+            source="task_reflection",
+            extra={"reflection_admission_source": "project_file_evidence"},
+        )
+
+        decision = MemoryWriteGuard().should_store(candidate)
+
+        self.assertTrue(decision.should_store)
+
+    def test_task_reflection_engine_post_filter_keeps_constraint_candidate(self) -> None:
+        engine = TaskMemoryReflectionEngine.__new__(TaskMemoryReflectionEngine)
+        candidate = ReflectionMemoryCandidate(
+            content="上下文压缩相关约束应尽量放到独立模块，不要把逻辑继续堆进 main.py。",
+            category="constraint",
+            tags=["constraint", "context_management"],
+            confidence=0.9,
+            domains=["memory", "context"],
+        )
+
+        result = TaskMemoryReflectionEngine._post_filter_candidates(engine, [candidate])
+
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0].category, "constraint")
+
+    def test_write_pipeline_extracts_user_preferences_and_project_constraints_from_user_input(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pipeline = MemoryWritePipeline(
+                memory_store=JsonMemoryStore(tmpdir),
+                memory_extractor=_FakeExtractor([]),
+                memory_verifier=_FakeVerifier(),
+                memory_curator=_FakeCurator(),
+                memory_decay=_FakeDecay(),
+            )
+            working_memory = WorkingMemory()
+
+            pipeline.remember_user_intent(
+                working_memory,
+                "默认使用中文回答，修改代码时加上中文注释，并且不要把太多上下文管理逻辑放进 main.py 和 agent_loop.py。",
+            )
+
+            preference_entries = working_memory.get_entries_by_type("user_preference")
+            constraint_entries = working_memory.get_entries_by_type("project_constraint")
+
+            self.assertTrue(preference_entries)
+            self.assertTrue(
+                any("中文" in entry.content or "注释" in entry.content for entry in preference_entries)
+            )
+            self.assertTrue(constraint_entries)
+            self.assertTrue(
+                any("main.py" in entry.content or "agent_loop.py" in entry.content for entry in constraint_entries)
+            )
+
+    def test_write_pipeline_extracts_recent_risks_from_assistant_and_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pipeline = MemoryWritePipeline(
+                memory_store=JsonMemoryStore(tmpdir),
+                memory_extractor=_FakeExtractor([]),
+                memory_verifier=_FakeVerifier(),
+                memory_curator=_FakeCurator(),
+                memory_decay=_FakeDecay(),
+            )
+            working_memory = WorkingMemory()
+
+            pipeline.record_assistant_reply(
+                working_memory,
+                content="当前风险是大 tool_result 会在 recent window 里堆积，如果上下文过长就需要优先压缩并避免信息冲刷。",
+            )
+            pipeline.record_tool_failure(
+                working_memory,
+                tool_name="run_command",
+                result=ToolResult(
+                    ok=False,
+                    output="context length exceeds limit",
+                    error="prompt too long: context length exceeds limit",
+                ),
+            )
+
+            risk_entries = working_memory.get_entries_by_type("recent_risk")
+            error_entries = working_memory.get_entries_by_type("error_context")
+
+            self.assertTrue(risk_entries)
+            self.assertTrue(
+                any("tool_result" in entry.content or "context length exceeds limit" in entry.content for entry in risk_entries)
+            )
+            self.assertTrue(error_entries)
+
     def test_parse_manual_user_memory_is_pinned_for_prompt(self) -> None:
         intent = parse_manual_memory_input("/memory add user: Prefer concise answers")
 

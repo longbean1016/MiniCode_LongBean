@@ -142,6 +142,7 @@ class WorkingMemory:
             "active_task": self.get_entries_by_type("active_task"),
             "key_decision": self.get_entries_by_type("key_decision"),
             "error_context": self.get_entries_by_type("error_context"),
+            "recent_risk": self.get_entries_by_type("recent_risk"),
         }
 
         if grouped["user_intent"]:
@@ -162,6 +163,11 @@ class WorkingMemory:
         if grouped["error_context"]:
             sections.append("错误上下文：")
             for entry in grouped["error_context"][-5:]:
+                sections.append(f"- {entry.content}")
+
+        if grouped["recent_risk"]:
+            sections.append("近期风险：")
+            for entry in grouped["recent_risk"][-5:]:
                 sections.append(f"- {entry.content}")
 
         supplemental_entries = [

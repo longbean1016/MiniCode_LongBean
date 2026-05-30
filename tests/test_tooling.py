@@ -29,6 +29,41 @@ class ToolBehaviorTests(unittest.TestCase):
             self.assertIn("TRUNCATED: yes", result.output)
             self.assertIn("file file_000.txt", result.output)
 
+    def test_list_files_omits_internal_context_entries_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            (Path(tmpdir) / ".cache").mkdir()
+            (Path(tmpdir) / ".sessions").mkdir()
+            (Path(tmpdir) / "app.py").write_text("print('x')", encoding="utf-8")
+
+            registry = build_tool_registry()
+            result = registry.execute_tool(
+                "list_files",
+                {"path": "."},
+                ToolContext(cwd=tmpdir),
+            )
+
+            self.assertTrue(result.ok)
+            self.assertIn("OMITTED_INTERNAL_ENTRIES: 2", result.output)
+            self.assertIn("file app.py", result.output)
+            self.assertNotIn(".cache", result.output)
+            self.assertNotIn(".sessions", result.output)
+
+    def test_list_files_blocks_internal_context_directories_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            internal_dir = Path(tmpdir) / ".context_state"
+            internal_dir.mkdir()
+
+            registry = build_tool_registry()
+            result = registry.execute_tool(
+                "list_files",
+                {"path": ".context_state"},
+                ToolContext(cwd=tmpdir),
+            )
+
+            self.assertFalse(result.ok)
+            self.assertEqual(result.error, "LIST_POLICY_BLOCKED")
+            self.assertIn("默认不允许列出内部上下文目录", result.output)
+
     def test_read_file_supports_offset_and_limit_chunks(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             target = Path(tmpdir) / "sample.txt"
@@ -70,6 +105,42 @@ class ToolBehaviorTests(unittest.TestCase):
             self.assertIn("TRUNCATED: yes", result.output)
             self.assertIn("sample.txt:1: match line 0", result.output)
 
+    def test_grep_files_blocks_internal_context_directories_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            internal_dir = Path(tmpdir) / ".sessions"
+            internal_dir.mkdir()
+            (internal_dir / "demo.txt").write_text("match", encoding="utf-8")
+
+            registry = build_tool_registry()
+            result = registry.execute_tool(
+                "grep_files",
+                {"path": ".sessions", "pattern": "match"},
+                ToolContext(cwd=tmpdir),
+            )
+
+            self.assertFalse(result.ok)
+            self.assertEqual(result.error, "SEARCH_POLICY_BLOCKED")
+            self.assertIn("默认不允许搜索内部上下文目录", result.output)
+
+    def test_grep_files_clips_single_match_line_and_applies_output_budget(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir) / "sample.txt"
+            long_line = "match " + ("x" * 2000)
+            target.write_text("\n".join(long_line for _ in range(80)), encoding="utf-8")
+
+            registry = build_tool_registry()
+            result = registry.execute_tool(
+                "grep_files",
+                {"path": ".", "pattern": "match", "max_matches": 80},
+                ToolContext(cwd=tmpdir),
+            )
+
+            self.assertTrue(result.ok)
+            self.assertIn("CONTENT_CLIPPED: yes", result.output)
+            self.assertIn("OUTPUT_BUDGET_HIT: yes", result.output)
+            self.assertIn("单行已截断", result.output)
+            self.assertIn("TRUNCATED: yes", result.output)
+
     def test_read_file_falls_back_for_non_utf8_text_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             target = Path(tmpdir) / "sample_gbk.txt"
@@ -86,6 +157,111 @@ class ToolBehaviorTests(unittest.TestCase):
             self.assertIn("FILE: sample_gbk.txt", result.output)
             self.assertIn("中文内容", result.output)
             self.assertIn("第二行", result.output)
+
+    def test_read_file_blocks_tool_result_cache_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache_dir = Path(tmpdir) / ".cache"
+            cache_dir.mkdir()
+            target = cache_dir / "tool_result_demo.txt"
+            target.write_text("tool output", encoding="utf-8")
+
+            registry = build_tool_registry()
+            result = registry.execute_tool(
+                "read_file",
+                {"path": ".cache/tool_result_demo.txt"},
+                ToolContext(cwd=tmpdir),
+            )
+
+            self.assertFalse(result.ok)
+            self.assertEqual(result.error, "READ_POLICY_BLOCKED")
+            self.assertIn("默认不允许读取", result.output)
+            self.assertIn(".cache/tool_result_demo.txt", result.output)
+
+    def test_read_file_blocks_session_history_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sessions_dir = Path(tmpdir) / ".sessions"
+            sessions_dir.mkdir()
+            target = sessions_dir / "demo.json"
+            target.write_text("{}", encoding="utf-8")
+
+            registry = build_tool_registry()
+            result = registry.execute_tool(
+                "read_file",
+                {"path": ".sessions/demo.json"},
+                ToolContext(cwd=tmpdir),
+            )
+
+            self.assertFalse(result.ok)
+            self.assertEqual(result.error, "READ_POLICY_BLOCKED")
+            self.assertIn("默认不允许读取", result.output)
+            self.assertIn(".sessions/demo.json", result.output)
+
+    def test_read_file_blocks_context_state_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_dir = Path(tmpdir) / ".context_state"
+            state_dir.mkdir()
+            target = state_dir / "demo.json"
+            target.write_text("{}", encoding="utf-8")
+
+            registry = build_tool_registry()
+            result = registry.execute_tool(
+                "read_file",
+                {"path": ".context_state/demo.json"},
+                ToolContext(cwd=tmpdir),
+            )
+
+            self.assertFalse(result.ok)
+            self.assertEqual(result.error, "READ_POLICY_BLOCKED")
+            self.assertIn("默认不允许读取", result.output)
+            self.assertIn(".context_state/demo.json", result.output)
+
+    def test_read_file_breaks_same_range_repeat_reads_within_same_turn(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir) / "sample.txt"
+            target.write_text("abcdefghij", encoding="utf-8")
+
+            registry = build_tool_registry()
+            context = ToolContext(cwd=tmpdir)
+
+            first = registry.execute_tool(
+                "read_file",
+                {"path": "sample.txt", "offset": 0, "limit": 4},
+                context,
+            )
+            second = registry.execute_tool(
+                "read_file",
+                {"path": "sample.txt", "offset": 0, "limit": 4},
+                context,
+            )
+
+            self.assertTrue(first.ok)
+            self.assertFalse(second.ok)
+            self.assertEqual(second.error, "READ_REPEAT_BLOCKED")
+            self.assertIn("同一轮里已经读取过相同区间", second.output)
+            self.assertIn("sample.txt", second.output)
+
+    def test_read_file_allows_different_ranges_within_same_turn(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir) / "sample.txt"
+            target.write_text("abcdefghij", encoding="utf-8")
+
+            registry = build_tool_registry()
+            context = ToolContext(cwd=tmpdir)
+
+            first = registry.execute_tool(
+                "read_file",
+                {"path": "sample.txt", "offset": 0, "limit": 4},
+                context,
+            )
+            second = registry.execute_tool(
+                "read_file",
+                {"path": "sample.txt", "offset": 4, "limit": 4},
+                context,
+            )
+
+            self.assertTrue(first.ok)
+            self.assertTrue(second.ok)
+            self.assertIn("efgh", second.output)
 
     def test_tool_registry_keeps_raw_output_when_smart_truncated(self) -> None:
         def _validate(input_data: object) -> dict[str, str]:

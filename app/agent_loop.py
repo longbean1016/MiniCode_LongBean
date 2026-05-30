@@ -32,7 +32,7 @@ def run_agent_once(
     memory_pipeline: MemoryPipeline | None,
     history_summarizer: OlderHistorySummarizer | None = None,
     history: list[ChatMessage] | None = None,
-    max_steps: int = 8,
+    max_steps: int = 20,
     session_id: str = "",
 ) -> tuple[AgentStep, list[ChatMessage]]:
     """执行一轮 agent 主循环：模型 -> 工具 -> 再模型，直到完成或达到上限。"""
@@ -69,7 +69,7 @@ def continue_agent_from_history(
     working_memory: WorkingMemory,
     memory_pipeline: MemoryPipeline | None,
     history_summarizer: OlderHistorySummarizer | None = None,
-    max_steps: int = 8,
+    max_steps: int = 20,
     session_id: str = "",
 ) -> tuple[AgentStep, list[ChatMessage]]:
     """基于已有历史继续主循环，不再追加新的 user 消息。"""

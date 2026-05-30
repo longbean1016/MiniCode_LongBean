@@ -18,7 +18,10 @@ from app.types import AgentStep, ChatMessage, ToolResult
 from app.working_memory import WorkingMemory
 from app.working_memory_updater import (
     extract_active_paths,
+    extract_project_constraints,
+    extract_recent_risks,
     extract_decision_from_assistant,
+    extract_user_preferences,
     summarize_failure,
 )
 
@@ -63,6 +66,20 @@ class MemoryWritePipeline:
             importance=1.0,
             replace_latest_of_type=True,
         )
+        for preference in extract_user_preferences(user_input):
+            working_memory.protect(
+                preference,
+                entry_type="user_preference",
+                ttl_seconds=7200,
+                importance=0.98,
+            )
+        for constraint in extract_project_constraints(user_input):
+            working_memory.protect(
+                constraint,
+                entry_type="project_constraint",
+                ttl_seconds=7200,
+                importance=0.98,
+            )
 
     def record_tool_call(
         self,
@@ -99,6 +116,13 @@ class MemoryWritePipeline:
             ttl_seconds=1800,
             importance=0.9,
         )
+        for risk in extract_recent_risks(failure_summary):
+            working_memory.protect(
+                risk,
+                entry_type="recent_risk",
+                ttl_seconds=1800,
+                importance=0.92,
+            )
         working_memory.protect(
             failure_summary,
             entry_type="reflection_failure",
@@ -112,6 +136,28 @@ class MemoryWritePipeline:
         *,
         content: str,
     ) -> None:
+        for preference in extract_user_preferences(content):
+            working_memory.protect(
+                preference,
+                entry_type="user_preference",
+                ttl_seconds=7200,
+                importance=0.9,
+            )
+        for constraint in extract_project_constraints(content):
+            working_memory.protect(
+                constraint,
+                entry_type="project_constraint",
+                ttl_seconds=5400,
+                importance=0.92,
+            )
+        for risk in extract_recent_risks(content):
+            working_memory.protect(
+                risk,
+                entry_type="recent_risk",
+                ttl_seconds=3600,
+                importance=0.93,
+            )
+
         decision = extract_decision_from_assistant(content)
         if not decision:
             return

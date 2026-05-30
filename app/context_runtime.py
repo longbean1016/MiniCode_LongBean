@@ -3,9 +3,15 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from app.compaction_policy import build_compaction_policy
+from app.context_compact_memory import build_compact_memory_context
 from app.context_auto_compact import AUTO_COMPACT_TRIGGER_RATIO
 from app.context_compactor import CompactionResult
 from app.context_compactor_pipeline import ContextCompactorPipeline, ContextPipelineResult
+from app.context_signal_resolver import (
+    resolve_project_constraints,
+    resolve_recent_risks,
+    resolve_user_preferences,
+)
 from app.context_manager import (
     DEFAULT_USABLE_CONTEXT_BUDGET,
     ContextPolicy,
@@ -39,6 +45,10 @@ class PreparedAgentContext:
     preview_stats: ContextStats
     stats: ContextStats
     older_history_summary: str
+    compact_memory_context: str
+    resolved_user_preferences: list[str]
+    resolved_project_constraints: list[str]
+    recent_risks: list[str]
     history_window: HistoryWindow
     compaction_result: CompactionResult
     memory_context: str
@@ -118,6 +128,25 @@ def prepare_agent_context(
         else:
             older_history_summary = build_older_history_summary(history_window.older_messages)
 
+    resolved_user_preferences = resolve_user_preferences(workspace=session.workspace)
+    resolved_project_constraints = resolve_project_constraints(
+        memory_pipeline=memory_pipeline,
+        working_memory=working_memory,
+    )
+    recent_risks = resolve_recent_risks(
+        working_memory=working_memory,
+        cached_risks=cached_state.recent_risks if cached_state is not None else [],
+    )
+
+    compact_memory_context = _resolve_compact_memory_context(
+        older_history_summary=older_history_summary,
+        working_memory=working_memory,
+        cached_state=cached_state,
+        resolved_user_preferences=resolved_user_preferences,
+        resolved_project_constraints=resolved_project_constraints,
+        recent_risks=recent_risks,
+    )
+
     fixed_overhead_tokens = max(0, preview_stats.total_tokens - preview_stats.recent_tokens)
     pipeline = ContextCompactorPipeline()
     pipeline_result, memory_context, final_stats, messages = _build_compacted_request(
@@ -128,6 +157,7 @@ def prepare_agent_context(
         working_memory=working_memory,
         memory_pipeline=memory_pipeline,
         older_history_summary=older_history_summary,
+        compact_memory_context=compact_memory_context,
         tool_registry=tool_registry,
         usable_budget=usable_budget,
         fixed_overhead_tokens=fixed_overhead_tokens,
@@ -147,6 +177,7 @@ def prepare_agent_context(
             working_memory=working_memory,
             memory_pipeline=memory_pipeline,
             older_history_summary=older_history_summary,
+            compact_memory_context=compact_memory_context,
             tool_registry=tool_registry,
             usable_budget=usable_budget,
             fixed_overhead_tokens=fixed_overhead_tokens,
@@ -158,6 +189,10 @@ def prepare_agent_context(
         full_history=full_history,
         session=session,
         older_history_summary=older_history_summary,
+        compact_memory_context=compact_memory_context,
+        resolved_user_preferences=resolved_user_preferences,
+        resolved_project_constraints=resolved_project_constraints,
+        recent_risks=recent_risks,
         compacted_messages=pipeline_result.messages,
         preview_stats=preview_stats,
         final_stats=final_stats,
@@ -172,6 +207,10 @@ def prepare_agent_context(
         preview_stats=preview_stats,
         stats=final_stats,
         older_history_summary=older_history_summary,
+        compact_memory_context=compact_memory_context,
+        resolved_user_preferences=resolved_user_preferences,
+        resolved_project_constraints=resolved_project_constraints,
+        recent_risks=recent_risks,
         history_window=history_window,
         compaction_result=pipeline_result.compaction_result,
         memory_context=memory_context,
@@ -202,6 +241,28 @@ def _build_preview_memory_context(*, older_history_summary: str, working_memory:
         sections.append(working_memory_text)
 
     return "\n".join(sections).strip()
+
+
+def _resolve_compact_memory_context(
+    *,
+    older_history_summary: str,
+    working_memory: WorkingMemory,
+    cached_state: ContextStateData | None,
+    resolved_user_preferences: list[str],
+    resolved_project_constraints: list[str],
+    recent_risks: list[str],
+) -> str:
+    """基于当前 working memory 重建 compact memory，并吸收上一版基线。"""
+    return build_compact_memory_context(
+        older_history_summary=older_history_summary,
+        working_memory=working_memory,
+        previous_compact_memory_context=(
+            cached_state.compact_memory_context if cached_state is not None else ""
+        ),
+        resolved_user_preferences=resolved_user_preferences,
+        resolved_project_constraints=resolved_project_constraints,
+        recent_risks=recent_risks,
+    )
 
 
 def _build_preview_source(
@@ -262,6 +323,10 @@ def _save_active_context_state(
     full_history: list[ChatMessage],
     session: SessionData,
     older_history_summary: str,
+    compact_memory_context: str,
+    resolved_user_preferences: list[str],
+    resolved_project_constraints: list[str],
+    recent_risks: list[str],
     compacted_messages: list[ChatMessage],
     preview_stats: ContextStats,
     final_stats: ContextStats,
@@ -281,6 +346,10 @@ def _save_active_context_state(
         source_history_fingerprint=build_history_fingerprint(full_history),
         compacted_messages=list(compacted_messages),
         older_history_summary=older_history_summary,
+        compact_memory_context=compact_memory_context,
+        resolved_user_preferences=list(resolved_user_preferences),
+        resolved_project_constraints=list(resolved_project_constraints),
+        recent_risks=list(recent_risks),
         compaction_level=compaction_level,
         compaction_history=history_entries,
         last_token_stats=build_token_stats_snapshot(
@@ -300,6 +369,7 @@ def _build_compacted_request(
     working_memory: WorkingMemory,
     memory_pipeline: MemoryPipeline | None,
     older_history_summary: str,
+    compact_memory_context: str,
     tool_registry: ToolRegistry,
     usable_budget: int,
     fixed_overhead_tokens: int,
@@ -307,10 +377,6 @@ def _build_compacted_request(
     force_auto_compact: bool = False,
 ) -> tuple[ContextPipelineResult, str, ContextStats, list[ChatMessage]]:
     """统一构造一次 compact 后的请求消息，避免 runtime 内重复拼装。"""
-    auto_compact_summary = _build_preview_memory_context(
-        older_history_summary=older_history_summary,
-        working_memory=working_memory,
-    )
     pipeline_result = pipeline.process_request(
         messages=source_recent_messages,
         max_recent_tool_results=policy.max_recent_tool_results,
@@ -318,7 +384,7 @@ def _build_compacted_request(
         workspace=session.workspace,
         usable_budget=usable_budget,
         fixed_overhead_tokens=fixed_overhead_tokens,
-        auto_compact_summary=auto_compact_summary,
+        auto_compact_summary=compact_memory_context,
         force_auto_compact=force_auto_compact,
     )
 

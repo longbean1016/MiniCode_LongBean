@@ -218,6 +218,123 @@ def _build_test_config(workspace_root: str) -> AppConfig:
 
 
 class MainSmokeTests(unittest.TestCase):
+    def test_main_entry_smoke_supports_user_add_command(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            stdout = io.StringIO()
+
+            with patch.object(sys, "argv", ["main.py"]), patch(
+                "builtins.input",
+                side_effect=[
+                    "/user add 回答尽量直接，修改代码时加中文注释",
+                    "/user",
+                    "exit",
+                ],
+            ), patch.object(
+                main_module,
+                "load_config",
+                return_value=_build_test_config(tmpdir),
+            ), patch.object(
+                main_module,
+                "build_tool_registry",
+                return_value=_FakeToolRegistry(),
+            ), patch.object(
+                main_module,
+                "OpenAIModelAdapter",
+                return_value=_FakeModelAdapter("unexpected"),
+            ), patch.object(
+                main_module,
+                "LongTermMemoryExtractor",
+                return_value=_FakeExtractor([]),
+            ), patch.object(
+                main_module,
+                "MemoryVerifier",
+                return_value=_FakeVerifier(),
+            ), patch.object(
+                main_module,
+                "MemoryCurator",
+                return_value=_FakeCurator(),
+            ), patch.object(
+                main_module,
+                "MemoryDecay",
+                return_value=_FakeDecay(),
+            ), patch.object(
+                main_module,
+                "OlderHistorySummarizer",
+                return_value=_FakeSummarizer(),
+            ), redirect_stdout(stdout):
+                main_module.main()
+
+            output = stdout.getvalue()
+            self.assertIn("已追加到 USER.md", output)
+            self.assertIn("回答尽量直接", output)
+            self.assertIn("修改代码时加中文注释", output)
+
+            with open(f"{tmpdir}\\USER.md", "r", encoding="utf-8") as handle:
+                user_md = handle.read()
+
+            self.assertIn("## Custom Instructions", user_md)
+            self.assertIn("- 回答尽量直接，修改代码时加中文注释", user_md)
+
+    def test_main_entry_smoke_supports_user_profile_manual_commands(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            stdout = io.StringIO()
+
+            with patch.object(sys, "argv", ["main.py"]), patch(
+                "builtins.input",
+                side_effect=[
+                    "/user set preferences.language zh-CN",
+                    "/user set coding_style.comments 修改代码时加中文注释",
+                    "/user paths",
+                    "/user",
+                    "exit",
+                ],
+            ), patch.object(
+                main_module,
+                "load_config",
+                return_value=_build_test_config(tmpdir),
+            ), patch.object(
+                main_module,
+                "build_tool_registry",
+                return_value=_FakeToolRegistry(),
+            ), patch.object(
+                main_module,
+                "OpenAIModelAdapter",
+                return_value=_FakeModelAdapter("unexpected"),
+            ), patch.object(
+                main_module,
+                "LongTermMemoryExtractor",
+                return_value=_FakeExtractor([]),
+            ), patch.object(
+                main_module,
+                "MemoryVerifier",
+                return_value=_FakeVerifier(),
+            ), patch.object(
+                main_module,
+                "MemoryCurator",
+                return_value=_FakeCurator(),
+            ), patch.object(
+                main_module,
+                "MemoryDecay",
+                return_value=_FakeDecay(),
+            ), patch.object(
+                main_module,
+                "OlderHistorySummarizer",
+                return_value=_FakeSummarizer(),
+            ), redirect_stdout(stdout):
+                main_module.main()
+
+            output = stdout.getvalue()
+            self.assertIn("已写入 USER.md", output)
+            self.assertIn("USER.md 路径", output)
+            self.assertIn("默认使用中文回答", output)
+            self.assertIn("修改代码时加中文注释", output)
+
+            with open(f"{tmpdir}\\USER.md", "r", encoding="utf-8") as handle:
+                user_md = handle.read()
+
+            self.assertIn("- **Language**: zh-CN", user_md)
+            self.assertIn("- **Comments**: 修改代码时加中文注释", user_md)
+
     def test_main_entry_smoke_injects_memories_and_persists_reflection(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             memory_store = JsonMemoryStore(tmpdir)

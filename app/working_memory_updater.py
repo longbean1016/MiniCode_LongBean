@@ -10,6 +10,58 @@ from app.types import ToolResult
 _PATH_TOKEN_RE = re.compile(
     r'([A-Za-z]:\\[^\s"\']+|\.{0,2}[\\/][^\s"\']+|[A-Za-z0-9_.-]+[\\/][A-Za-z0-9_./\\-]+)'
 )
+_SENTENCE_SPLIT_RE = re.compile(r"(?:\r?\n)+|(?<=[。！？!?；;，,])\s*")
+
+_PREFERENCE_KEYWORDS = (
+    "默认",
+    "优先",
+    "偏好",
+    "习惯",
+    "中文",
+    "英文",
+    "注释",
+    "风格",
+    "简洁",
+    "详细",
+    "按照",
+    "参考",
+    "命名",
+    "格式",
+)
+_CONSTRAINT_KEYWORDS = (
+    "不要",
+    "不能",
+    "不可以",
+    "只",
+    "必须",
+    "需要",
+    "尽量不要",
+    "不要把",
+    "不要改",
+    "不要动",
+    "保留",
+    "限制",
+)
+_RISK_KEYWORDS = (
+    "风险",
+    "失败",
+    "报错",
+    "错误",
+    "超长",
+    "超限",
+    "overflow",
+    "exceeds limit",
+    "too long",
+    "超时",
+    "丢",
+    "漏",
+    "堆积",
+    "污染",
+    "冲刷",
+    "恢复",
+    "重试",
+    "压缩",
+)
 
 
 def _shorten(text: str, max_chars: int = 120) -> str:
@@ -20,6 +72,39 @@ def _shorten(text: str, max_chars: int = 120) -> str:
     if len(cleaned) <= max_chars:
         return cleaned
     return cleaned[:max_chars].rstrip() + "..."
+
+
+def _split_sentences(text: str) -> list[str]:
+    """按中文/英文标点和换行做轻量切句。"""
+    normalized = str(text).strip()
+    if not normalized:
+        return []
+
+    parts = _SENTENCE_SPLIT_RE.split(normalized)
+    result: list[str] = []
+    for part in parts:
+        cleaned = " ".join(part.strip().split())
+        if cleaned:
+            result.append(cleaned)
+    return result
+
+
+def _contains_any(text: str, keywords: tuple[str, ...]) -> bool:
+    lowered = text.lower()
+    return any(keyword in text or keyword in lowered for keyword in keywords)
+
+
+def _dedupe_texts(items: list[str]) -> list[str]:
+    """按归一化文本去重，避免同一句被多次写入 working memory。"""
+    result: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        normalized = re.sub(r"\s+", " ", item.strip().lower())
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        result.append(item)
+    return result
 
 
 def extract_active_paths(tool_name: str, tool_input: Any) -> list[str]:
@@ -70,6 +155,59 @@ def extract_active_paths(tool_name: str, tool_input: Any) -> list[str]:
         result.append(path)
 
     return result
+
+
+def extract_user_preferences(text: str) -> list[str]:
+    """
+    从用户输入或 assistant 承诺里提取“回答/实现偏好”。
+
+    这里参考 minicode 的 user profile 思路：
+    - 优先抓稳定偏好，不抓一次性任务目标
+    - 偏好应尽量短、可复用、可跨轮次继承
+    """
+    preferences: list[str] = []
+    for sentence in _split_sentences(text):
+        if not _contains_any(sentence, _PREFERENCE_KEYWORDS):
+            continue
+        if _contains_any(sentence, _RISK_KEYWORDS):
+            continue
+        if _contains_any(sentence, ("main.py", "agent_loop.py", ".py", "文件")) and _contains_any(sentence, _CONSTRAINT_KEYWORDS):
+            continue
+        preferences.append(_shorten(sentence, 140))
+    return _dedupe_texts(preferences)[:3]
+
+
+def extract_project_constraints(text: str) -> list[str]:
+    """
+    从用户输入或 assistant 结论里提取“实现约束”。
+
+    重点抓：
+    - 不要改哪些文件
+    - 必须保留哪些结构
+    - 只能如何计算/实现
+    """
+    constraints: list[str] = []
+    for sentence in _split_sentences(text):
+        if not _contains_any(sentence, _CONSTRAINT_KEYWORDS):
+            continue
+        if _contains_any(sentence, _RISK_KEYWORDS) and not _contains_any(sentence, ("必须", "需要", "不要", "不能")):
+            continue
+        constraints.append(_shorten(sentence, 160))
+    return _dedupe_texts(constraints)[:4]
+
+
+def extract_recent_risks(text: str) -> list[str]:
+    """
+    从 assistant 分析或失败信息里提取“近期风险/不稳定点”。
+
+    风险强调最近需要警惕的问题，而不是一般性目标描述。
+    """
+    risks: list[str] = []
+    for sentence in _split_sentences(text):
+        if not _contains_any(sentence, _RISK_KEYWORDS):
+            continue
+        risks.append(_shorten(sentence, 160))
+    return _dedupe_texts(risks)[:4]
 
 
 def summarize_failure(tool_name: str, result: ToolResult) -> str:

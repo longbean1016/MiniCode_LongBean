@@ -21,6 +21,10 @@ class ContextStateData:
     source_history_fingerprint: str
     compacted_messages: list[ChatMessage] = field(default_factory=list)
     older_history_summary: str = ""
+    compact_memory_context: str = ""
+    resolved_user_preferences: list[str] = field(default_factory=list)
+    resolved_project_constraints: list[str] = field(default_factory=list)
+    recent_risks: list[str] = field(default_factory=list)
     compaction_level: int = 0
     compaction_history: list[dict[str, Any]] = field(default_factory=list)
     last_token_stats: dict[str, Any] = field(default_factory=dict)
@@ -32,6 +36,10 @@ class ContextStateData:
             "source_history_fingerprint": self.source_history_fingerprint,
             "compacted_messages": list(self.compacted_messages),
             "older_history_summary": self.older_history_summary,
+            "compact_memory_context": self.compact_memory_context,
+            "resolved_user_preferences": list(self.resolved_user_preferences),
+            "resolved_project_constraints": list(self.resolved_project_constraints),
+            "recent_risks": list(self.recent_risks),
             "compaction_level": self.compaction_level,
             "compaction_history": list(self.compaction_history),
             "last_token_stats": dict(self.last_token_stats),
@@ -45,12 +53,28 @@ class ContextStateData:
         compaction_history = [item for item in raw_history if isinstance(item, dict)]
         raw_stats = data.get("last_token_stats", {})
         last_token_stats = dict(raw_stats) if isinstance(raw_stats, dict) else {}
+        raw_preferences = data.get("resolved_user_preferences", [])
+        resolved_user_preferences = [
+            str(item).strip() for item in raw_preferences if str(item).strip()
+        ]
+        raw_constraints = data.get("resolved_project_constraints", [])
+        resolved_project_constraints = [
+            str(item).strip() for item in raw_constraints if str(item).strip()
+        ]
+        raw_risks = data.get("recent_risks", [])
+        recent_risks = [
+            str(item).strip() for item in raw_risks if str(item).strip()
+        ]
         return cls(
             session_id=str(data["session_id"]),
             source_message_count=int(data.get("source_message_count", 0)),
             source_history_fingerprint=str(data.get("source_history_fingerprint", "")),
             compacted_messages=compacted_messages,  # type: ignore[arg-type]
             older_history_summary=str(data.get("older_history_summary", "")),
+            compact_memory_context=str(data.get("compact_memory_context", "")),
+            resolved_user_preferences=resolved_user_preferences,
+            resolved_project_constraints=resolved_project_constraints,
+            recent_risks=recent_risks,
             compaction_level=int(data.get("compaction_level", 0)),
             compaction_history=compaction_history,
             last_token_stats=last_token_stats,

@@ -12,9 +12,10 @@ from app.retry import RetryPolicy, run_with_retry, should_retry_model_error
 from app.types import AgentStep, ChatMessage
 
 
-# 自动 reflection 当前只保留两类“项目执行经验”。
+# 自动 reflection 当前只保留三类“项目执行经验”。
 ALLOWED_MEMORY_CATEGORIES = {
     "convention",
+    "constraint",
     "failure",
 }
 
@@ -92,6 +93,7 @@ class TaskMemoryReflectionEngine:
     对齐当前的 project-memory 设计后，
     它只负责从一次真实仓库任务执行中提炼：
     - `convention`: 项目约定、实现约束、工作方式
+    - `constraint`: 更硬性的项目边界、禁止项、结构约束
     - `failure`: 可复用的失败经验、风险警告
     """
 
@@ -220,9 +222,10 @@ class TaskMemoryReflectionEngine:
 你是一个代码 Agent 的任务执行经验反思器。
 你的任务不是总结聊天内容，也不是提炼通用知识，而是从一次任务执行中提炼“未来仍值得复用”的项目执行经验。
 
-只允许输出以下两类记忆：
-1. convention: 与当前仓库直接相关的项目约定、实现约束、工作方式
-2. failure: 与当前仓库执行过程直接相关、未来可复用的失败经验或风险警告
+只允许输出以下三类记忆：
+1. convention: 与当前仓库直接相关的项目约定、工作方式、推荐做法
+2. constraint: 与当前仓库直接相关的硬性实现约束、禁止项、结构边界
+3. failure: 与当前仓库执行过程直接相关、未来可复用的失败经验或风险警告
 
 请严格遵守下面的准则：
 - 候选记忆默认会写入 project scope，所以内容必须对当前仓库的后续协作有长期价值
@@ -241,6 +244,7 @@ class TaskMemoryReflectionEngine:
 下面这些内容可以高分：
 - 项目长期约定
 - 当前仓库中长期稳定的实现约束
+- 当前仓库中明确的禁止项、边界条件、结构限制
 - 当前仓库执行中暴露出的稳定风险与规避方式
 - 可复用的失败经验
 
@@ -260,7 +264,7 @@ confidence 评分规则：
   "memories": [
     {
       "content": "......",
-      "category": "convention|failure",
+      "category": "convention|constraint|failure",
       "tags": ["tag1", "tag2"],
       "confidence": 0.0,
       "domains": ["memory", "session"]
@@ -435,6 +439,7 @@ confidence 评分规则：
         """按类别设置更保守的最低 confidence。"""
         min_confidence_by_category = {
             "convention": 0.80,
+            "constraint": 0.82,
             "failure": 0.78,
         }
         threshold = min_confidence_by_category.get(item.category, 0.80)

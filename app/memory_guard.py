@@ -41,10 +41,10 @@ class MemoryWriteGuard:
             )
 
         if candidate.source.strip().lower() == "task_reflection":
-            if candidate.category.strip().lower() not in {"convention", "failure"}:
+            if candidate.category.strip().lower() not in {"convention", "constraint", "failure"}:
                 return MemoryWriteDecision(
                     should_store=False,
-                    reason="自动 reflection 只允许写入 convention / failure",
+                    reason="自动 reflection 只允许写入 convention / constraint / failure",
                 )
 
             if not self._has_reflection_admission(candidate):
