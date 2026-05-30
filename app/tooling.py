@@ -18,6 +18,13 @@ _TOOL_OUTPUT_LIMITS: dict[str, int] = {
     "run_command": 30_000,
 }
 _DEFAULT_MAX_OUTPUT = 18_000
+_TOOL_CONTEXT_OUTPUT_LIMITS: dict[str, int] = {
+    "read_file": 6_000,
+    "grep_files": 4_000,
+    "list_files": 3_500,
+    "run_command": 5_000,
+}
+_DEFAULT_CONTEXT_OUTPUT_LIMIT = 6_000
 
 
 @dataclass(slots=True)
@@ -103,6 +110,32 @@ class ToolRegistry:
             return base
 
         return self._truncate_head_tail(lines, total_chars, max_lines)
+
+    def _build_context_output(self, raw_output: str, tool_name: str) -> str:
+        """生成更适合写入对话历史的紧凑版工具结果。"""
+        if not raw_output:
+            return raw_output
+
+        limit = _TOOL_CONTEXT_OUTPUT_LIMITS.get(tool_name, _DEFAULT_CONTEXT_OUTPUT_LIMIT)
+        if len(raw_output) <= limit:
+            return raw_output
+
+        lines = raw_output.splitlines()
+        total_lines = max(1, len(lines))
+        average_line_length = max(1, len(raw_output) / total_lines)
+        max_lines = max(6, int(limit / max(40, average_line_length)))
+
+        if tool_name == "read_file":
+            return self._truncate_head_tail(lines, len(raw_output), max_lines, head_ratio=0.55, tail_ratio=0.25)
+        if tool_name in {"grep_files", "list_files"}:
+            return self._truncate_structured_collection_output(lines, len(raw_output), max_lines)
+        if tool_name == "run_command":
+            error_lines = self._extract_error_lines(lines, max_keep=6)
+            base = self._truncate_head_tail(lines, len(raw_output), max_lines, head_ratio=0.35, tail_ratio=0.35)
+            if error_lines:
+                return f"{base}\n\n--- Error Highlights ---\n" + "\n".join(error_lines)
+            return base
+        return self._truncate_head_tail(lines, len(raw_output), max_lines)
 
     def _truncate_structured_collection_output(
         self,
@@ -199,6 +232,7 @@ class ToolRegistry:
         output = self._normalize_output(result.output)
         raw_output = output
         summarized_output = self._smart_truncate_output(output, tool_name)
+        context_output = self._build_context_output(raw_output, tool_name)
         truncated = summarized_output != raw_output
         total_lines = len(raw_output.splitlines())
 
@@ -213,6 +247,8 @@ class ToolRegistry:
         meta["max_output_lines"] = self._max_output_lines
         meta["output_limit_chars"] = _TOOL_OUTPUT_LIMITS.get(tool_name, _DEFAULT_MAX_OUTPUT)
         meta["raw_output_chars"] = len(raw_output)
+        meta["context_output"] = context_output
+        meta["context_output_chars"] = len(context_output)
         if truncated:
             # 保留完整原文，供后续 context compactor 落盘或调试使用。
             meta["raw_output"] = raw_output

@@ -3,9 +3,15 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from app.context_compact_memory import (
+    CompactMemorySnapshot,
+    parse_compact_memory_context,
+    render_compact_memory_context,
+)
 from app.context_auto_compact import AutoCompactResult, run_auto_compact
 from app.context_compactor import CompactionResult, compact_recent_messages
 from app.context_manager import estimate_messages_tokens
+from app.context_message_safety import normalize_tool_call_pairs
 from app.types import ChatMessage
 
 
@@ -18,6 +24,8 @@ class ContextPipelineResult:
     auto_compact_result: AutoCompactResult
     steps_taken: list[str] = field(default_factory=list)
     compaction_history_entry: dict[str, Any] = field(default_factory=dict)
+    resolved_compact_memory_snapshot: CompactMemorySnapshot = field(default_factory=dict)
+    resolved_compact_memory_context: str = ""
 
 
 class ContextCompactorPipeline:
@@ -37,12 +45,14 @@ class ContextCompactorPipeline:
         self,
         *,
         messages: list[ChatMessage],
+        summary_source_messages: list[ChatMessage] | None = None,
         max_recent_tool_results: int,
         truncate_tool_result_chars: int,
         workspace: str,
         usable_budget: int,
         fixed_overhead_tokens: int,
         auto_compact_summary: str,
+        auto_compact_snapshot: CompactMemorySnapshot | None = None,
         force_auto_compact: bool = False,
     ) -> ContextPipelineResult:
         # 先做轻量 recent-window 压缩，把最肥的 tool_result 处理掉。
@@ -64,6 +74,8 @@ class ContextCompactorPipeline:
             messages=compaction_result.messages,
             usable_budget=usable_budget,
             summary_base=auto_compact_summary,
+            summary_snapshot=auto_compact_snapshot,
+            summary_source_messages=summary_source_messages or messages,
             fixed_overhead_tokens=fixed_overhead_tokens,
             force_full=force_auto_compact,
         )
@@ -83,10 +95,24 @@ class ContextCompactorPipeline:
             "auto_compact_tokens_before": auto_compact_result.tokens_before,
             "auto_compact_tokens_after": auto_compact_result.tokens_after,
         }
+        output_messages = auto_compact_result.messages if auto_compact_result.applied else compaction_result.messages
+        normalized_messages = normalize_tool_call_pairs(output_messages)
+        resolved_snapshot = auto_compact_snapshot or parse_compact_memory_context(auto_compact_summary)
+        resolved_context = auto_compact_summary.strip()
+        if auto_compact_result.summary_snapshot:
+            resolved_snapshot = auto_compact_result.summary_snapshot
+            resolved_context = (
+                auto_compact_result.summary_text.strip()
+                or render_compact_memory_context(resolved_snapshot)
+            )
+        elif resolved_snapshot and not resolved_context:
+            resolved_context = render_compact_memory_context(resolved_snapshot)
         return ContextPipelineResult(
-            messages=auto_compact_result.messages if auto_compact_result.applied else compaction_result.messages,
+            messages=normalized_messages,
             compaction_result=compaction_result,
             auto_compact_result=auto_compact_result,
             steps_taken=steps_taken,
             compaction_history_entry=history_entry,
+            resolved_compact_memory_snapshot=resolved_snapshot,
+            resolved_compact_memory_context=resolved_context,
         )

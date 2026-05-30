@@ -4,6 +4,7 @@ from dataclasses import dataclass
 
 from app.context_auto_compact import run_auto_compact
 from app.context_manager import estimate_messages_tokens
+from app.context_message_safety import is_internal_compaction_marker
 from app.types import ChatMessage
 
 _OVERFLOW_ERROR_PATTERNS = (
@@ -55,7 +56,7 @@ def recover_from_context_overflow(
         fixed_overhead_tokens=0,
         force_full=True,
     )
-    if full_result.applied and full_result.tokens_after < tokens_before:
+    if full_result.tokens_after < tokens_before:
         recovered_messages = _prepend_reactive_marker(full_result.messages)
         tokens_after = estimate_messages_tokens(recovered_messages)
         return ReactiveCompactResult(
@@ -99,16 +100,14 @@ def _aggressive_tail_recover(
     usable_budget: int,
 ) -> list[ChatMessage]:
     """兜底方案：只保留最近极小的一段上下文。"""
-    system_messages: list[ChatMessage] = []
+    system_messages = _select_reactive_system_messages(messages)
     other_messages: list[ChatMessage] = []
     for message in messages:
-        if message.get("role") == "system":
-            system_messages.append(dict(message))
-        else:
+        if message.get("role") != "system":
             other_messages.append(dict(message))
 
-    keep_limit = min(len(other_messages), 2)
-    target_tokens = max(1, int(usable_budget * 0.20))
+    keep_limit = min(len(other_messages), 1)
+    target_tokens = max(1, int(usable_budget * 0.12))
     kept_reversed: list[ChatMessage] = []
 
     for message in reversed(other_messages):
@@ -135,3 +134,25 @@ def _aggressive_tail_recover(
     )
     result.extend(kept_tail)
     return result
+
+
+def _select_reactive_system_messages(messages: list[ChatMessage]) -> list[ChatMessage]:
+    """
+    Reactive recover 只保留基础 system prompt。
+
+    前一轮如果已经插入过 compact / recover marker，再把它们原样带进来会导致
+    fallback 体积不降反升，进而让重试分支失效。
+    """
+    system_messages = [dict(message) for message in messages if message.get("role") == "system"]
+    if not system_messages:
+        return []
+
+    for message in system_messages:
+        if not _is_internal_compaction_marker(message):
+            return [message]
+    return [system_messages[0]]
+
+
+def _is_internal_compaction_marker(message: ChatMessage) -> bool:
+    """兼容旧调用点，实际委托给共享判定逻辑。"""
+    return is_internal_compaction_marker(message)

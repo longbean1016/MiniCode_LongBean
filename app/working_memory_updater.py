@@ -223,25 +223,16 @@ def summarize_failure(tool_name: str, result: ToolResult) -> str:
     return f"{tool_name}: {_shorten(first_line, 140)}"
 
 
-def extract_decision_from_assistant(content: str) -> str | None:
+def extract_decisions_from_assistant(content: str) -> list[str]:
     """
-    从 assistant 最终回复里抽一条“最近关键决策”。
+    从 assistant 最终回复里抽取多条“最近关键决策/结论”。
 
-    第一版先用启发式规则，不调用模型。
-    目标不是完美，而是尽量提取“可复用的执行方向或约束”。
+    优先保留 bullet 和短结论句，避免把整段说明作为单条决策写入。
     """
-    text = " ".join(content.strip().split())
+    text = str(content).strip()
     if not text:
-        return None
+        return []
 
-    # 太短通常更像普通确认，不一定值得记为关键决策。
-    if len(text) < 12:
-        return None
-
-    # 按句号、问号、感叹号做简单切句，优先看前几句。
-    sentences = re.split(r"(?<=[。！？.!?])\s+", text)
-
-    # 这些关键词更像“已经确认的方向/约束/承诺”。
     decision_keywords = (
         "以后",
         "统一",
@@ -253,22 +244,60 @@ def extract_decision_from_assistant(content: str) -> str | None:
         "使用",
         "采用",
         "改为",
+        "负责",
+        "顺序",
+        "优先",
+        "治理",
+        "拆成",
+        "保留",
         "from now on",
         "i will",
         "use ",
         "switch to",
         "default to",
+        "working memory",
+        "context",
+        "compact",
+        "pipeline",
+        "tool_result",
     )
 
-    for sentence in sentences[:3]:
-        candidate = sentence.strip()
+    candidates: list[str] = []
+    for raw_line in text.splitlines():
+        normalized = re.sub(r"^\s*(?:[-*•]+|\d+\.)\s*", "", raw_line).strip()
+        normalized = " ".join(normalized.split())
+        if not normalized or len(normalized) < 12:
+            continue
+        if normalized.endswith(("：", ":")):
+            continue
+        candidates.append(normalized)
+
+    if not candidates:
+        candidates = _split_sentences(text)
+
+    accepted: list[str] = []
+    for candidate in candidates:
         lowered = candidate.lower()
-        if any(keyword in lowered or keyword in candidate for keyword in decision_keywords):
-            return _shorten(candidate, 160)
+        if not any(keyword in candidate or keyword in lowered for keyword in decision_keywords):
+            continue
+        accepted.append(_shorten(candidate, 160))
 
-    # 如果没命中关键词，但整段本身就很短且像结论，也可以退而求其次保留首句。
-    first_sentence = sentences[0].strip() if sentences else ""
-    if 12 <= len(first_sentence) <= 120:
-        return _shorten(first_sentence, 160)
+    if not accepted:
+        first_sentence = _split_sentences(text)
+        if first_sentence:
+            head = first_sentence[0]
+            if 12 <= len(head) <= 120:
+                accepted.append(_shorten(head, 160))
 
-    return None
+    return _dedupe_texts(accepted)[:4]
+
+
+def extract_decision_from_assistant(content: str) -> str | None:
+    """
+    从 assistant 最终回复里抽一条“最近关键决策”。
+
+    第一版先用启发式规则，不调用模型。
+    目标不是完美，而是尽量提取“可复用的执行方向或约束”。
+    """
+    decisions = extract_decisions_from_assistant(content)
+    return decisions[0] if decisions else None

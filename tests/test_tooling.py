@@ -291,6 +291,8 @@ class ToolBehaviorTests(unittest.TestCase):
         self.assertGreater(len(str(result.meta["raw_output"])), len(result.output))
         self.assertIn("ERROR line 0", result.output)
         self.assertIn("ERROR line 1199", str(result.meta["raw_output"]))
+        self.assertIn("context_output", result.meta)
+        self.assertLessEqual(len(str(result.meta["context_output"])), len(str(result.meta["raw_output"])))
 
     def test_tool_registry_smart_truncates_grep_files_but_keeps_header_and_tail(self) -> None:
         def _validate(input_data: object) -> dict[str, str]:
@@ -332,6 +334,9 @@ class ToolBehaviorTests(unittest.TestCase):
         self.assertIn("src/file_599.py:600:", result.output)
         self.assertIn("省略", result.output)
         self.assertIn("raw_output", result.meta)
+        self.assertIn("context_output", result.meta)
+        self.assertIn("PATTERN: session", str(result.meta["context_output"]))
+        self.assertLess(len(str(result.meta["context_output"])), len(str(result.meta["raw_output"])))
 
     def test_tool_registry_smart_truncates_list_files_but_keeps_header_and_tail(self) -> None:
         def _validate(input_data: object) -> dict[str, str]:
@@ -372,6 +377,9 @@ class ToolBehaviorTests(unittest.TestCase):
         self.assertIn("file nested_directory_499_", result.output)
         self.assertIn("省略", result.output)
         self.assertIn("raw_output", result.meta)
+        self.assertIn("context_output", result.meta)
+        self.assertIn("TOTAL_ENTRIES: 500", str(result.meta["context_output"]))
+        self.assertLess(len(str(result.meta["context_output"])), len(str(result.meta["raw_output"])))
 
 
 if __name__ == "__main__":

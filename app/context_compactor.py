@@ -14,6 +14,7 @@ from app.types import ChatMessage
 # 这里先只对 read_file 做真正的“路径 + 内容 hash”去重。
 # list_files / grep_files 更像集合型结果，直接套同一规则容易误伤。
 _READ_TOOLS = {"read_file"}
+_COLLECTION_TOOLS = {"list_files", "grep_files"}
 _PREVIEW_HEAD_LINES = 8
 _PREVIEW_TAIL_LINES = 3
 _PREVIEW_LINE_CHAR_LIMIT = 160
@@ -98,6 +99,7 @@ def compact_recent_messages(
 
     # 读取类工具容易重复把同一段信息塞进上下文，因此只保留最后一份完整结果。
     last_seen_by_key: dict[tuple[str, str, str], int] = {}
+    last_seen_collection_key: dict[tuple[str, str], int] = {}
     for index in range(len(compacted) - 1, -1, -1):
         message = compacted[index]
         if message.get("role") != "tool_result":
@@ -105,6 +107,23 @@ def compact_recent_messages(
 
         tool_name = str(message.get("tool_name", ""))
         if tool_name not in _READ_TOOLS:
+            if tool_name not in _COLLECTION_TOOLS:
+                continue
+            collection_key = _build_collection_dedupe_identity(
+                tool_name=tool_name,
+                content=original_tool_contents[index],
+            )
+            if collection_key is None:
+                continue
+            if collection_key not in last_seen_collection_key:
+                last_seen_collection_key[collection_key] = index
+                continue
+            compacted[index]["content"] = (
+                "[扫描结果已去重：保留本轮较新的同类结果]\n"
+                f"工具: {tool_name}"
+            )
+            compacted[index]["_deduped_read_result"] = True
+            result.deduped_read_results += 1
             continue
 
         read_identity = _build_read_dedupe_identity(
@@ -304,3 +323,25 @@ def _normalize_read_path(path: str) -> str:
     """对路径做轻量规范化，减少斜杠和大小写差异带来的误判。"""
     normalized = os.path.normpath(path.strip())
     return os.path.normcase(normalized)
+
+
+def _build_collection_dedupe_identity(*, tool_name: str, content: str) -> tuple[str, str] | None:
+    """给 list_files / grep_files 生成轻量语义去重标识。"""
+    lines = [line.strip() for line in content.splitlines() if line.strip()]
+    if not lines:
+        return None
+
+    header_lines: list[str] = []
+    body_lines: list[str] = []
+    in_body = False
+    for line in lines:
+        if not in_body and (line.startswith("file ") or ":" in line and tool_name == "grep_files"):
+            in_body = True
+        if in_body:
+            body_lines.append(line)
+        else:
+            header_lines.append(line)
+
+    normalized_header = "|".join(header_lines[:6]).lower()
+    normalized_body = "|".join(sorted(body_lines[:12])).lower()
+    return (tool_name, f"{normalized_header}::{normalized_body}")

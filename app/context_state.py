@@ -10,6 +10,15 @@ from app.context_manager import ContextStats
 from app.types import ChatMessage
 
 CONTEXT_STATE_DIR_NAME = ".context_state"
+_SNAPSHOT_KEYS = (
+    "preferences",
+    "stable_constraints",
+    "active_tasks",
+    "decisions",
+    "open_issues",
+    "tool_findings",
+    "history_summary",
+)
 
 
 @dataclass(slots=True)
@@ -22,6 +31,7 @@ class ContextStateData:
     compacted_messages: list[ChatMessage] = field(default_factory=list)
     older_history_summary: str = ""
     compact_memory_context: str = ""
+    compact_memory_snapshot: dict[str, list[str]] = field(default_factory=dict)
     resolved_user_preferences: list[str] = field(default_factory=list)
     resolved_project_constraints: list[str] = field(default_factory=list)
     recent_risks: list[str] = field(default_factory=list)
@@ -37,6 +47,7 @@ class ContextStateData:
             "compacted_messages": list(self.compacted_messages),
             "older_history_summary": self.older_history_summary,
             "compact_memory_context": self.compact_memory_context,
+            "compact_memory_snapshot": _normalize_snapshot(self.compact_memory_snapshot),
             "resolved_user_preferences": list(self.resolved_user_preferences),
             "resolved_project_constraints": list(self.resolved_project_constraints),
             "recent_risks": list(self.recent_risks),
@@ -53,6 +64,7 @@ class ContextStateData:
         compaction_history = [item for item in raw_history if isinstance(item, dict)]
         raw_stats = data.get("last_token_stats", {})
         last_token_stats = dict(raw_stats) if isinstance(raw_stats, dict) else {}
+        compact_memory_snapshot = _normalize_snapshot(data.get("compact_memory_snapshot", {}))
         raw_preferences = data.get("resolved_user_preferences", [])
         resolved_user_preferences = [
             str(item).strip() for item in raw_preferences if str(item).strip()
@@ -72,6 +84,7 @@ class ContextStateData:
             compacted_messages=compacted_messages,  # type: ignore[arg-type]
             older_history_summary=str(data.get("older_history_summary", "")),
             compact_memory_context=str(data.get("compact_memory_context", "")),
+            compact_memory_snapshot=compact_memory_snapshot,
             resolved_user_preferences=resolved_user_preferences,
             resolved_project_constraints=resolved_project_constraints,
             recent_risks=recent_risks,
@@ -143,3 +156,19 @@ def build_token_stats_snapshot(*, preview_stats: ContextStats, final_stats: Cont
         "final_usage": final_stats.usage_ratio,
         "final_budget": final_stats.usable_budget,
     }
+
+
+def _normalize_snapshot(raw_value: object) -> dict[str, list[str]]:
+    """把结构化 compact memory 快照清洗成稳定的 {key: [lines]} 结构。"""
+    if not isinstance(raw_value, dict):
+        return {}
+
+    normalized: dict[str, list[str]] = {}
+    for key in _SNAPSHOT_KEYS:
+        raw_lines = raw_value.get(key, [])
+        if not isinstance(raw_lines, list):
+            continue
+        lines = [str(item).strip() for item in raw_lines if str(item).strip()]
+        if lines:
+            normalized[key] = lines
+    return normalized

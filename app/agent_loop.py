@@ -18,6 +18,7 @@ from app.working_memory import WorkingMemory
 from app.working_memory_updater import (
     extract_active_paths,
     extract_decision_from_assistant,
+    extract_decisions_from_assistant,
     summarize_failure,
 )
 
@@ -204,8 +205,8 @@ def _run_agent_loop(
                                     content=step.content,
                                 )
                             else:
-                                decision = extract_decision_from_assistant(step.content)
-                                if decision:
+                                decisions = extract_decisions_from_assistant(step.content)
+                                for decision in decisions:
                                     working_memory.protect(
                                         decision,
                                         entry_type="key_decision",
@@ -264,8 +265,8 @@ def _run_agent_loop(
                     content=step.content,
                 )
             else:
-                decision = extract_decision_from_assistant(step.content)
-                if decision:
+                decisions = extract_decisions_from_assistant(step.content)
+                for decision in decisions:
                     working_memory.protect(
                         decision,
                         entry_type="key_decision",
@@ -435,10 +436,13 @@ def _run_agent_loop(
                     return approval_step, builder.build()
 
                 # 正常情况才把工具结果写回消息历史
+                context_output = result.meta.get("context_output", result.output)
+                if not isinstance(context_output, str) or not context_output.strip():
+                    context_output = result.output
                 builder.add_tool_result(
                     tool_use_id=tool_use_id,
                     tool_name=tool_name,
-                    content=result.output,
+                    content=context_output,
                     is_error=not result.ok,
                     meta=dict(result.meta),
                 )

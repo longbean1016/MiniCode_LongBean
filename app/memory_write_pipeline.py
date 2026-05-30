@@ -21,6 +21,7 @@ from app.working_memory_updater import (
     extract_project_constraints,
     extract_recent_risks,
     extract_decision_from_assistant,
+    extract_decisions_from_assistant,
     extract_user_preferences,
     summarize_failure,
 )
@@ -158,22 +159,23 @@ class MemoryWritePipeline:
                 importance=0.93,
             )
 
-        decision = extract_decision_from_assistant(content)
-        if not decision:
+        decisions = extract_decisions_from_assistant(content)
+        if not decisions:
             return
 
-        working_memory.protect(
-            decision,
-            entry_type="key_decision",
-            ttl_seconds=3600,
-            importance=0.95,
-        )
-        working_memory.protect(
-            decision,
-            entry_type="reflection_decision",
-            ttl_seconds=3600,
-            importance=0.95,
-        )
+        for decision in decisions:
+            working_memory.protect(
+                decision,
+                entry_type="key_decision",
+                ttl_seconds=3600,
+                importance=0.95,
+            )
+            working_memory.protect(
+                decision,
+                entry_type="reflection_decision",
+                ttl_seconds=3600,
+                importance=0.95,
+            )
 
     def handle_explicit_input(
         self,

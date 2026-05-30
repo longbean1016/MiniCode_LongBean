@@ -1,12 +1,144 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 from app.context_manager import estimate_tokens
+from app.types import ChatMessage
 from app.working_memory import WorkingMemory, WorkingMemoryEntry
 
-COMPACT_MEMORY_MAX_TOKENS = 220
-COMPACT_MEMORY_SECTION_ENTRY_LIMIT = 3
+# compact memory 是跨轮次续带的结构化基线，预算不能低到只够放 1-2 条句子。
+# 这里参考 minicode 的分层摘要 / working memory 量级，给到更合理的中等预算。
+COMPACT_MEMORY_MAX_TOKENS = 2000
+COMPACT_MEMORY_SECTION_ENTRY_LIMIT = 6
+_CARRY_FORWARD_BLOCKED_SECTIONS = {"项目约束", "当前任务", "用户意图"}
+_CARRY_FORWARD_REJECT_PHRASES = (
+    "本次",
+    "这次",
+    "本轮",
+    "验收测试",
+    "工具调用",
+    "完成后",
+    "立即停止",
+    "不要继续探索",
+    "写文件",
+    "写入 tmp",
+    "tmp/",
+    "先读取",
+    "最后只回复",
+    "最多允许",
+)
+_SECTION_KEY_TO_TITLE = {
+    "preferences": "用户偏好",
+    "stable_constraints": "项目约束",
+    "active_tasks": "当前任务",
+    "decisions": "关键决策",
+    "open_issues": "未解决问题（最近风险）",
+    "tool_findings": "关键工具发现（上次压缩延续）",
+    "history_summary": "旧对话摘要",
+}
+_TITLE_TO_SECTION_KEY = {
+    "用户偏好": "preferences",
+    "项目约束": "stable_constraints",
+    "当前任务": "active_tasks",
+    "关键决策": "decisions",
+    "未解决问题": "open_issues",
+    "最近风险": "open_issues",
+    "关键工具发现": "tool_findings",
+    "旧对话摘要": "history_summary",
+    "上次压缩延续": "tool_findings",
+    "稳定事实": "tool_findings",
+}
+_SNAPSHOT_SECTION_SPECS = (
+    ("decisions", 4, 160, 128),
+    ("open_issues", 3, 100, 54),
+    ("tool_findings", 4, 110, 50),
+    ("active_tasks", 2, 80, 34),
+    ("preferences", 2, 90, 42),
+    ("stable_constraints", 3, 100, 54),
+    ("history_summary", 1, 140, 40),
+)
+_DEFAULT_RENDER_SECTION_SPECS = (
+    ("decisions", 4, 160, 128),
+    ("open_issues", 3, 100, 54),
+    ("tool_findings", 2, 110, 50),
+    ("active_tasks", 2, 80, 34),
+    ("preferences", 2, 90, 42),
+    ("stable_constraints", 3, 100, 54),
+    ("history_summary", 1, 140, 40),
+)
+_FULL_COMPACT_RENDER_SECTION_SPECS = (
+    ("decisions", 4, 160, 240),
+    ("tool_findings", 3, 96, 96),
+    ("open_issues", 2, 92, 54),
+)
+_NOISE_PREFIXES = ("│", "├", "└", "dir ", "file ")
+_MARKDOWN_TABLE_RE = re.compile(r"^\|.+\|$")
+_CODE_LIKE_PREFIXES = ("def ", "class ", "return ", "import ", "from ", "if ", "for ", "while ")
+_TOOL_RESULT_META_PREFIXES = (
+    "FILE:",
+    "OFFSET:",
+    "END:",
+    "TOTAL_CHARS:",
+    "TRUNCATED:",
+    "PATH:",
+    "TOOL:",
+    "路径:",
+    "工具:",
+    "SEARCH_ROOT:",
+    "PATTERN:",
+    "ROOT:",
+    "TOTAL_ENTRIES:",
+    "RETURNED_ENTRIES:",
+    "LOCALROOT:",
+)
+_TOOL_RESULT_SKIP_TOKENS = (
+    "--- preview",
+    "--- 预览",
+    "省略",
+    "omitted",
+    "output truncated",
+    "已落盘",
+    "旧工具结果已省略",
+    "原始字符数",
+    "补充说明",
+    "filler block",
+    "alpha filler",
+    "beta filler",
+    "delta filler",
+    "gamma filler",
+)
+_SEMANTIC_HINT_TOKENS = (
+    "压缩",
+    "上下文",
+    "recent window",
+    "tool_result",
+    "memory",
+    "working memory",
+    "constraint",
+    "constraints",
+    "decision",
+    "risk",
+    "issue",
+    "error",
+    "结论",
+    "发现",
+    "风险",
+    "原因",
+    "建议",
+    "需要",
+    "应该",
+    "优先",
+    "避免",
+    "问题",
+    "策略",
+    "验证",
+    "保留",
+    "分离",
+    "污染",
+)
+
+CompactMemorySnapshot = dict[str, list[str]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -25,7 +157,7 @@ _SECTION_SPECS = (
     _SectionSpec("项目约束", ("project_constraint",), 3, 100, 54),
     _SectionSpec("最近风险", ("recent_risk", "error_context"), 3, 100, 54),
     _SectionSpec("当前任务", ("active_task",), 2, 80, 34),
-    _SectionSpec("关键决策", ("key_decision",), 2, 80, 34),
+    _SectionSpec("关键决策", ("key_decision",), 4, 160, 128),
     _SectionSpec("用户意图", ("user_intent",), 1, 90, 22),
 )
 
@@ -35,49 +167,276 @@ def build_compact_memory_context(
     older_history_summary: str,
     working_memory: WorkingMemory,
     previous_compact_memory_context: str = "",
+    previous_snapshot: CompactMemorySnapshot | None = None,
     resolved_user_preferences: list[str] | None = None,
     resolved_project_constraints: list[str] | None = None,
     recent_risks: list[str] | None = None,
 ) -> str:
+    """把结构化 compact memory 快照渲染成压缩阶段使用的短摘要基线。"""
+    snapshot = build_compact_memory_snapshot(
+        older_history_summary=older_history_summary,
+        working_memory=working_memory,
+        previous_snapshot=previous_snapshot,
+        previous_compact_memory_context=previous_compact_memory_context,
+        resolved_user_preferences=resolved_user_preferences,
+        resolved_project_constraints=resolved_project_constraints,
+        recent_risks=recent_risks,
+    )
+    return render_compact_memory_context(snapshot)
+
+
+def build_compact_memory_snapshot(
+    *,
+    older_history_summary: str,
+    working_memory: WorkingMemory,
+    previous_snapshot: CompactMemorySnapshot | None = None,
+    previous_compact_memory_context: str = "",
+    resolved_user_preferences: list[str] | None = None,
+    resolved_project_constraints: list[str] | None = None,
+    recent_risks: list[str] | None = None,
+) -> CompactMemorySnapshot:
     """
-    构造一段专门给压缩阶段使用的短摘要基线。
+    构造结构化 compact memory 快照。
 
-    参考 minicode 的思路：
-    - 不直接把 working memory 整段原样塞回去
-    - 先抽稳定信号，再做分层预算组装
-    - 高价值层优先：偏好 / 约束 / 风险 > 当前任务 / 决策 > 摘要兜底
+    这里不再把上一版自由文本整段递归喂回来，而是优先续带已结构化的稳定字段。
+    只有兼容旧数据时，才从上一版 compact_memory_context 尝试解析少量可续带内容。
     """
-    lines: list[str] = ["压缩记忆基线"]
+    carry_snapshot = _normalize_snapshot(previous_snapshot)
+    if not carry_snapshot:
+        carry_snapshot = _normalize_snapshot(
+            _snapshot_from_previous_context(previous_compact_memory_context)
+        )
+    protected_snapshot = _normalize_snapshot(working_memory.build_protected_snapshot())
+    snapshot: CompactMemorySnapshot = {}
 
-    explicit_sections = {
-        "用户偏好": list(resolved_user_preferences or []),
-        "项目约束": list(resolved_project_constraints or []),
-        "最近风险": list(recent_risks or []),
-    }
+    snapshot["preferences"] = _merge_snapshot_lines(
+        primary=(
+            list(resolved_user_preferences or [])
+            or protected_snapshot.get("preferences", [])
+        ),
+        secondary=carry_snapshot.get("preferences", []),
+        max_entries=2,
+        max_item_chars=90,
+    )
+    snapshot["stable_constraints"] = _merge_snapshot_lines(
+        primary=(
+            list(resolved_project_constraints or [])
+            or protected_snapshot.get("stable_constraints", [])
+        ),
+        secondary=carry_snapshot.get("stable_constraints", []),
+        max_entries=3,
+        max_item_chars=100,
+    )
+    snapshot["active_tasks"] = _merge_snapshot_lines(
+        primary=protected_snapshot.get("active_tasks", []),
+        secondary=[],
+        max_entries=2,
+        max_item_chars=80,
+    )
+    snapshot["decisions"] = _merge_snapshot_lines(
+        primary=protected_snapshot.get("decisions", []),
+        secondary=[],
+        max_entries=4,
+        max_item_chars=160,
+    )
 
-    for spec in _SECTION_SPECS:
-        section_lines = _build_structured_section(
-            working_memory=working_memory,
-            title=spec.title,
-            entry_types=spec.entry_types,
-            max_entries=spec.max_entries,
-            max_item_chars=spec.max_item_chars,
-            max_section_tokens=spec.max_section_tokens,
-            explicit_lines=explicit_sections.get(spec.title, []),
+    issue_lines = _merge_snapshot_lines(
+        primary=list(recent_risks or []),
+        secondary=[],
+        max_entries=3,
+        max_item_chars=100,
+    )
+    if not issue_lines:
+        issue_lines = _merge_snapshot_lines(
+            primary=protected_snapshot.get("open_issues", []),
+            secondary=[],
+            max_entries=3,
+            max_item_chars=100,
+        )
+    snapshot["open_issues"] = issue_lines
+
+    snapshot["tool_findings"] = _merge_ranked_snapshot_lines(
+        primary=(
+            protected_snapshot.get("tool_findings", [])
+            or _collect_tool_findings(working_memory)
+        ),
+        secondary=carry_snapshot.get("tool_findings", []),
+        max_entries=2,
+        max_item_chars=110,
+        priority_fn=_tool_finding_priority,
+    )
+
+    normalized_summary = older_history_summary.strip()
+    if normalized_summary:
+        snapshot["history_summary"] = [_shorten(normalized_summary, 140)]
+    elif carry_snapshot.get("history_summary"):
+        snapshot["history_summary"] = carry_snapshot["history_summary"][:1]
+
+    return {key: lines for key, lines in snapshot.items() if lines}
+
+
+def parse_compact_memory_context(text: str) -> CompactMemorySnapshot:
+    """把 compact memory 文本解析回结构化快照，供恢复和全量压缩复用。"""
+    return _normalize_snapshot(_snapshot_from_previous_context(text))
+
+
+def merge_compact_memory_snapshots(
+    *,
+    base_snapshot: CompactMemorySnapshot | None,
+    overlay_snapshot: CompactMemorySnapshot | None,
+) -> CompactMemorySnapshot:
+    """把事件快照叠加到稳定基线上，仍按各槽位预算做裁剪。"""
+    base = _normalize_snapshot(base_snapshot or {})
+    overlay = _normalize_snapshot(overlay_snapshot or {})
+    merged: CompactMemorySnapshot = {}
+
+    for key, max_entries, max_item_chars, _ in _SNAPSHOT_SECTION_SPECS:
+        merge_fn = _merge_ranked_snapshot_lines if key == "tool_findings" else _merge_snapshot_lines
+        merge_kwargs = {
+            "primary": overlay.get(key, []),
+            "secondary": base.get(key, []),
+            "max_entries": max_entries,
+            "max_item_chars": max_item_chars,
+        }
+        if key == "tool_findings":
+            merge_kwargs["priority_fn"] = _tool_finding_priority
+        merged_lines = merge_fn(**merge_kwargs)
+        if merged_lines:
+            merged[key] = merged_lines
+    return merged
+
+
+def build_event_compact_memory_snapshot(
+    *,
+    removed_messages: list[ChatMessage],
+) -> CompactMemorySnapshot:
+    """按轮次事件提取压缩快照，避免按消息片段自由文本拼接。"""
+    snapshot: CompactMemorySnapshot = {}
+    active_tasks: list[str] = []
+    decisions: list[str] = []
+    open_issues: list[str] = []
+    tool_calls: list[str] = []
+    tool_findings: list[str] = []
+
+    for message in removed_messages:
+        role = str(message.get("role", "")).strip()
+        raw_content = str(message.get("content", "")).strip()
+        content = " ".join(raw_content.split())
+        if role == "user" and content and not _looks_like_structured_noise(content):
+            active_tasks.append(_shorten(content, 60))
+            continue
+        if role == "assistant" and content and not _looks_like_structured_noise(content):
+            decisions.extend(_extract_assistant_decision_points(raw_content))
+            continue
+        if role == "assistant_tool_call":
+            tool_name = str(message.get("tool_name", "")).strip() or "unknown"
+            tool_calls.append(tool_name)
+            continue
+        if role != "tool_result" or not content:
+            continue
+
+        tool_name = str(message.get("tool_name", "")).strip() or "unknown"
+        findings = _extract_tool_result_findings(
+            tool_name=tool_name,
+            raw_content=raw_content,
+        )
+        if bool(message.get("is_error")):
+            if findings:
+                open_issues.extend(findings)
+            else:
+                preview = _shorten(content, 70)
+                open_issues.append(f"{tool_name}：{preview}")
+        else:
+            if findings:
+                tool_findings.extend(findings)
+            else:
+                preview = _shorten(content, 70)
+                tool_findings.append(f"{tool_name}：{preview}")
+
+    if active_tasks:
+        snapshot["active_tasks"] = _dedupe_lines(active_tasks)[:2]
+    if decisions:
+        snapshot["decisions"] = _dedupe_lines(decisions)[:4]
+    if open_issues:
+        snapshot["open_issues"] = _dedupe_lines(open_issues)[:3]
+    if tool_findings:
+        snapshot["tool_findings"] = _merge_ranked_snapshot_lines(
+            primary=tool_findings,
+            secondary=[],
+            max_entries=4,
+            max_item_chars=100,
+            priority_fn=_tool_finding_priority,
+        )
+    elif tool_calls:
+        snapshot["tool_findings"] = _dedupe_lines(
+            [f"调用工具：{tool_name}" for tool_name in tool_calls]
+        )[:2]
+    return snapshot
+
+
+def render_compact_memory_context(
+    snapshot: CompactMemorySnapshot,
+    *,
+    section_specs: tuple[tuple[str, int, int, int], ...] = _DEFAULT_RENDER_SECTION_SPECS,
+    max_tokens: int = COMPACT_MEMORY_MAX_TOKENS,
+) -> str:
+    """把结构化快照按预算渲染成 compact memory 文本。"""
+    normalized_snapshot = _normalize_snapshot(snapshot)
+    lines: list[str] = ["结构化压缩记忆", "压缩记忆基线"]
+
+    for key, max_entries, max_item_chars, max_section_tokens in section_specs:
+        section_lines = _build_snapshot_section(
+            key=key,
+            values=normalized_snapshot.get(key, []),
+            max_entries=max_entries,
+            max_item_chars=max_item_chars,
+            max_section_tokens=max_section_tokens,
         )
         if not section_lines:
             continue
-        if not _append_with_global_budget(lines, section_lines):
+        if not _append_with_global_budget(lines, section_lines, max_tokens=max_tokens):
             break
 
-    summary_section = _build_summary_fallback_section(
-        older_history_summary=older_history_summary,
-        previous_compact_memory_context=previous_compact_memory_context,
-    )
-    if summary_section:
-        _append_with_global_budget(lines, summary_section)
-
     return "\n".join(lines).strip()
+
+
+def render_full_compact_memory_context(snapshot: CompactMemorySnapshot) -> str:
+    """full compact 场景下优先渲染语义核心，避免任务/偏好占掉摘要预算。"""
+    return render_compact_memory_context(
+        snapshot,
+        section_specs=_FULL_COMPACT_RENDER_SECTION_SPECS,
+    )
+
+
+def _build_snapshot_section(
+    *,
+    key: str,
+    values: list[str],
+    max_entries: int,
+    max_item_chars: int,
+    max_section_tokens: int,
+) -> list[str]:
+    """按结构化字段构造单个 section。"""
+    if not values:
+        return []
+
+    title = _SECTION_KEY_TO_TITLE.get(key, key)
+    lines = [f"## {title}"]
+    kept_count = 0
+
+    for content in values:
+        if kept_count >= max_entries:
+            break
+        candidate_line = f"- {_shorten(content, max_item_chars)}"
+        candidate_lines = [*lines, candidate_line]
+        if estimate_tokens("\n".join(candidate_lines)) > max_section_tokens:
+            if kept_count == 0:
+                lines.append(candidate_line)
+            break
+        lines.append(candidate_line)
+        kept_count += 1
+
+    return lines if len(lines) > 1 else []
 
 
 def _build_structured_section(
@@ -144,6 +503,257 @@ def _collect_ranked_entries(
     return deduped[:COMPACT_MEMORY_SECTION_ENTRY_LIMIT]
 
 
+def _collect_snapshot_entries(
+    *,
+    working_memory: WorkingMemory,
+    entry_types: tuple[str, ...],
+    max_entries: int,
+    max_item_chars: int,
+) -> list[str]:
+    """从 working memory 抽指定类型的结构化条目。"""
+    entries = _collect_ranked_entries(
+        working_memory=working_memory,
+        entry_types=entry_types,
+    )
+    result: list[str] = []
+    for entry in entries:
+        if _looks_like_structured_noise(entry.content):
+            continue
+        result.append(_shorten(entry.content, max_item_chars))
+        if len(result) >= max_entries:
+            break
+    return result
+
+
+def _collect_tool_findings(working_memory: WorkingMemory) -> list[str]:
+    """提取值得续带的工具发现。"""
+    findings = _collect_snapshot_entries(
+        working_memory=working_memory,
+        entry_types=("reflection_file", "error_context"),
+        max_entries=2,
+        max_item_chars=110,
+    )
+    ranked = sorted(
+        findings,
+        key=_tool_finding_priority,
+        reverse=True,
+    )
+    return ranked[:2]
+
+
+def _extract_assistant_decision_points(raw_content: str) -> list[str]:
+    """把 assistant 结论拆成更小的语义点，避免整段说明被当成单条决策。"""
+    points: list[str] = []
+    decision_tokens = (
+        "负责",
+        "顺序",
+        "优先",
+        "需要",
+        "应该",
+        "避免",
+        "治理",
+        "拆成",
+        "保留",
+        "session memory compact",
+        "full compact",
+        "tool result budget",
+        "read dedup",
+        "working memory",
+        "tool_findings",
+        "context",
+        "pipeline",
+        "compact",
+    )
+    for raw_line in raw_content.splitlines():
+        normalized = re.sub(r"^\s*(?:[-*•]+|\d+\.)\s*", "", raw_line).strip()
+        normalized = " ".join(normalized.split())
+        if not normalized or len(normalized) < 12:
+            continue
+        if normalized.endswith(("：", ":")):
+            continue
+        lowered = normalized.lower()
+        if not any(token in normalized or token in lowered for token in decision_tokens):
+            continue
+        if _looks_like_structured_noise(normalized):
+            continue
+        points.append(_shorten(normalized, 110))
+    if points:
+        return _dedupe_lines(points)[:4]
+    fallback = " ".join(raw_content.strip().split())
+    if 12 <= len(fallback) <= 120 and not _looks_like_structured_noise(fallback):
+        return [_shorten(fallback, 110)]
+    return []
+
+
+def _extract_tool_result_findings(*, tool_name: str, raw_content: str) -> list[str]:
+    """从 tool_result 中优先抽取语义结论，而不是文件头和路径元信息。"""
+    candidates: list[tuple[int, str]] = []
+
+    for raw_line in raw_content.splitlines():
+        normalized = _normalize_tool_result_candidate(raw_line)
+        if not normalized:
+            continue
+        if _looks_like_structured_noise(normalized) or _looks_like_path_only(normalized):
+            continue
+
+        score = _semantic_line_score(normalized)
+        if score <= 0:
+            continue
+        candidates.append((score, _shorten(normalized, 100)))
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for _, item in sorted(candidates, key=lambda pair: (pair[0], len(pair[1])), reverse=True):
+        dedupe_key = " ".join(item.lower().split())
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        deduped.append(item)
+        if len(deduped) >= 2:
+            break
+    return deduped
+
+
+def _normalize_tool_result_candidate(raw_line: str) -> str:
+    line = raw_line.strip()
+    if not line:
+        return ""
+
+    lowered = line.lower()
+    if any(token in lowered for token in _TOOL_RESULT_SKIP_TOKENS):
+        return ""
+    if line.startswith("... [") or line.startswith("...（"):
+        return ""
+
+    line = re.sub(r"^\d+\.\s+", "", line)
+    if any(line.startswith(prefix) for prefix in _TOOL_RESULT_META_PREFIXES):
+        return ""
+    if line.startswith("ERROR:"):
+        return line.split(":", 1)[1].strip()
+
+    if ":" in line:
+        head, tail = line.split(":", 1)
+        normalized_head = head.strip()
+        normalized_tail = tail.strip()
+        if _is_tool_result_header(normalized_head) and normalized_tail:
+            return normalized_tail
+    return line
+
+
+def _is_tool_result_header(text: str) -> bool:
+    normalized = text.strip()
+    if not normalized:
+        return False
+    if normalized.upper() == normalized and re.search(r"[A-Z_]", normalized):
+        return True
+    return bool(re.fullmatch(r"[A-Za-z0-9_\-]+", normalized))
+
+
+def _semantic_line_score(text: str) -> int:
+    lowered = text.lower()
+    score = 0
+
+    if len(text) >= 12:
+        score += 1
+    if any(token in lowered for token in _SEMANTIC_HINT_TOKENS):
+        score += 4
+    if any(token in text for token in ("：", "，", "。", "；")):
+        score += 2
+    if any(token in lowered for token in ("应", "应该", "需要", "避免", "导致", "验证")):
+        score += 2
+    if _looks_like_path_only(text):
+        score -= 5
+    if re.search(r"\b(tmp|app|tests)[/\\]", lowered):
+        score -= 3
+    if len(text) < 10 or len(text) > 140:
+        score -= 2
+    return score
+
+
+def _tool_finding_priority(text: str) -> tuple[int, int]:
+    score = _semantic_line_score(text)
+    if _looks_like_path_only(text):
+        score -= 4
+    lowered = text.lower()
+    if "已落盘" in text or "原始字符数" in text or lowered.startswith("[工具结果已"):
+        score -= 6
+    return score, len(text)
+
+
+def _looks_like_path_only(text: str) -> bool:
+    normalized = text.strip()
+    if not normalized:
+        return False
+    if re.fullmatch(r"[A-Za-z]:[/\\].+", normalized):
+        return True
+    if re.fullmatch(r"[\w.\- /\\]+", normalized) and ("/" in normalized or "\\" in normalized):
+        alpha_count = sum(1 for ch in normalized if ch.isalpha())
+        return alpha_count <= max(8, len(normalized) // 3)
+    return False
+
+
+def _merge_snapshot_lines(
+    *,
+    primary: list[str],
+    secondary: list[str],
+    max_entries: int,
+    max_item_chars: int,
+) -> list[str]:
+    """合并当前值和续带值，当前值优先。"""
+    result: list[str] = []
+    seen: set[str] = set()
+
+    for line in [*primary, *secondary]:
+        normalized = _shorten(str(line).strip(), max_item_chars)
+        dedupe_key = " ".join(normalized.lower().split())
+        if not dedupe_key or dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        result.append(normalized)
+        if len(result) >= max_entries:
+            break
+
+    return result
+
+
+def _merge_ranked_snapshot_lines(
+    *,
+    primary: list[str],
+    secondary: list[str],
+    max_entries: int,
+    max_item_chars: int,
+    priority_fn,
+) -> list[str]:
+    """按内容质量排序合并，避免路径类新条目挤掉旧的高价值语义事实。"""
+    candidates: list[tuple[tuple[int, int, int], str, str]] = []
+    for index, line in enumerate(primary):
+        normalized = _shorten(str(line).strip(), max_item_chars)
+        dedupe_key = " ".join(normalized.lower().split())
+        if not dedupe_key:
+            continue
+        priority = priority_fn(normalized)
+        candidates.append(((priority[0], priority[1], 1_000 - index), dedupe_key, normalized))
+    for index, line in enumerate(secondary):
+        normalized = _shorten(str(line).strip(), max_item_chars)
+        dedupe_key = " ".join(normalized.lower().split())
+        if not dedupe_key:
+            continue
+        priority = priority_fn(normalized)
+        candidates.append(((priority[0], priority[1], 100 - index), dedupe_key, normalized))
+
+    ranked = sorted(candidates, key=lambda item: item[0], reverse=True)
+    result: list[str] = []
+    seen: set[str] = set()
+    for _, dedupe_key, normalized in ranked:
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        result.append(normalized)
+        if len(result) >= max_entries:
+            break
+    return result
+
+
 def _build_summary_fallback_section(
     *,
     older_history_summary: str,
@@ -169,33 +779,94 @@ def _build_summary_fallback_section(
     return lines
 
 
+def _snapshot_from_previous_context(previous_compact_memory_context: str) -> CompactMemorySnapshot:
+    """兼容旧数据：把上一版自由文本基线尽量解析回结构化快照。"""
+    snapshot: CompactMemorySnapshot = {}
+    current_key = ""
+
+    for raw_line in previous_compact_memory_context.splitlines():
+        line = raw_line.strip()
+        if not line or line in {"压缩记忆基线", "结构化压缩记忆"}:
+            continue
+        if line.startswith("## "):
+            current_key = _TITLE_TO_SECTION_KEY.get(line[3:].strip(), "")
+            continue
+        if not current_key:
+            continue
+        if line.startswith("- "):
+            content = line[2:].strip()
+        elif re.match(r"^\d+\.\s+", line):
+            content = re.sub(r"^\d+\.\s+", "", line)
+        else:
+            continue
+        if current_key == "stable_constraints":
+            normalized = " ".join(content.lower().split())
+            if any(phrase in normalized for phrase in _CARRY_FORWARD_REJECT_PHRASES):
+                continue
+        if _looks_like_structured_noise(content):
+            continue
+        snapshot.setdefault(current_key, []).append(content)
+
+    return snapshot
+
+
+def _normalize_snapshot(snapshot: CompactMemorySnapshot | object) -> CompactMemorySnapshot:
+    """清洗结构化快照，去掉空白和无效 key。"""
+    if not isinstance(snapshot, dict):
+        return {}
+
+    normalized: CompactMemorySnapshot = {}
+    for key in _SECTION_KEY_TO_TITLE:
+        raw_lines = snapshot.get(key, [])
+        if not isinstance(raw_lines, list):
+            continue
+        lines = [str(item).strip() for item in raw_lines if str(item).strip()]
+        deduped = _dedupe_lines(lines)
+        if deduped:
+            normalized[key] = deduped
+    return normalized
+
+
 def _extract_previous_baseline_lines(previous_compact_memory_context: str) -> list[str]:
     """从上一版 compact memory 中提取可延续的有效内容，避免递归复制标题。"""
     result: list[str] = []
+    current_section = ""
     for raw_line in previous_compact_memory_context.splitlines():
         line = raw_line.strip()
         if not line:
             continue
-        if line == "压缩记忆基线":
+        if line in {"压缩记忆基线", "结构化压缩记忆"}:
             continue
         if line.startswith("## "):
+            current_section = line[3:].strip()
+            continue
+        if current_section in _CARRY_FORWARD_BLOCKED_SECTIONS:
+            continue
+        if _looks_like_structured_noise(line):
+            continue
+        normalized = " ".join(line.lstrip("- ").strip().lower().split())
+        if any(phrase in normalized for phrase in _CARRY_FORWARD_REJECT_PHRASES):
             continue
         result.append(f"- {_shorten(line.lstrip('- ').strip(), 90)}")
     return _dedupe_lines(result)
 
 
-def _append_with_global_budget(lines: list[str], section_lines: list[str]) -> bool:
+def _append_with_global_budget(
+    lines: list[str],
+    section_lines: list[str],
+    *,
+    max_tokens: int,
+) -> bool:
     """把 section 追加到最终上下文中，同时保证总 token 不超预算。"""
     candidate = "\n".join([*lines, *section_lines]).strip()
-    if estimate_tokens(candidate) <= COMPACT_MEMORY_MAX_TOKENS:
+    if estimate_tokens(candidate) <= max_tokens:
         lines.extend(section_lines)
         return True
 
-    # 如果整段放不下，尝试逐行压进去，尽量保留标题和前几个高价值 bullet。
     partial = list(lines)
     for line in section_lines:
         next_candidate = "\n".join([*partial, line]).strip()
-        if estimate_tokens(next_candidate) > COMPACT_MEMORY_MAX_TOKENS:
+        if estimate_tokens(next_candidate) > max_tokens:
             return False
         partial.append(line)
 
@@ -251,3 +922,25 @@ def _shorten(text: str, max_chars: int) -> str:
     suffix = " ...[已截断]"
     head_limit = max(0, max_chars - len(suffix))
     return f"{normalized[:head_limit]}{suffix}"
+
+
+def _looks_like_structured_noise(text: str) -> bool:
+    """过滤明显不适合作为结构化记忆槽位的目录树、表格和代码正文。"""
+    normalized = str(text).strip()
+    if not normalized:
+        return True
+
+    lower_line = normalized.lower()
+    if lower_line.startswith(_NOISE_PREFIXES):
+        return True
+    if _MARKDOWN_TABLE_RE.match(normalized):
+        return True
+    if lower_line.startswith(_CODE_LIKE_PREFIXES):
+        return True
+    if normalized.count("```") >= 1:
+        return True
+    if normalized.count("|") >= 4:
+        return True
+    if normalized.count("/") >= 4 and " " not in normalized:
+        return True
+    return False

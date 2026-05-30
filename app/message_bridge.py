@@ -8,6 +8,7 @@
 import json
 from typing import Any
 
+from app.context_message_safety import normalize_tool_call_pairs
 from app.tooling import ToolDefinition
 from app.types import AgentStep, ChatMessage, ToolCall
 
@@ -33,7 +34,7 @@ def build_openai_messages(messages:list[ChatMessage])->list[dict[str,Any]]:
     """把内部消息转成模型接口消息。"""
     result:list[dict[str,Any]]=[]
 
-    for msg in messages:
+    for msg in normalize_tool_call_pairs(messages):
         role=msg.get("role") 
         content=msg.get("content")
 

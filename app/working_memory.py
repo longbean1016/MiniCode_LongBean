@@ -4,6 +4,11 @@ import time
 from dataclasses import dataclass, field
 
 
+def _estimate_tokens(text: str) -> int:
+    """轻量估算 token，用于约束受保护记忆自身的体积。"""
+    return max(1, len(str(text)) // 4)
+
+
 def _normalize_text(text: str) -> str:
     """规范化文本空白，便于作为运行时工作记忆存储。"""
     return " ".join(str(text).strip().split())
@@ -19,6 +24,9 @@ class WorkingMemoryEntry:
     expires_at: float | None = None
     importance: float = 1.0
 
+    def token_count(self) -> int:
+        return _estimate_tokens(self.content)
+
     def is_expired(self, now: float | None = None) -> bool:
         """判断当前条目是否已经过期。"""
         if self.expires_at is None:
@@ -28,11 +36,49 @@ class WorkingMemoryEntry:
         return current > self.expires_at
 
 
+@dataclass(frozen=True, slots=True)
+class ProtectedSlotSpec:
+    """定义受保护工作记忆槽位和上限。"""
+
+    entry_types: tuple[str, ...]
+    max_entries: int
+
+
+_PROTECTED_SLOT_SPECS: dict[str, ProtectedSlotSpec] = {
+    "preferences": ProtectedSlotSpec(("user_preference",), 2),
+    "stable_constraints": ProtectedSlotSpec(("project_constraint",), 3),
+    "active_tasks": ProtectedSlotSpec(("active_task", "user_intent"), 3),
+    "decisions": ProtectedSlotSpec(("key_decision",), 4),
+    "open_issues": ProtectedSlotSpec(("recent_risk", "error_context"), 4),
+    "tool_findings": ProtectedSlotSpec(("reflection_file", "tool_finding"), 2),
+}
+_ENTRY_TYPE_LIMITS: dict[str, int] = {
+    "user_preference": 2,
+    "project_constraint": 3,
+    "active_task": 2,
+    "user_intent": 1,
+    "key_decision": 4,
+    "recent_risk": 3,
+    "error_context": 2,
+    "reflection_file": 2,
+    "tool_finding": 2,
+}
+_PROMPT_SECTION_TITLES = {
+    "preferences": "用户偏好",
+    "stable_constraints": "项目约束",
+    "active_tasks": "当前任务",
+    "decisions": "关键决策",
+    "open_issues": "未解决问题",
+    "tool_findings": "关键工具发现",
+}
+
+
 @dataclass(slots=True)
 class WorkingMemory:
     """类似 minicode 的运行时工作记忆跟踪器。"""
 
     max_entries: int = 15
+    max_tokens: int = 420
     entries: list[WorkingMemoryEntry] = field(default_factory=list)
 
     def protect(
@@ -134,63 +180,107 @@ class WorkingMemory:
             if entry.entry_type == normalized_type
         ]
 
+    def get_protected_tokens(self) -> int:
+        """返回当前受保护工作记忆的大致 token 总量。"""
+        return sum(entry.token_count() for entry in self.get_entries())
+
+    def build_protected_snapshot(self) -> dict[str, list[str]]:
+        """把受保护工作记忆整理成结构化槽位，供 compact/render 统一使用。"""
+        snapshot: dict[str, list[str]] = {}
+        for slot_name, spec in _PROTECTED_SLOT_SPECS.items():
+            slot_entries: list[WorkingMemoryEntry] = []
+            for entry_type in spec.entry_types:
+                slot_entries.extend(self.get_entries_by_type(entry_type))
+            if not slot_entries:
+                continue
+
+            slot_entries.sort(
+                key=lambda entry: (entry.importance, entry.created_at),
+                reverse=True,
+            )
+            lines: list[str] = []
+            seen: set[str] = set()
+            for entry in slot_entries:
+                normalized = " ".join(entry.content.strip().split())
+                dedupe_key = normalized.lower()
+                if not dedupe_key or dedupe_key in seen:
+                    continue
+                seen.add(dedupe_key)
+                lines.append(normalized)
+                if len(lines) >= spec.max_entries:
+                    break
+            if lines:
+                snapshot[slot_name] = lines
+        return snapshot
+
     def format_for_prompt(self) -> str:
         """把运行时保护上下文化成可注入 prompt 的文本。"""
         sections: list[str] = []
-        grouped = {
-            "user_intent": self.get_entries_by_type("user_intent"),
-            "active_task": self.get_entries_by_type("active_task"),
-            "key_decision": self.get_entries_by_type("key_decision"),
-            "error_context": self.get_entries_by_type("error_context"),
-            "recent_risk": self.get_entries_by_type("recent_risk"),
-        }
-
-        if grouped["user_intent"]:
-            sections.append("用户意图：")
-            for entry in grouped["user_intent"][-3:]:
-                sections.append(f"- {entry.content}")
-
-        if grouped["active_task"]:
-            sections.append("活跃任务：")
-            for entry in grouped["active_task"][-5:]:
-                sections.append(f"- {entry.content}")
-
-        if grouped["key_decision"]:
-            sections.append("关键决策：")
-            for entry in grouped["key_decision"][-5:]:
-                sections.append(f"- {entry.content}")
-
-        if grouped["error_context"]:
-            sections.append("错误上下文：")
-            for entry in grouped["error_context"][-5:]:
-                sections.append(f"- {entry.content}")
-
-        if grouped["recent_risk"]:
-            sections.append("近期风险：")
-            for entry in grouped["recent_risk"][-5:]:
-                sections.append(f"- {entry.content}")
+        snapshot = self.build_protected_snapshot()
+        for slot_name in (
+            "preferences",
+            "stable_constraints",
+            "active_tasks",
+            "decisions",
+            "open_issues",
+            "tool_findings",
+        ):
+            lines = snapshot.get(slot_name, [])
+            if not lines:
+                continue
+            sections.append(f"{_PROMPT_SECTION_TITLES[slot_name]}：")
+            sections.extend(f"- {line}" for line in lines)
 
         supplemental_entries = [
             entry for entry in self.get_entries()
-            if entry.entry_type not in grouped
+            if entry.entry_type not in _ENTRY_TYPE_LIMITS
             and not entry.entry_type.startswith("reflection_")
         ]
         if supplemental_entries:
-            sections.append("运行时保护上下文：")
-            for entry in supplemental_entries[-5:]:
+            sections.append("运行时补充上下文：")
+            for entry in supplemental_entries[-4:]:
                 sections.append(f"- [{entry.entry_type}] {entry.content}")
-
         return "\n".join(sections).strip()
 
     def _enforce_entry_limits(self) -> None:
-        """超过最大条目数时，优先删除重要度最低、最旧的条目。"""
+        """超过类型/总量上限时，优先删除重要度最低、最旧的条目。"""
         self.clear_expired()
+        self._enforce_type_limits()
+        self._enforce_token_budget()
         while len(self.entries) > self.max_entries:
-            lowest = min(
-                range(len(self.entries)),
-                key=lambda index: (
-                    self.entries[index].importance,
-                    self.entries[index].created_at,
-                ),
-            )
-            self.entries.pop(lowest)
+            self.entries.pop(self._pick_lowest_priority_index())
+
+    def _enforce_type_limits(self) -> None:
+        for entry_type, max_allowed in _ENTRY_TYPE_LIMITS.items():
+            matching_indexes = [
+                index
+                for index, entry in enumerate(self.entries)
+                if entry.entry_type == entry_type
+            ]
+            while len(matching_indexes) > max_allowed:
+                lowest_index = min(
+                    matching_indexes,
+                    key=lambda index: (
+                        self.entries[index].importance,
+                        self.entries[index].created_at,
+                    ),
+                )
+                self.entries.pop(lowest_index)
+                matching_indexes = [
+                    index
+                    for index, entry in enumerate(self.entries)
+                    if entry.entry_type == entry_type
+                ]
+
+    def _enforce_token_budget(self) -> None:
+        while self.get_protected_tokens() > self.max_tokens and self.entries:
+            self.entries.pop(self._pick_lowest_priority_index())
+
+    def _pick_lowest_priority_index(self) -> int:
+        return min(
+            range(len(self.entries)),
+            key=lambda index: (
+                self.entries[index].importance,
+                self.entries[index].created_at,
+            ),
+        )
