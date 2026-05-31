@@ -25,6 +25,7 @@ def normalize_tool_call_pairs(messages: list[ChatMessage]) -> list[ChatMessage]:
     一旦 compact 折掉了前置 assistant_tool_call，后续请求就会直接 400。
     这里统一丢弃孤立的 assistant_tool_call / tool_result，保证出站消息可发送。
     """
+    # 先找出两边都存在的 tool_use_id，只保留真正成对的交互。
     assistant_ids = {
         str(message.get("tool_use_id", "")).strip()
         for message in messages
@@ -47,6 +48,8 @@ def normalize_tool_call_pairs(messages: list[ChatMessage]) -> list[ChatMessage]:
             continue
 
         tool_use_id = str(message.get("tool_use_id", "")).strip()
+        # 这里选择“直接丢弃孤儿消息”，而不是尝试自动补配对项。
+        # 原因是补出来的配对项一定是伪造结构，宁可少一点旧上下文，也不能发出假协议消息。
         if tool_use_id and tool_use_id in valid_ids:
             normalized.append(dict(message))
 

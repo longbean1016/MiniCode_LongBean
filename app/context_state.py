@@ -38,6 +38,10 @@ class ContextStateData:
     resolved_project_constraints: list[str] = field(default_factory=list)
     recent_risks: list[str] = field(default_factory=list)
     compaction_level: int = 0
+    # 新增：保存上一次 microcompact 的执行时间。
+    # 这样下一轮 prepare_agent_context 命中 context_state 时，
+    # 可以继续沿用同一套节流窗口，而不是把旧 tool_result 反复清理。
+    last_microcompact_at: float = 0.0
     compaction_history: list[dict[str, Any]] = field(default_factory=list)
     last_token_stats: dict[str, Any] = field(default_factory=dict)
 
@@ -54,12 +58,15 @@ class ContextStateData:
             "resolved_project_constraints": list(self.resolved_project_constraints),
             "recent_risks": list(self.recent_risks),
             "compaction_level": self.compaction_level,
+            "last_microcompact_at": self.last_microcompact_at,
             "compaction_history": list(self.compaction_history),
             "last_token_stats": dict(self.last_token_stats),
         }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "ContextStateData":
+        # 旧状态文件没有 last_microcompact_at 时，默认退回 0。
+        # 这样兼容老版本 session，不需要做迁移脚本。
         raw_messages = data.get("compacted_messages", [])
         compacted_messages = [item for item in raw_messages if isinstance(item, dict)]
         raw_history = data.get("compaction_history", [])
@@ -91,6 +98,7 @@ class ContextStateData:
             resolved_project_constraints=resolved_project_constraints,
             recent_risks=recent_risks,
             compaction_level=int(data.get("compaction_level", 0)),
+            last_microcompact_at=float(data.get("last_microcompact_at", 0.0) or 0.0),
             compaction_history=compaction_history,
             last_token_stats=last_token_stats,
         )

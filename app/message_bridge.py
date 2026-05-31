@@ -18,6 +18,9 @@ def build_openai_tools(tools:list[ToolDefinition])->list[dict[str,Any]]:
     result:list[dict[str,Any]]=[]
 
     for tool in tools:
+        # 这里只做协议层映射，不掺入任何调度策略。
+        # “该不该调用某个工具”是模型与主循环共同决定的，
+        # bridge 只负责把注册表里的定义准确送到模型侧。
         result.append(
             {
                 "type":"function",
@@ -34,6 +37,9 @@ def build_openai_messages(messages:list[ChatMessage])->list[dict[str,Any]]:
     """把内部消息转成模型接口消息。"""
     result:list[dict[str,Any]]=[]
 
+    # 先做一次 pair 归一化，再出站。
+    # 因为对 OpenAI 协议来说，孤立的 tool_result 不是“信息不完整”这么简单，
+    # 而是会直接导致请求非法。
     for msg in normalize_tool_call_pairs(messages):
         role=msg.get("role") 
         content=msg.get("content")
@@ -49,7 +55,8 @@ def build_openai_messages(messages:list[ChatMessage])->list[dict[str,Any]]:
             )
             continue
 
-        # assistant_progress 用标记包起来，便于后续解析回内部 kind
+        # assistant_progress 没有对应的原生 role，
+        # 这里只能编码进 assistant 文本里，再在回包时拆回内部 kind。
         if role == "assistant_progress":
             result.append(
                 {
@@ -59,7 +66,8 @@ def build_openai_messages(messages:list[ChatMessage])->list[dict[str,Any]]:
             )
             continue
 
-        # assistant_tool_call 映射为 OpenAI 的 assistant + tool_calls
+        # 内部协议里 tool_call 是单独 role；
+        # OpenAI 协议里则是 assistant 消息上的 tool_calls 字段。
         if role=="assistant_tool_call":
             result.append(
                 {
@@ -81,7 +89,8 @@ def build_openai_messages(messages:list[ChatMessage])->list[dict[str,Any]]:
                 }
             )
             continue
-        # tool_result 映射为 tool 角色，并保留 tool_call_id 对应关系
+        # tool_result 的关键不是 content 本身，而是必须带上 tool_call_id。
+        # 只有这样模型下一轮才能把它识别为“这是刚才那个工具调用的返回结果”。
         if role == "tool_result":
             result.append(
                 {
@@ -98,14 +107,18 @@ def parse_openai_response_message(message: Any) -> AgentStep:
     """把模型返回转回内部 AgentStep。"""
     tool_calls_raw = getattr(message, "tool_calls", None) or []
 
-    # 模型返回了工具调用：组装成内部 tool_calls
+    # 先判 tool_calls，再判纯文本。
+    # 因为一次响应只要带了 tool_calls，就意味着主循环下一步必须进入工具执行分支，
+    # 不能再把它当成普通 assistant 文本继续向后走。
     if tool_calls_raw:
         calls: list[ToolCall] = []
         for call in tool_calls_raw:
             tool_name = call.function.name
             tool_args = call.function.arguments or "{}"
 
-            # 工具参数 JSON 解析失败时给空字典兜底，避免中断主循环
+            # 参数 JSON 偶尔会被模型生成为非法字符串。
+            # 这里兜底为空字典，是为了让主循环继续运行并把失败交给具体工具层处理，
+            # 而不是在协议桥接层直接把整轮对话打崩。
             try:
                 parsed_input = json.loads(tool_args)
             except json.JSONDecodeError:
@@ -136,7 +149,8 @@ def _unwrap_content(content: str) -> tuple[str, str | None]:
     """把进度/最终标记从文本里拆出来。"""
     trimmed = content.strip()
 
-    # 识别 progress 包裹
+    # 这里约定了一层极轻的“文本内协议”：
+    # 当模型侧只能返回 assistant 文本时，用包裹标记把内部 kind 带回来。
     if trimmed.startswith("<progress>") and trimmed.endswith("</progress>"):
         inner = trimmed[len("<progress>") : -len("</progress>")].strip()
         return inner, "progress"

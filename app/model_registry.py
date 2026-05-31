@@ -79,13 +79,19 @@ class OpenAIModelAdapter:
         调用聊天模型并返回统一的 AgentStep。
         """
 
+        # 这里先统一做协议翻译，再进入具体模型调用。
+        # agent_loop 不需要知道 OpenAI 要求什么 message/tool 结构，
+        # 这样后面替换模型提供商时，主循环可以尽量不动。
         openai_messages = build_openai_messages(messages)
         openai_tools = build_openai_tools(self.tool_registry.list_tools())
 
+        # 熔断检查放在真正发请求前，避免每轮都再白白经历一次网络超时。
         if not self.circuit_breaker.allow_request():
             raise CircuitOpenError(self.circuit_breaker.reject_reason())
 
         def _request_model() -> Any:
+            # tools 始终一并传入，让模型自己决定“回答”还是“发起工具调用”。
+            # 这样主循环只处理统一 AgentStep，不需要先分岔出工具模式与非工具模式。
             return self.client.chat.completions.create(
                 model=self.model_name,
                 messages=openai_messages,  # type: ignore
@@ -111,5 +117,7 @@ class OpenAIModelAdapter:
             self.circuit_breaker.record_failure(error)
             raise
 
+        # 只有真正拿到成功响应后才恢复熔断状态，
+        # 否则短暂的半失败/解析失败也会把线路错误地标记成健康。
         self.circuit_breaker.record_success()
         return parse_openai_response_message(response.choices[0].message)

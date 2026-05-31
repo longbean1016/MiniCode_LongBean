@@ -63,6 +63,11 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 
 def _load_or_create_session(workspace: str, session_id: str, resume: str) -> SessionData:
     """按参数决定是恢复旧会话还是创建新会话。"""
+    # 优先级是：
+    # 1. 显式指定 session_id
+    # 2. --resume latest
+    # 3. 新建
+    # 这样命令行行为始终可预测，不会因为“最近会话存在”就偷偷覆盖用户显式选择。
     if session_id:
         session = load_session(workspace, session_id)
         if session is None:
@@ -97,6 +102,7 @@ def _replace_pending_tool_result(
     replaced = False
 
     for msg in history:
+        # 只替换第一条匹配占位，避免历史里若存在重复残留时把多条结果一起污染。
         if (
             msg.get("role") == "tool_result"
             and msg.get("tool_use_id") == tool_use_id
@@ -135,6 +141,8 @@ def main() -> None:
     parser = _build_arg_parser()
     args = parser.parse_args()
 
+    # 配置先加载，再组装所有依赖。
+    # main 的职责不是执行业务逻辑，而是把“模型 / 工具 / 记忆 / 会话”这些基础设施接起来。
     config = load_config()
 
     if args.resume == "list":
@@ -142,6 +150,8 @@ def main() -> None:
         print(format_session_list(metas))
         return
 
+    # 工具注册表和模型适配器都在启动时构建，
+    # 后续整轮会话里复用同一套实例，避免每次用户输入都重新初始化依赖。
     tool_registry = build_tool_registry()
 
     model = OpenAIModelAdapter(
@@ -157,7 +167,8 @@ def main() -> None:
         circuit_recovery_timeout_seconds=config.model_circuit_recovery_timeout_seconds,
     )  # type: ignore[arg-type]
 
-    # 当前工具默认在工作区根目录下执行
+    # ToolContext 保存的是“工具运行时共享状态”，
+    # 例如当前工作目录、已批准动作；它不是一次性参数，而是整场会话的执行上下文。
     tool_context = ToolContext(
         cwd=config.workspace_root,
     )
@@ -204,7 +215,8 @@ def main() -> None:
                 f"[session=startup] 向量索引初始化收敛失败，已降级继续运行: {error}"
             )
 
-    # 当前会话的短期工作记忆
+    # WorkingMemory 只承担“本次会话里近期要持续遵守/记住的事实”，
+    # 长期知识仍然交给 memory store / memory pipeline。
     working_memory = WorkingMemory()
 
     # 长期记忆抽取器：负责把本轮任务整理成 task reflection，并产出候选记忆。
@@ -269,6 +281,8 @@ def main() -> None:
         circuit_recovery_timeout_seconds=config.aux_model_circuit_recovery_timeout_seconds,
     )
 
+    # 所有基础设施都就绪后再恢复/创建会话，
+    # 这样一进主循环就能直接处理 explicit memory 命令、工具调用和长期记忆读写。
     session = _load_or_create_session(
         workspace=config.workspace_root,
         session_id=args.session.strip(),
@@ -285,6 +299,8 @@ def main() -> None:
         if not user_input:
             continue
 
+        # 每轮开始先清空“只属于上一轮”的运行时痕迹，再写入本轮用户意图。
+        # 否则反思链路、失败上下文、短期任务状态会在多轮后互相污染。
         memory_pipeline.reset_turn_runtime(working_memory)
         memory_pipeline.remember_user_intent(working_memory, user_input)
 
@@ -294,6 +310,8 @@ def main() -> None:
             print("Bye!")
             break
 
+        # 先处理显式命令型输入，如 /memory add。
+        # 这类输入本质上不是“问模型”，而是直接操作本地记忆系统，应该短路主 agent loop。
         explicit_result = memory_pipeline.handle_explicit_input(
             user_input=user_input,
             session_id=session.session_id,
@@ -308,6 +326,8 @@ def main() -> None:
             print(f"Agent> {explicit_result.assistant_text}")
             continue
 
+        # 常规自然语言输入才进入主 agent loop。
+        # run_agent_once 会负责拼装 prompt、调用模型、执行低风险工具，并返回新的 history。
         step, history = run_agent_once(
             user_input=user_input,
             model=model,
@@ -322,6 +342,7 @@ def main() -> None:
         )
 
         if step.type == "approval" and step.approval is not None:
+            # 高风险工具不会直接执行，而是先把“待批准占位结果”写进历史，交给用户确认。
             print(step.approval.message)
             answer = input("是否允许本次执行？(y/n)> ").strip().lower()
 
@@ -329,7 +350,8 @@ def main() -> None:
                 # 同一会话里同一条高风险动作后续可直接放行
                 tool_context.approved_actions.add(step.approval.action_key)
 
-                # 批准后直接执行待授权工具，不重新问模型
+                # 批准后直接执行待授权工具，不重新问模型。
+                # 否则模型可能在批准前后生成不同 tool_call，导致用户批准的并不是最终执行的那次动作。
                 result = tool_registry.execute_tool(
                     tool_name=step.approval.tool_name,
                     input_data=step.approval.input_data,
@@ -356,7 +378,8 @@ def main() -> None:
                     is_error=not result.ok,
                 )
 
-                # 再从真实 tool_result 已写回的历史继续跑主循环
+                # 把真实 tool_result 写回历史后，再继续主循环。
+                # 这样模型下一步看到的是“已经执行完的事实”，而不是一条脱节的批准结果。
                 step, history = continue_agent_from_history(
                     history=approved_history,
                     model=model,
@@ -381,6 +404,8 @@ def main() -> None:
 
         if step.type == "assistant":
             try:
+                # finalize_turn 放在真正得到 assistant 结果之后，
+                # 让长期记忆抽取基于“本轮最终回答 + 真实工具轨迹”收敛，而不是半成品中间态。
                 memory_pipeline.finalize_turn(
                     task_description=user_input,
                     final_step=step,
@@ -396,6 +421,8 @@ def main() -> None:
                 )
                 print(f"[memory-reflection-error] {error}")
 
+        # 每轮末尾都把最新 history 落回 session，再持久化到磁盘。
+        # 这样即使下一轮或下次启动中断，也能从最近一次完成态恢复。
         session.replace_messages(history)
         save_session(session)
 

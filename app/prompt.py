@@ -21,6 +21,8 @@ def _build_tool_rules(tool_registry:ToolRegistry)->str:
     """工具规则：告诉模型有哪些工具、什么时候该用工具。"""
 
     tool_names=tool_registry.list_tool_name()
+    # 工具清单每轮动态生成，这样 system prompt 永远和当前注册表一致，
+    # 不需要手工维护一份容易过期的静态工具说明。
     tool_lines="\n".join(f"- {name}" for name in tool_names) if tool_names else "- (暂无工具)"
 
     return f"""
@@ -79,6 +81,9 @@ def build_system_prompt(
     user_profile_context: str = "",
 ) -> str:
     """拼装分层系统提示词，供主循环每轮发送给模型。"""
+    # 这里按“角色 -> 工具 -> 分析 -> 重试 -> 风格”的顺序拼接，
+    # 目的是先定义身份和边界，再定义执行方式，最后才补充输出风格。
+    # 这样模型更容易先遵守事实与工具约束，而不是先追求回答好看。
     sections = [
         "【角色约束】\n" + _build_role_constraints(),
         "【工具使用规则】\n" + _build_tool_rules(tool_registry),
@@ -87,12 +92,16 @@ def build_system_prompt(
         "【回答风格】\n" + _build_response_style(),
     ]
 
+    # 用户偏好单独成节，优先级高于“默认风格”，
+    # 但仍低于角色/工具/分析这些安全约束，避免偏好覆盖事实性规则。
     if user_profile_context.strip():
         sections.append("【用户偏好与工作方式】\n" + user_profile_context.strip())
 
     # 记忆上下文属于每轮都可能变化的动态部分。
     # 只有在确实有内容时才加入，避免 system prompt 里出现空标题。
     if memory_context.strip():
+        # 放在最后是为了把它当成“当前轮的补充事实”，
+        # 而不是更高优先级的全局规则，减少历史记忆对当前任务的误导。
         sections.append("【记忆上下文】\n" + memory_context.strip())
 
     return "\n\n".join(sections).strip()

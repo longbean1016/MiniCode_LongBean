@@ -85,6 +85,7 @@ class PreparedAgentContext:
     recent_risks: list[str]
     history_window: HistoryWindow
     compaction_result: CompactionResult
+    pipeline_steps: list[str]
     memory_context: str
     user_profile_context: str
 
@@ -221,6 +222,8 @@ def prepare_agent_context(
         fixed_overhead_tokens=fixed_overhead_tokens,
         base_system_prompt=base_system_prompt,
         user_profile_context=user_profile_context,
+        # 把缓存状态直接传给压缩流水线，让新版 microcompact 节流能接上旧轮次。
+        cached_state=cached_state,
         analysis_mode=analysis_mode,
     )
     compact_memory_snapshot = (
@@ -257,6 +260,9 @@ def prepare_agent_context(
             base_system_prompt=base_system_prompt,
             user_profile_context=user_profile_context,
             force_auto_compact=True,
+            # 第二次强制 auto compact 时也继续复用同一个缓存状态，
+            # 避免第一次处理刚写下的 microcompact 节流信息丢失。
+            cached_state=cached_state,
             analysis_mode=analysis_mode,
         )
         compact_memory_snapshot = (
@@ -281,6 +287,8 @@ def prepare_agent_context(
         pipeline_history_entry=pipeline_result.compaction_history_entry,
         cached_state=cached_state,
         compaction_level=policy.level,
+        # 把最新 microcompact 时间写回 context_state，供下一轮增量恢复继续复用。
+        last_microcompact_at=pipeline_result.last_microcompact_at,
     )
 
     return PreparedAgentContext(
@@ -298,6 +306,7 @@ def prepare_agent_context(
         recent_risks=recent_risks,
         history_window=history_window,
         compaction_result=pipeline_result.compaction_result,
+        pipeline_steps=list(pipeline_result.steps_taken),
         memory_context=memory_context,
         user_profile_context=user_profile_context,
     )
@@ -475,6 +484,7 @@ def _save_active_context_state(
     pipeline_history_entry: dict[str, object],
     cached_state: ContextStateData | None,
     compaction_level: int,
+    last_microcompact_at: float,
 ) -> None:
     """把当前 compact 后的 active context 状态单独落盘。"""
     history_entries: list[dict[str, object]] = []
@@ -494,6 +504,9 @@ def _save_active_context_state(
         resolved_project_constraints=list(resolved_project_constraints),
         recent_risks=list(recent_risks),
         compaction_level=compaction_level,
+        # 这里保存的是“本轮结束后”的最近一次 microcompact 时间。
+        # 下一轮如果直接命中 context_state，就能继续做时间节流判断。
+        last_microcompact_at=max(0.0, float(last_microcompact_at or 0.0)),
         compaction_history=history_entries,
         last_token_stats=build_token_stats_snapshot(
             preview_stats=preview_stats,
@@ -520,6 +533,7 @@ def _build_compacted_request(
     fixed_overhead_tokens: int,
     base_system_prompt: str,
     user_profile_context: str,
+    cached_state: ContextStateData | None,
     force_auto_compact: bool = False,
     analysis_mode: bool = False,
 ) -> tuple[ContextPipelineResult, str, ContextStats, list[ChatMessage]]:
@@ -536,6 +550,11 @@ def _build_compacted_request(
         auto_compact_snapshot=compact_memory_snapshot,
         force_auto_compact=force_auto_compact,
         pinned_tool_names=(_ANALYSIS_PINNED_TOOL_NAMES if analysis_mode else None),
+        # 命中缓存状态时，把上一次 microcompact 时间透传进 pipeline，
+        # 让轻量清理也具备跨轮次的连续性。
+        last_microcompact_at=(
+            cached_state.last_microcompact_at if cached_state is not None else 0.0
+        ),
     )
 
     session_snapshot = SessionData(

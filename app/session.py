@@ -87,6 +87,9 @@ class SessionData:
     def __post_init__(self) -> None:
         """初始化后补齐 meta，但不主动刷新时间。"""
         if self.meta is None:
+            # 这里不直接 refresh_meta，而是按已有 created/updated_at 构造。
+            # 原因是 SessionData 既可能来自“新建会话”，也可能来自“磁盘恢复”：
+            # 恢复场景如果一进来就 refresh，会把原始时间戳误改成当前时间。
             self.meta = SessionMeta(
                 session_id=self.session_id,
                 created_at=self.created_at,
@@ -121,12 +124,15 @@ class SessionData:
         self.meta.last_message = ""
 
         # 第一条 user 消息用于会话列表展示。
+        # 这里故意取“第一条”而不是“最后一条”，因为列表页更需要会话主题入口，
+        # 而不是最近一次中途工具输出或补充说明。
         for message in self.messages:
             if message.get("role") == "user":
                 self.meta.first_user_message = str(message.get("content", ""))[:100]
                 break
 
         # 最后一条有内容的消息用于快速识别最近状态。
+        # 这样恢复会话列表时，用户能同时看到“这个会话最初在聊什么”和“它停在什么位置”。
         for message in reversed(self.messages):
             content = str(message.get("content", "")).strip()
             if content:
@@ -230,6 +236,7 @@ def save_session(session: SessionData) -> Path:
     temp_file = session_file.with_suffix(".json.tmp")
 
     # 先写临时文件，再原子替换正式文件，避免写到一半损坏。
+    # 这对会话文件尤其重要：一旦用户正处在长链路调试中，半截 JSON 会直接让恢复能力失效。
     temp_file.write_text(
         json.dumps(session.to_dict(), ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
@@ -249,6 +256,8 @@ def load_session(workspace: str, session_id: str) -> SessionData | None:
         raw_data = json.loads(raw_text)
         if not isinstance(raw_data, dict):
             return None
+        # load 时不 refresh，目的是保留磁盘中的真实时间线；
+        # 否则“仅仅读取一次会话”也会看起来像刚刚被更新过。
         return SessionData.from_dict(raw_data, refresh=False)
     except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
         return None
@@ -275,6 +284,7 @@ def list_sessions(workspace: str) -> list[SessionMeta]:
                 continue
 
             # 兼容早期没有 meta 的旧数据。
+            # 这里临时从完整 SessionData 回填 meta，只用于展示，不反写磁盘。
             session = SessionData.from_dict(raw_data, refresh=False)
             if session.meta is not None:
                 metas.append(session.meta)

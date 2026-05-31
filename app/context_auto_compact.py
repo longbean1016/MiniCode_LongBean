@@ -45,6 +45,100 @@ class AutoCompactResult:
     summary_snapshot: CompactMemorySnapshot | None = None
 
 
+@dataclass(slots=True)
+class AutoCompactDispatcherConfig:
+    """
+    Auto Compact 调度配置。
+
+    当前项目仍使用既有阈值常量，只是把触发参数收口成配置对象，
+    这样更接近新版 MiniCode 的 dispatcher 结构。
+    """
+
+    trigger_ratio: float = AUTO_COMPACT_TRIGGER_RATIO
+    target_ratio: float = AUTO_COMPACT_TARGET_RATIO
+    tool_result_trigger_ratio: float = AUTO_COMPACT_TOOL_RESULT_TRIGGER_RATIO
+    repeated_scan_trigger_count: int = AUTO_COMPACT_REPEATED_SCAN_TRIGGER_COUNT
+
+
+class AutoCompactDispatcher:
+    """
+    对应新版 MiniCode 的 Auto Compact 调度器。
+
+    这个对象专门负责“是否触发”和“按何种顺序调度策略”，
+    具体的 session/full compact 细节仍复用当前项目已有实现。
+    """
+
+    def __init__(self, config: AutoCompactDispatcherConfig | None = None):
+        self._config = config or AutoCompactDispatcherConfig()
+
+    def should_trigger(
+        self,
+        *,
+        total_tokens: int,
+        usable_budget: int,
+        tool_result_tokens: int = 0,
+        repeated_scan_count: int = 0,
+    ) -> bool:
+        return should_trigger_auto_compact(
+            total_tokens=total_tokens,
+            usable_budget=usable_budget,
+            tool_result_tokens=tool_result_tokens,
+            repeated_scan_count=repeated_scan_count,
+        )
+
+    def dispatch(
+        self,
+        *,
+        messages: list[ChatMessage],
+        usable_budget: int,
+        summary_base: str,
+        summary_snapshot: CompactMemorySnapshot | None = None,
+        summary_source_messages: list[ChatMessage] | None = None,
+        fixed_overhead_tokens: int = 0,
+        force_full: bool = False,
+    ) -> AutoCompactResult:
+        # 在调度器入口统一计算 token 压力与扫描噪声。
+        # 这样旧入口和新入口最终都会走同一套触发条件。
+        current_messages = [dict(message) for message in messages]
+        tokens_before = fixed_overhead_tokens + estimate_messages_tokens(current_messages)
+        tool_result_tokens = _estimate_tool_result_tokens(current_messages)
+        repeated_scan_count = _count_repeated_scan_results(current_messages)
+
+        if not force_full and not self.should_trigger(
+            total_tokens=tokens_before,
+            usable_budget=usable_budget,
+            tool_result_tokens=tool_result_tokens,
+            repeated_scan_count=repeated_scan_count,
+        ):
+            return AutoCompactResult(
+                messages=current_messages,
+                tokens_before=tokens_before,
+                tokens_after=tokens_before,
+            )
+
+        if not force_full:
+            # 顺序上先尝试 session memory compact。
+            # 只有轻量摘要压不下去时，才退化到更重的 full compact。
+            session_result = _run_session_memory_compact(
+                messages=current_messages,
+                usable_budget=usable_budget,
+                summary_base=summary_base,
+                summary_snapshot=summary_snapshot,
+                fixed_overhead_tokens=fixed_overhead_tokens,
+            )
+            if session_result.applied:
+                return session_result
+
+        return _run_full_compact(
+            messages=current_messages,
+            usable_budget=usable_budget,
+            summary_base=summary_base,
+            summary_snapshot=summary_snapshot,
+            summary_source_messages=summary_source_messages,
+            fixed_overhead_tokens=fixed_overhead_tokens,
+        )
+
+
 def should_trigger_auto_compact(
     *,
     total_tokens: int,
@@ -84,41 +178,14 @@ def run_auto_compact(
     1. Session Memory Compact
     2. Full Compact
     """
-    current_messages = [dict(message) for message in messages]
-    tokens_before = fixed_overhead_tokens + estimate_messages_tokens(current_messages)
-    tool_result_tokens = _estimate_tool_result_tokens(current_messages)
-    repeated_scan_count = _count_repeated_scan_results(current_messages)
-
-    if not force_full and not should_trigger_auto_compact(
-        total_tokens=tokens_before,
-        usable_budget=usable_budget,
-        tool_result_tokens=tool_result_tokens,
-        repeated_scan_count=repeated_scan_count,
-    ):
-        return AutoCompactResult(
-            messages=current_messages,
-            tokens_before=tokens_before,
-            tokens_after=tokens_before,
-        )
-
-    if not force_full:
-        session_result = _run_session_memory_compact(
-            messages=current_messages,
-            usable_budget=usable_budget,
-            summary_base=summary_base,
-            summary_snapshot=summary_snapshot,
-            fixed_overhead_tokens=fixed_overhead_tokens,
-        )
-        if session_result.applied:
-            return session_result
-
-    return _run_full_compact(
-        messages=current_messages,
+    return AutoCompactDispatcher().dispatch(
+        messages=messages,
         usable_budget=usable_budget,
         summary_base=summary_base,
         summary_snapshot=summary_snapshot,
         summary_source_messages=summary_source_messages,
         fixed_overhead_tokens=fixed_overhead_tokens,
+        force_full=force_full,
     )
 
 

@@ -281,7 +281,8 @@ def _run_agent_loop(
             f"level={prepared_context.policy.level} keep_rounds={prepared_context.policy.keep_rounds} "
             f"older={len(prepared_context.history_window.older_messages)} recent={len(prepared_context.history_window.recent_messages)} "
             f"tool_truncated={prepared_context.compaction_result.truncated_tool_results} "
-            f"tool_cleared={prepared_context.compaction_result.cleared_old_tool_results}"
+            f"tool_cleared={prepared_context.compaction_result.cleared_old_tool_results} "
+            f"steps={','.join(prepared_context.pipeline_steps)}"
         )
         log_event(
             f"[session={session_id or '-'}] 第 {step_index + 1} 轮压缩前预估: "

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import tempfile
+import time
 import unittest
 from dataclasses import dataclass
 from unittest.mock import patch
@@ -1246,6 +1247,110 @@ class ContextCompactorTests(unittest.TestCase):
             )
         )
 
+    def test_context_pipeline_runs_lightweight_tool_budget_before_threshold(self) -> None:
+        from app.context_compactor_pipeline import ContextCompactorPipeline
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pipeline = ContextCompactorPipeline()
+            large_output = "\n".join(f"line-{index}" for index in range(1, 40))
+            result = pipeline.process_request(
+                messages=[
+                    {"role": "user", "content": "查看日志"},
+                    {"role": "assistant_tool_call", "tool_use_id": "call-1", "tool_name": "read_file", "input": {"path": "logs/app.log"}},
+                    {"role": "tool_result", "tool_use_id": "call-1", "tool_name": "read_file", "content": large_output},
+                ],
+                max_recent_tool_results=2,
+                truncate_tool_result_chars=40,
+                workspace=tmpdir,
+                usable_budget=128000,
+                fixed_overhead_tokens=0,
+                auto_compact_summary="",
+            )
+
+            self.assertIn("tool_budget", result.steps_taken)
+            self.assertEqual(result.auto_compact_result.applied, False)
+            self.assertGreaterEqual(result.compaction_result.truncated_tool_results, 1)
+            self.assertTrue(
+                any("_persisted_path" in message for message in result.messages)
+            )
+
+    def test_context_pipeline_microcompacts_old_tool_results_without_breaking_recent_pair(self) -> None:
+        from app.context_compactor_pipeline import ContextCompactorPipeline
+
+        pipeline = ContextCompactorPipeline()
+        messages = [
+            {"role": "user", "content": "分析调用链"},
+            {"role": "assistant_tool_call", "tool_use_id": "call-1", "tool_name": "read_file", "input": {"path": "app/a.py"}},
+            {"role": "tool_result", "tool_use_id": "call-1", "tool_name": "read_file", "content": "FILE: app/a.py\n\n" + ("A" * 3000), "meta": {"path": "app/a.py"}},
+            {"role": "assistant_tool_call", "tool_use_id": "call-2", "tool_name": "read_file", "input": {"path": "app/b.py"}},
+            {"role": "tool_result", "tool_use_id": "call-2", "tool_name": "read_file", "content": "FILE: app/b.py\n\n" + ("B" * 3000), "meta": {"path": "app/b.py"}},
+            {"role": "assistant_tool_call", "tool_use_id": "call-3", "tool_name": "read_file", "input": {"path": "app/c.py"}},
+            {"role": "tool_result", "tool_use_id": "call-3", "tool_name": "read_file", "content": "FILE: app/c.py\n\n" + ("C" * 3000), "meta": {"path": "app/c.py"}},
+        ]
+
+        result = pipeline.process_request(
+            messages=messages,
+            max_recent_tool_results=1,
+            truncate_tool_result_chars=10_000,
+            workspace="d:\\MiniCode-ByMyself",
+            usable_budget=10000,
+            fixed_overhead_tokens=0,
+            auto_compact_summary="",
+        )
+
+        self.assertIn("microcompact", result.steps_taken)
+        self.assertGreaterEqual(result.compaction_result.cleared_old_tool_results, 2)
+        self.assertTrue(
+            any(
+                message.get("role") == "tool_result"
+                and str(message.get("content", "")).startswith("[旧 tool_result 内容已由 microcompact 清理]")
+                for message in result.messages
+            )
+        )
+        self.assertTrue(
+            any(
+                message.get("role") == "assistant_tool_call"
+                and message.get("tool_use_id") == "call-3"
+                for message in result.messages
+            )
+        )
+        self.assertTrue(
+            any(
+                message.get("role") == "tool_result"
+                and message.get("tool_use_id") == "call-3"
+                and "FILE: app/c.py" in str(message.get("content", ""))
+                for message in result.messages
+            )
+        )
+
+    def test_context_pipeline_microcompact_respects_time_cooldown(self) -> None:
+        from app.context_compactor_pipeline import ContextCompactorPipeline
+
+        pipeline = ContextCompactorPipeline()
+        messages = [
+            {"role": "user", "content": "继续分析"},
+            {"role": "assistant_tool_call", "tool_use_id": "call-1", "tool_name": "read_file", "input": {"path": "app/a.py"}},
+            {"role": "tool_result", "tool_use_id": "call-1", "tool_name": "read_file", "content": "FILE: app/a.py\n\n" + ("A" * 3000)},
+            {"role": "assistant_tool_call", "tool_use_id": "call-2", "tool_name": "read_file", "input": {"path": "app/b.py"}},
+            {"role": "tool_result", "tool_use_id": "call-2", "tool_name": "read_file", "content": "FILE: app/b.py\n\n" + ("B" * 3000)},
+            {"role": "assistant_tool_call", "tool_use_id": "call-3", "tool_name": "read_file", "input": {"path": "app/c.py"}},
+            {"role": "tool_result", "tool_use_id": "call-3", "tool_name": "read_file", "content": "FILE: app/c.py\n\n" + ("C" * 3000)},
+        ]
+
+        result = pipeline.process_request(
+            messages=messages,
+            max_recent_tool_results=1,
+            truncate_tool_result_chars=10_000,
+            workspace="d:\\MiniCode-ByMyself",
+            usable_budget=10000,
+            fixed_overhead_tokens=0,
+            auto_compact_summary="",
+            last_microcompact_at=time.time(),
+        )
+
+        self.assertNotIn("microcompact", result.steps_taken)
+        self.assertEqual(result.compaction_result.cleared_old_tool_results, 0)
+
 
 class _FakeModel:
     def __init__(self) -> None:
@@ -2242,6 +2347,64 @@ class AgentLoopContextPolicyTests(unittest.TestCase):
             )
             self.assertTrue(state.compacted_messages)
             self.assertIn("preview_total", state.last_token_stats)
+
+    def test_prepare_agent_context_persists_last_microcompact_at_from_pipeline(self) -> None:
+        from app.context_auto_compact import AutoCompactResult
+        from app.context_compactor import CompactionResult
+        from app.context_compactor_pipeline import ContextPipelineResult
+        from app.context_runtime import prepare_agent_context
+        from app.context_state import load_context_state
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tool_registry = _FakeToolRegistry()
+            session = create_new_session(tmpdir)
+            session.extra["usable_context_budget"] = 10_000
+            working_memory = WorkingMemory()
+            working_memory.protect("验证 microcompact 时间戳会回写到 context_state", entry_type="user_intent")
+
+            full_history = [
+                {"role": "user", "content": "分析最近几次读取结果"},
+                {"role": "assistant_tool_call", "tool_use_id": "call-1", "tool_name": "read_file", "input": {"path": "app/a.py"}},
+                {"role": "tool_result", "tool_use_id": "call-1", "tool_name": "read_file", "content": "FILE: app/a.py\n\n" + ("A" * 3000)},
+                {"role": "assistant_tool_call", "tool_use_id": "call-2", "tool_name": "read_file", "input": {"path": "app/b.py"}},
+                {"role": "tool_result", "tool_use_id": "call-2", "tool_name": "read_file", "content": "FILE: app/b.py\n\n" + ("B" * 3000)},
+                {"role": "assistant_tool_call", "tool_use_id": "call-3", "tool_name": "read_file", "input": {"path": "app/c.py"}},
+                {"role": "tool_result", "tool_use_id": "call-3", "tool_name": "read_file", "content": "FILE: app/c.py\n\n" + ("C" * 3000)},
+                {"role": "assistant_tool_call", "tool_use_id": "call-4", "tool_name": "read_file", "input": {"path": "app/d.py"}},
+                {"role": "tool_result", "tool_use_id": "call-4", "tool_name": "read_file", "content": "FILE: app/d.py\n\n" + ("D" * 3000)},
+            ]
+
+            mocked_pipeline_result = ContextPipelineResult(
+                messages=list(full_history),
+                compaction_result=CompactionResult(messages=list(full_history)),
+                auto_compact_result=AutoCompactResult(messages=list(full_history)),
+                steps_taken=["tool_budget", "microcompact"],
+                compaction_history_entry={"microcompact_applied": True},
+                last_microcompact_at=1234.5,
+            )
+
+            with patch(
+                "app.context_runtime.ContextCompactorPipeline.process_request",
+                return_value=mocked_pipeline_result,
+            ):
+                prepare_agent_context(
+                    full_history=full_history,
+                    session=session,
+                    tool_registry=tool_registry,
+                    working_memory=working_memory,
+                    memory_pipeline=None,
+                    history_summarizer=None,
+                )
+
+            state = load_context_state(tmpdir, session.session_id)
+            self.assertIsNotNone(state)
+            assert state is not None
+            self.assertEqual(state.last_microcompact_at, 1234.5)
+            self.assertTrue(state.compaction_history)
+            self.assertEqual(
+                state.compaction_history[-1].get("microcompact_applied"),
+                True,
+            )
 
     def test_prepare_agent_context_persists_full_compact_semantic_snapshot(self) -> None:
         from app.context_runtime import prepare_agent_context

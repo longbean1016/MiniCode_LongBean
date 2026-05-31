@@ -10,9 +10,9 @@ from dotenv import load_dotenv
 from app.types import AppConfig
 
 
-# 加载当前项目目录下的 .env 文件。
-# 这里故意不覆盖已经存在的系统环境变量，
-# 改为False这样在做隔离测试时，可以通过临时环境变量覆盖 .env 中的默认配置。
+# 启动时先加载项目根目录下的 .env。
+# 当前使用 override=True，表示 .env 中的值会覆盖进当前进程环境；
+# 这里保持和现有运行行为一致，只把注释写清楚，避免阅读时代码与说明相互矛盾。
 load_dotenv(override=True)
 
 
@@ -25,6 +25,8 @@ def _get_env(name: str, default: str | None = None, required: bool = False) -> s
     - `default`: 默认值；变量不存在时回退到这里
     - `required`: 是否为必填项
     """
+    # 所有配置读取统一走这里，目的是把“默认值、必填校验、空字符串处理”收口到一个地方，
+    # 避免每个配置字段各自写一套 if/else，后续难以维护。
     value = os.getenv(name, default)
     if required and (value is None or value.strip() == ""):
         raise ValueError(f"Missing required environment variable: {name}")
@@ -87,6 +89,8 @@ def load_config() -> AppConfig:
     - `QDRANT_API_KEY`: Qdrant API Key（本地无鉴权时可留空）
     - `QDRANT_COLLECTION`: 向量集合名
     """
+    # 这里按“主模型 -> embedding / 向量 -> 重试熔断 -> decay”分组读取，
+    # 方便把配置结构和系统模块结构对应起来，减少排查时的跳转成本。
     api_key = _get_env("OPENAI_API_KEY", required=True)
     base_url = _get_env("OPENAI_BASE_URL", default="https://api.openai.com/v1")
     model = _get_env("OPENAI_MODEL", default="gpt-4o-mini")
@@ -100,6 +104,8 @@ def load_config() -> AppConfig:
 
     qdrant_enabled = _get_bool_env("QDRANT_ENABLED", default=False)
     qdrant_url = _get_env("QDRANT_URL", default="http://localhost:6333")
+    # Qdrant 本地路径统一解析到 workspace 下，
+    # 避免从不同启动目录运行时把向量数据散落到当前 shell 的 cwd。
     raw_qdrant_path = _get_env("QDRANT_PATH", default=".qdrant_storage").strip()
     qdrant_path = ""
     if raw_qdrant_path:
@@ -181,6 +187,8 @@ def load_config() -> AppConfig:
     decay_log_enabled = _get_bool_env("DECAY_LOG_ENABLED", default=True)
     decay_log_echo = _get_bool_env("DECAY_LOG_ECHO", default=False)
 
+    # AppConfig 是全局只读配置快照。
+    # main 启动后各组件都从这份对象取值，避免运行过程中再去读散落的环境变量。
     return AppConfig(
         api_key=api_key,
         base_url=base_url,

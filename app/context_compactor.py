@@ -24,6 +24,7 @@ _PREVIEW_LINE_CHAR_LIMIT = 160
 _READ_FILE_PATH_PATTERN = re.compile(r"^FILE:\s*(.+)$", re.MULTILINE)
 _HEADER_PATTERN = re.compile(r"^([A-Z_]+):\s*(.+)$")
 _SUMMARY_LINE_CHAR_LIMIT = 120
+_MICROCOMPACT_MARKER_PREFIX = "[旧 tool_result 内容已由 microcompact 清理]"
 
 
 @dataclass(slots=True)
@@ -102,14 +103,9 @@ def compact_recent_messages(
         if message.get("role") == "tool_result"
     }
 
-    current_tokens = estimate_messages_tokens(compacted)
-    if _is_within_target(current_tokens=current_tokens, target_tokens=target_tokens):
-        result.messages = compacted
-        return result
-
     effective_truncate_chars = _resolve_truncate_budget(
         base_truncate_chars=truncate_tool_result_chars,
-        current_tokens=current_tokens,
+        current_tokens=estimate_messages_tokens(compacted),
         target_tokens=target_tokens,
     )
     _truncate_large_tool_results(
@@ -161,6 +157,44 @@ def compact_recent_messages(
         compacted=compacted,
         target_tokens=target_tokens,
         protected_recent_messages=protected_recent_messages,
+        result=result,
+    )
+    result.messages = compacted
+    return result
+
+
+def microcompact_old_tool_results(
+    messages: list[ChatMessage],
+    *,
+    keep_recent_tool_results: int,
+    pinned_tool_names: set[str] | None = None,
+) -> CompactionResult:
+    """
+    轻量清理较旧 tool_result 的正文，保留协议结构和最近证据。
+
+    这一步不折叠为 assistant 摘要，也不删除 tool_call，只把较旧结果替换成
+    一个可识别的占位说明，行为上更接近新版 minicode 的 microcompact。
+    """
+    compacted = [
+        dict(message)
+        for message in messages
+        if message.get("role") != "assistant_progress"
+    ]
+    result = CompactionResult(messages=compacted)
+    result.dropped_progress_messages = max(0, len(messages) - len(compacted))
+
+    protected_tool_indexes = _collect_protected_tool_indexes(
+        compacted=compacted,
+        max_recent_tool_results=max(0, keep_recent_tool_results),
+        pinned_tools={
+            str(tool_name).strip()
+            for tool_name in (pinned_tool_names or set())
+            if str(tool_name).strip()
+        },
+    )
+    _microcompact_tool_results(
+        compacted=compacted,
+        protected_tool_indexes=protected_tool_indexes,
         result=result,
     )
     result.messages = compacted
@@ -233,6 +267,58 @@ def _truncate_large_tool_results(
         compacted[index]["_tool_result_preview"] = True
         result.truncated_tool_results += 1
         result.tokens_freed_estimate += max(0, len(original_content) - len(preview)) // 4
+
+
+def _microcompact_tool_results(
+    *,
+    compacted: list[ChatMessage],
+    protected_tool_indexes: set[int],
+    result: CompactionResult,
+) -> None:
+    """对较旧 tool_result 做正文清理，但保留 tool_result 结构供后续恢复。"""
+    for index, message in enumerate(compacted):
+        if message.get("role") != "tool_result":
+            continue
+        if index in protected_tool_indexes:
+            continue
+        if _is_already_microcompacted_tool_result(message):
+            continue
+
+        original_content = str(message.get("content", ""))
+        summary = _build_microcompact_summary(message)
+        if not summary or summary == original_content:
+            continue
+
+        compacted[index]["content"] = summary
+        compacted[index]["_microcompacted"] = True
+        result.cleared_old_tool_results += 1
+        result.tokens_freed_estimate += max(0, len(original_content) - len(summary)) // 4
+
+
+def _is_already_microcompacted_tool_result(message: ChatMessage) -> bool:
+    content = str(message.get("content", "")).strip()
+    if not content:
+        return False
+    if content.startswith(_MICROCOMPACT_MARKER_PREFIX):
+        return True
+    return bool(
+        message.get("_microcompacted")
+        or message.get("_tool_result_preview")
+        or message.get("_deduped_read_result")
+    )
+
+
+def _build_microcompact_summary(message: ChatMessage) -> str:
+    tool_name = str(message.get("tool_name", "") or "unknown")
+    meta = message.get("meta", {})
+    path = ""
+    if isinstance(meta, dict):
+        path = str(meta.get("path", "") or meta.get("file_path", "")).strip()
+
+    lines = [_MICROCOMPACT_MARKER_PREFIX, f"工具: {tool_name}"]
+    if path:
+        lines.append(f"路径: {path}")
+    return "\n".join(lines)
 
 
 def _dedupe_tool_results(
