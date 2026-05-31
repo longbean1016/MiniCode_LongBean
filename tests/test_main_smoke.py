@@ -276,6 +276,69 @@ class MainSmokeTests(unittest.TestCase):
             self.assertIn("## Custom Instructions", user_md)
             self.assertIn("- 回答尽量直接，修改代码时加中文注释", user_md)
 
+    def test_main_entry_smoke_supports_typed_user_add_commands(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            stdout = io.StringIO()
+
+            with patch.object(sys, "argv", ["main.py"]), patch(
+                "builtins.input",
+                side_effect=[
+                    "/user add identity 我的名字是长豆角，我给你取名字为小多",
+                    "/user add preferences 默认中文回答，回答尽量直接",
+                    "/user add custom 在tmp目录新建的代码不用帮我测试",
+                    "/user",
+                    "exit",
+                ],
+            ), patch.object(
+                main_module,
+                "load_config",
+                return_value=_build_test_config(tmpdir),
+            ), patch.object(
+                main_module,
+                "build_tool_registry",
+                return_value=_FakeToolRegistry(),
+            ), patch.object(
+                main_module,
+                "OpenAIModelAdapter",
+                return_value=_FakeModelAdapter("unexpected"),
+            ), patch.object(
+                main_module,
+                "LongTermMemoryExtractor",
+                return_value=_FakeExtractor([]),
+            ), patch.object(
+                main_module,
+                "MemoryVerifier",
+                return_value=_FakeVerifier(),
+            ), patch.object(
+                main_module,
+                "MemoryCurator",
+                return_value=_FakeCurator(),
+            ), patch.object(
+                main_module,
+                "MemoryDecay",
+                return_value=_FakeDecay(),
+            ), patch.object(
+                main_module,
+                "OlderHistorySummarizer",
+                return_value=_FakeSummarizer(),
+            ), redirect_stdout(stdout):
+                main_module.main()
+
+            output = stdout.getvalue()
+            self.assertIn("我的名字是长豆角", output)
+            self.assertIn("默认中文回答，回答尽量直接", output)
+            self.assertIn("在tmp目录新建的代码不用帮我测试", output)
+
+            with open(f"{tmpdir}\\USER.md", "r", encoding="utf-8") as handle:
+                user_md = handle.read()
+
+            self.assertIn("## Identity", user_md)
+            self.assertIn("- 我的名字是长豆角，我给你取名字为小多", user_md)
+            self.assertIn("## Preference Instructions", user_md)
+            self.assertIn("- 默认中文回答，回答尽量直接", user_md)
+            self.assertIn("## Custom Instructions", user_md)
+            self.assertIn("- 在tmp目录新建的代码不用帮我测试", user_md)
+
     def test_main_entry_smoke_supports_user_profile_manual_commands(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             stdout = io.StringIO()

@@ -868,6 +868,37 @@ class ContextManagerTests(unittest.TestCase):
             self.assertIn("修改代码时加中文注释", profile.to_preference_lines())
             self.assertIn("尽量最小改动", profile.to_preference_lines())
 
+    def test_user_profile_loader_parses_identity_and_preference_instruction_sections(self) -> None:
+        from app.user_profile import load_user_profile
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            user_md_path = f"{tmpdir}\\USER.md"
+            with open(user_md_path, "w", encoding="utf-8") as handle:
+                handle.write(
+                    "# User Profile\n\n"
+                    "## Identity\n"
+                    "- 我的名字是长豆角\n"
+                    "- 我给你取名字为小多\n\n"
+                    "## Preference Instructions\n"
+                    "- 默认中文回答\n"
+                    "- 回答尽量直接\n\n"
+                    "## Custom Instructions\n"
+                    "- 在tmp目录新建的代码不用帮我测试\n"
+                )
+
+            profile = load_user_profile(tmpdir)
+
+            self.assertIsNotNone(profile)
+            assert profile is not None
+            policy = profile.build_resolved_policy()
+            self.assertIn("我的名字是长豆角", policy.identity_lines)
+            self.assertIn("我给你取名字为小多", policy.identity_lines)
+            self.assertIn("默认中文回答", policy.global_preferences)
+            self.assertIn("回答尽量直接", policy.global_preferences)
+            self.assertTrue(
+                any("不用帮我测试" in rule.instruction for rule in policy.scoped_rules)
+            )
+
     def test_user_profile_loader_accepts_loose_manual_text_in_user_md(self) -> None:
         from app.user_profile import load_user_profile
 
@@ -918,6 +949,26 @@ class ContextManagerTests(unittest.TestCase):
             self.assertTrue(
                 any("longbean = 666" in rule.instruction for rule in policy.scoped_rules)
             )
+
+    def test_split_instruction_lines_uses_different_limits_for_different_categories(self) -> None:
+        from app.user_profile import UserProfileSnapshot
+
+        profile = UserProfileSnapshot(
+            identity_instructions="\n".join(f"- 身份{i}" for i in range(1, 10)),
+            preference_instructions="\n".join(f"- 偏好{i}" for i in range(1, 15)),
+            custom_instructions="\n".join(f"- 自由{i}" for i in range(1, 12)),
+        )
+
+        policy = profile.build_resolved_policy()
+        merged_lines = profile.to_preference_lines()
+
+        self.assertEqual(len(policy.identity_lines), 8)
+        self.assertIn("身份8", policy.identity_lines)
+        self.assertNotIn("身份9", policy.identity_lines)
+        self.assertIn("偏好12", merged_lines)
+        self.assertNotIn("偏好13", merged_lines)
+        self.assertIn("自由8", merged_lines)
+        self.assertNotIn("自由9", merged_lines)
 
 
 class ContextCompactorTests(unittest.TestCase):
