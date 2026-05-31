@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+"""文本搜索工具，负责在目录或文件范围内查找匹配内容。"""
+
 from pathlib import Path
 from typing import Any
 

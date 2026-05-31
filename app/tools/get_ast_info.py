@@ -3,6 +3,8 @@ from __future__ import annotations
 import ast
 from typing import Any
 
+"""AST 信息工具，输出源码的结构化语法树摘要。"""
+
 from app.tooling import ToolDefinition
 from app.tools._code_nav_common import (
     build_function_signature,

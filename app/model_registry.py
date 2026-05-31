@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Any
 
+"""模型适配层，负责把统一消息协议转成具体模型调用。"""
+
 from openai import OpenAI
 
 from app.circuit_breaker import CircuitBreaker, CircuitOpenError

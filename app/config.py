@@ -3,6 +3,8 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+"""应用配置加载模块，负责读取环境变量并构造统一配置对象。"""
+
 from dotenv import load_dotenv
 
 from app.types import AppConfig

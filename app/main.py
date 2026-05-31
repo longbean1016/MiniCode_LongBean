@@ -2,6 +2,8 @@
 
 import argparse
 
+"""命令行入口，负责启动会话、组装依赖并驱动整轮交互。"""
+
 from app.agent_loop import continue_agent_from_history, run_agent_once
 from app.config import load_config
 from app.memory_decay import MemoryDecay

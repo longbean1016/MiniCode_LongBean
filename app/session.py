@@ -7,6 +7,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+"""会话持久化模块，负责创建、加载、保存和列出本地会话。"""
+
 from app.types import ChatMessage
 
 

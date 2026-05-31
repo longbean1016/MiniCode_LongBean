@@ -4,6 +4,8 @@ import time
 from dataclasses import dataclass
 from typing import Callable, TypeVar
 
+"""通用重试工具，封装带回调的重试执行逻辑。"""
+
 
 T = TypeVar("T")
 

@@ -3,6 +3,8 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field
 
+"""工作记忆模块，维护当前任务的短期上下文和受保护条目。"""
+
 
 def _estimate_tokens(text: str) -> int:
     """轻量估算 token，用于约束受保护记忆自身的体积。"""

@@ -1,5 +1,7 @@
 
 
+"""系统提示词构造模块，负责拼装基础规则与用户偏好上下文。"""
+
 from app.tooling import ToolRegistry
 
 

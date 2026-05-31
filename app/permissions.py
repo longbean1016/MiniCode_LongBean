@@ -1,5 +1,7 @@
 
 
+"""权限控制模块，负责约束工具访问范围和高风险操作审批。"""
+
 from dataclasses import dataclass
 from pathlib import Path
 import re

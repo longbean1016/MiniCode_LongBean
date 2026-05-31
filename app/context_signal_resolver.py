@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+"""上下文信号解析模块，把运行状态转换成可用于决策的压缩信号。"""
+
 import re
 
 from app.memory_pipeline import MemoryPipeline

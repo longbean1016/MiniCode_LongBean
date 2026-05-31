@@ -9,6 +9,8 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+"""上下文压缩执行模块，负责裁剪消息历史并保留关键恢复信息。"""
+
 from app.context_manager import estimate_messages_tokens
 from app.types import ChatMessage
 

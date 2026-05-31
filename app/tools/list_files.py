@@ -1,3 +1,5 @@
+"""列目录工具，负责输出目录结构并控制返回规模。"""
+
 from pathlib import Path
 from typing import Any
 

@@ -1,4 +1,4 @@
-
+"""会话摘要辅助模块，用于生成轻量级的会话概览文本。"""
 
 from app.types import ChatMessage
 

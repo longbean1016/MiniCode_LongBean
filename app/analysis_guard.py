@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+"""代码分析专项护栏，负责证据跟踪、答案校验和收敛提示。"""
+
 import re
 
 from app.types import ToolResult

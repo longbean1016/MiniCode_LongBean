@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+"""运行时上下文装配层，负责拼接消息窗口、记忆注入和压缩结果。"""
+
 from app.compaction_policy import build_compaction_policy
 from app.context_compact_memory import (
     CompactMemorySnapshot,

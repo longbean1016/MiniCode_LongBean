@@ -4,6 +4,8 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
+"""用户偏好解析与规则生效模块，负责把 user.md 转成运行时策略。"""
+
 
 _SECTION_RE = re.compile(r"^##\s+(.+)$", re.MULTILINE)
 _KV_RE = re.compile(r"^-\s+\*\*(.+?)\*\*:\s*(.+)$")

@@ -2,6 +2,8 @@
 import subprocess
 from typing import Any
 
+"""命令执行工具，负责受控运行终端命令并返回截断后的输出。"""
+
 from app.permissions import PermissionManager
 from app.tooling import ToolDefinition
 from app.types import ToolContext, ToolResult

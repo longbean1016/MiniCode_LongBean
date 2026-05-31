@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 
+"""历史摘要模块，负责把较早轮次的对话压成可继续使用的摘要。"""
+
 from openai import OpenAI
 
 from app.circuit_breaker import CircuitBreaker

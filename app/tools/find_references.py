@@ -3,6 +3,8 @@ from __future__ import annotations
 import re
 from typing import Any
 
+"""引用查找工具，用于搜索符号在项目中的调用或引用位置。"""
+
 from app.tooling import ToolDefinition
 from app.tools._code_nav_common import (
     iter_python_files,

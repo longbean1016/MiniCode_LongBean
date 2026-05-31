@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+"""消息构造器，负责按协议顺序追加 user、assistant 和 tool 消息。"""
+
 from app.types import ChatMessage
 
 

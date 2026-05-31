@@ -5,6 +5,9 @@ from typing import Any, Callable, Literal, Protocol, TypedDict
  
 
 
+"""项目核心类型定义，集中声明消息、步骤、工具和配置协议。"""
+
+
 class ChatMessage(TypedDict,total=False):
     """
     表示一条对话消息，是主循环里最核心的消息结构。

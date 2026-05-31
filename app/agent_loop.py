@@ -1,5 +1,7 @@
 ﻿from __future__ import annotations
 
+"""Agent 主循环，负责模型调用、工具执行、审批中断与结果回写。"""
+
 import time
 
 from app.analysis_guard import (

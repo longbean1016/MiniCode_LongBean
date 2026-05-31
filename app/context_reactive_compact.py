@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+"""上下文溢出兜底模块，在请求失败后尝试做应急压缩恢复。"""
+
 from app.context_auto_compact import run_auto_compact
 from app.context_manager import estimate_messages_tokens
 from app.context_message_safety import is_internal_compaction_marker

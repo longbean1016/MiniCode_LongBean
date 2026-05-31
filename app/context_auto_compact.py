@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+"""自动压缩策略模块，负责在上下文逼近阈值时触发历史压缩。"""
+
 from app.context_compact_memory import (
     CompactMemorySnapshot,
     build_event_compact_memory_snapshot,

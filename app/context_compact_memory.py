@@ -3,6 +3,8 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
+"""压缩期记忆快照模块，负责提炼上下文压缩前后的核心记忆语义。"""
+
 from app.context_manager import estimate_tokens
 from app.types import ChatMessage
 from app.working_memory import WorkingMemory, WorkingMemoryEntry

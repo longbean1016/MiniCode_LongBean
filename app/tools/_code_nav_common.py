@@ -4,6 +4,8 @@ import ast
 from dataclasses import dataclass
 from pathlib import Path
 
+"""代码导航公共辅助模块，复用路径、AST 和输出格式化逻辑。"""
+
 from app.permissions import PermissionManager
 
 

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+"""上下文状态模型，描述当前窗口、预算和压缩后的阶段状态。"""
+
 import hashlib
 import json
 from dataclasses import dataclass, field

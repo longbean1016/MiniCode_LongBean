@@ -3,6 +3,8 @@ from __future__ import annotations
 import re
 from typing import Any
 
+"""符号定位工具，用于快速定位指定标识符的定义位置。"""
+
 from app.tooling import ToolDefinition
 from app.tools._code_nav_common import (
     build_function_signature,

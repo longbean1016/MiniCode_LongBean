@@ -4,6 +4,8 @@ import re
 from dataclasses import dataclass
 from typing import Any, Callable
 
+"""工具注册与执行基础设施，统一管理校验、调用和结果裁剪。"""
+
 from app.types import ToolContext, ToolResult
 
 

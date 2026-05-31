@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+"""消息安全辅助模块，负责过滤不合法或不完整的上下文消息结构。"""
+
 from app.types import ChatMessage
 
 

@@ -4,6 +4,8 @@ from pathlib import Path
 import re
 from typing import Any
 
+"""读取文件工具，按块返回源码内容并附带覆盖范围信息。"""
+
 from app.permissions import PermissionManager
 from app.tooling import ToolDefinition
 from app.types import ToolContext, ToolResult

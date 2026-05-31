@@ -4,6 +4,8 @@ import json
 import re
 from dataclasses import dataclass
 
+"""上下文管理器，维护消息列表和基础 token 使用统计。"""
+
 from app.types import ChatMessage
 
 

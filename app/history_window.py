@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+"""历史窗口模型，区分近期消息、较早消息和压缩边界。"""
+
 from app.session_summary import build_session_summary
 from app.types import ChatMessage
 
