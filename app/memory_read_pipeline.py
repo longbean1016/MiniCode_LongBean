@@ -232,6 +232,37 @@ def _format_long_term_memories(entries: list[MemoryEntry], max_chars_per_item: i
     return "\n".join(lines).strip()
 
 
+def _build_working_memory_brief(
+    working_memory: WorkingMemory | None,
+    *,
+    max_chars_per_item: int,
+) -> str:
+    """
+    只保留少量高价值 working memory。
+    新链路里它只是辅助信号，不再承担旧版“大段会话基线”的职责。
+    """
+    if working_memory is None:
+        return ""
+
+    slot_specs = (
+        ("当前任务", "active_task", 2),
+        ("关键决策", "key_decision", 2),
+        ("最近风险", "recent_risk", 2),
+        ("错误上下文", "error_context", 1),
+    )
+    lines: list[str] = []
+    for title, entry_type, limit in slot_specs:
+        entries = working_memory.get_entries_by_type(entry_type)[-limit:]
+        if not entries:
+            continue
+        lines.append(f"## {title}")
+        for entry in entries:
+            content = _shorten(entry.content, max_chars_per_item)
+            if content:
+                lines.append(f"- {content}")
+    return "\n".join(lines).strip()
+
+
 class MemoryReadPipeline:
     def __init__(
         self,
@@ -259,6 +290,9 @@ class MemoryReadPipeline:
         sections: list[str] = []
         session_summary = _shorten(session_summary_override, max_summary_chars)
         if not session_summary:
+            cached_active_summary = str(session.extra.get("active_context_summary", "")).strip()
+            session_summary = _shorten(cached_active_summary, max_summary_chars)
+        if not session_summary:
             cached_summary = str(session.extra.get("older_history_summary", "")).strip()
             session_summary = _shorten(cached_summary, max_summary_chars)
 
@@ -267,7 +301,10 @@ class MemoryReadPipeline:
 
         if working_memory is not None:
             try:
-                working_memory_text = working_memory.format_for_prompt().strip()
+                working_memory_text = _build_working_memory_brief(
+                    working_memory,
+                    max_chars_per_item=min(max_memory_chars_per_item, 120),
+                ).strip()
             except Exception:
                 working_memory_text = ""
 

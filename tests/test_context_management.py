@@ -1549,7 +1549,7 @@ class AgentLoopContextPolicyTests(unittest.TestCase):
             self.assertEqual(state.compaction_level, prepared.policy.level)
             self.assertTrue(state.compacted_messages)
             self.assertIn("preview_total", state.last_token_stats)
-            self.assertTrue(state.compact_memory_context.strip())
+            self.assertTrue(state.active_context_summary.strip())
             self.assertIn("默认使用中文回答", state.resolved_user_preferences)
 
     def test_prepare_agent_context_resolves_project_constraints_from_project_memory(self) -> None:
@@ -1622,7 +1622,7 @@ class AgentLoopContextPolicyTests(unittest.TestCase):
             self.assertTrue(
                 any("main.py" in item or "token" in item for item in state.resolved_project_constraints)
             )
-            self.assertIn("项目约束", prepared.compact_memory_context)
+            self.assertIn("项目约束", prepared.active_context_summary)
 
     def test_prepare_agent_context_filters_transient_execution_constraints_from_state(self) -> None:
         from app.context_runtime import prepare_agent_context
@@ -1732,27 +1732,27 @@ class AgentLoopContextPolicyTests(unittest.TestCase):
             self.assertIn("不需要帮我测试", str(prepared.messages[0].get("content", "")))
             self.assertNotIn("保留中文标题", str(prepared.messages[0].get("content", "")))
 
-    def test_build_compact_memory_context_merges_summary_and_working_memory(self) -> None:
-        from app.context_compact_memory import build_compact_memory_context
+    def test_build_active_context_summary_merges_summary_and_working_memory(self) -> None:
+        from app.context_compact_memory import build_active_context_summary
 
         working_memory = WorkingMemory()
         working_memory.protect("用户偏好：回答时优先用中文", entry_type="user_preference")
         working_memory.protect("项目约束：尽量不要改动 main.py", entry_type="project_constraint")
         working_memory.protect("最近风险：上下文过长时需要优先压缩工具结果", entry_type="error_context")
 
-        compact_memory_context = build_compact_memory_context(
+        active_context_summary = build_active_context_summary(
             older_history_summary="旧对话摘要：最近主要在整理上下文压缩链路。",
             working_memory=working_memory,
         )
 
-        self.assertIn("压缩记忆基线", compact_memory_context)
-        self.assertIn("旧对话摘要", compact_memory_context)
-        self.assertIn("用户偏好", compact_memory_context)
-        self.assertIn("项目约束", compact_memory_context)
-        self.assertIn("最近风险", compact_memory_context)
+        self.assertIn("压缩记忆基线", active_context_summary)
+        self.assertIn("旧对话摘要", active_context_summary)
+        self.assertIn("用户偏好", active_context_summary)
+        self.assertIn("项目约束", active_context_summary)
+        self.assertIn("最近风险", active_context_summary)
 
-    def test_build_compact_memory_context_prioritizes_preferences_constraints_and_risks(self) -> None:
-        from app.context_compact_memory import build_compact_memory_context
+    def test_build_active_context_summary_prioritizes_preferences_constraints_and_risks(self) -> None:
+        from app.context_compact_memory import build_active_context_summary
 
         working_memory = WorkingMemory()
         working_memory.protect("默认使用中文回答，并尽量把结论放在前面。", entry_type="user_preference", importance=1.0)
@@ -1766,24 +1766,24 @@ class AgentLoopContextPolicyTests(unittest.TestCase):
                 importance=0.4,
             )
 
-        compact_memory_context = build_compact_memory_context(
+        active_context_summary = build_active_context_summary(
             older_history_summary="旧对话摘要：" + ("这里是一些较长但优先级更低的上下文。 " * 20),
             working_memory=working_memory,
         )
 
-        self.assertIn("用户偏好", compact_memory_context)
-        self.assertIn("项目约束", compact_memory_context)
-        self.assertIn("最近风险", compact_memory_context)
-        self.assertIn("main.py", compact_memory_context)
-        self.assertIn("tool_result", compact_memory_context)
+        self.assertIn("用户偏好", active_context_summary)
+        self.assertIn("项目约束", active_context_summary)
+        self.assertIn("最近风险", active_context_summary)
+        self.assertIn("main.py", active_context_summary)
+        self.assertIn("tool_result", active_context_summary)
 
-    def test_build_compact_memory_context_skips_transient_carry_over_sections(self) -> None:
-        from app.context_compact_memory import build_compact_memory_context
+    def test_build_active_context_summary_skips_transient_carry_over_sections(self) -> None:
+        from app.context_compact_memory import build_active_context_summary
 
-        compact_memory_context = build_compact_memory_context(
+        active_context_summary = build_active_context_summary(
             older_history_summary="",
             working_memory=WorkingMemory(),
-            previous_compact_memory_context=(
+            previous_active_context_summary=(
                 "压缩记忆基线\n"
                 "## 用户偏好\n"
                 "- 默认使用中文回答\n"
@@ -1796,14 +1796,14 @@ class AgentLoopContextPolicyTests(unittest.TestCase):
             ),
         )
 
-        self.assertIn("上次压缩延续", compact_memory_context)
-        self.assertIn("默认使用中文回答", compact_memory_context)
-        self.assertIn("复用上一次压缩基线", compact_memory_context)
-        self.assertNotIn("最多允许 8 次工具调用", compact_memory_context)
-        self.assertNotIn("tmp/real_chain_outputs", compact_memory_context)
+        self.assertIn("上次压缩延续", active_context_summary)
+        self.assertIn("默认使用中文回答", active_context_summary)
+        self.assertIn("复用上一次压缩基线", active_context_summary)
+        self.assertNotIn("最多允许 8 次工具调用", active_context_summary)
+        self.assertNotIn("tmp/real_chain_outputs", active_context_summary)
 
-    def test_build_compact_memory_snapshot_uses_structured_sections_instead_of_free_text_carry_over(self) -> None:
-        from app.context_compact_memory import build_compact_memory_snapshot, render_compact_memory_context
+    def test_build_active_context_snapshot_uses_structured_sections_instead_of_free_text_carry_over(self) -> None:
+        from app.context_compact_memory import build_active_context_snapshot, render_active_context_summary
 
         working_memory = WorkingMemory()
         working_memory.protect("当前活跃任务：重构上下文压缩链路", entry_type="active_task", importance=0.9)
@@ -1818,7 +1818,7 @@ class AgentLoopContextPolicyTests(unittest.TestCase):
             "open_issues": ["旧问题：不应该覆盖本轮风险"],
         }
 
-        snapshot = build_compact_memory_snapshot(
+        snapshot = build_active_context_snapshot(
             older_history_summary="旧对话摘要：当前主要在治理上下文压缩污染。",
             working_memory=working_memory,
             previous_snapshot=previous_snapshot,
@@ -1826,7 +1826,7 @@ class AgentLoopContextPolicyTests(unittest.TestCase):
             resolved_project_constraints=["不要把太多上下文管理逻辑塞进 main.py"],
             recent_risks=["最近风险：目录树类噪音可能误入 recent_risk"],
         )
-        rendered = render_compact_memory_context(snapshot)
+        rendered = render_active_context_summary(snapshot)
 
         self.assertEqual(snapshot["preferences"][:2], ["回答尽量直接", "默认使用中文回答"])
         self.assertIn("不要把太多上下文管理逻辑塞进 main.py", snapshot["stable_constraints"])
@@ -1921,7 +1921,7 @@ class AgentLoopContextPolicyTests(unittest.TestCase):
                 )
             )
 
-    def test_run_auto_compact_uses_compact_memory_context_in_summary_base(self) -> None:
+    def test_run_auto_compact_uses_active_context_summary_in_summary_base(self) -> None:
         from app.context_auto_compact import _run_session_memory_compact
 
         messages = [
@@ -2082,10 +2082,10 @@ class AgentLoopContextPolicyTests(unittest.TestCase):
         self.assertIn("重复扫描的 tool_result", marker)
         self.assertIn("resolved_project_constraints 分离", marker)
 
-    def test_build_event_compact_memory_snapshot_prefers_semantic_tool_findings(self) -> None:
-        from app.context_compact_memory import build_event_compact_memory_snapshot
+    def test_build_active_context_event_snapshot_prefers_semantic_tool_findings(self) -> None:
+        from app.context_compact_memory import build_active_context_event_snapshot
 
-        snapshot = build_event_compact_memory_snapshot(
+        snapshot = build_active_context_event_snapshot(
             removed_messages=[
                 {"role": "user", "content": "请分析为什么上下文压缩后丢掉了核心结论。"},
                 {"role": "assistant_tool_call", "tool_name": "read_file", "content": "{\"path\": \"tmp/demo.txt\"}"},
@@ -2282,7 +2282,7 @@ class AgentLoopContextPolicyTests(unittest.TestCase):
             )
         )
 
-    def test_prepare_agent_context_restores_compact_memory_context_from_cached_state(self) -> None:
+    def test_prepare_agent_context_restores_active_context_from_cached_state(self) -> None:
         from app.context_runtime import prepare_agent_context
         from app.context_state import ContextStateData, build_history_fingerprint, load_context_state, save_context_state
 
@@ -2293,7 +2293,7 @@ class AgentLoopContextPolicyTests(unittest.TestCase):
             working_memory = WorkingMemory()
             working_memory.protect("继续处理上下文压缩恢复", entry_type="user_intent")
 
-            cached_compact_memory_context = (
+            cached_active_context_summary = (
                 "压缩记忆基线\n"
                 "## 稳定事实\n"
                 "1. 当前目标是复用上一次压缩基线，而不是重新拼 older_history_summary。"
@@ -2306,7 +2306,7 @@ class AgentLoopContextPolicyTests(unittest.TestCase):
                     source_history_fingerprint=build_history_fingerprint([]),
                     compacted_messages=[],
                     older_history_summary="旧摘要：这段文字不应该优先进入会话压缩摘要。",
-                    compact_memory_context=cached_compact_memory_context,
+                    active_context_summary=cached_active_context_summary,
                 ),
             )
 
@@ -2317,7 +2317,7 @@ class AgentLoopContextPolicyTests(unittest.TestCase):
                 {"role": "assistant", "content": "因为这份基线已经是上次压缩阶段沉淀过的信息，比重新拼接更稳定。" * 9},
                 {"role": "user", "content": "同时还要保证最近几轮完整消息继续保留，不然模型会丢掉紧邻当前问题的上下文。" * 10},
                 {"role": "assistant", "content": "所以 session compact 只应该折叠较早消息，把尾部 recent window 继续保留下来。" * 9},
-                {"role": "user", "content": "如果恢复后又遇到高压，就继续用 compact_memory_context 作为摘要基线，而不是回退到旧摘要。" * 10},
+                {"role": "user", "content": "如果恢复后又遇到高压，就继续用 active_context_summary 作为摘要基线，而不是回退到旧摘要。" * 10},
                 {"role": "assistant", "content": "最后还要确认新的 context_state 会继续保存这份基线，供下一轮同 session 复用。" * 9},
             ]
 
@@ -2336,13 +2336,13 @@ class AgentLoopContextPolicyTests(unittest.TestCase):
             self.assertTrue(
                 any(
                     "复用上一次压缩基线" in item
-                    for item in prepared.compact_memory_snapshot.get("tool_findings", [])
+                    for item in prepared.active_context_snapshot.get("tool_findings", [])
                 )
             )
             self.assertTrue(
                 any(
                     "复用上一次压缩基线" in item
-                    for item in state.compact_memory_snapshot.get("tool_findings", [])
+                    for item in state.active_context_snapshot.get("tool_findings", [])
                 )
             )
             self.assertTrue(state.compacted_messages)
@@ -2449,10 +2449,10 @@ class AgentLoopContextPolicyTests(unittest.TestCase):
             self.assertIsNotNone(state)
             assert state is not None
             self.assertEqual(state.compaction_history[-1].get("auto_compact_strategy"), "full")
-            self.assertIn("resolved_project_constraints 分离", state.compact_memory_context)
-            self.assertIn("回写到 state", state.compact_memory_context)
-            self.assertIn("resolved_project_constraints 分离", prepared.compact_memory_context)
-            self.assertIn("重复扫描的 tool_result", prepared.compact_memory_context)
+            self.assertIn("resolved_project_constraints 分离", state.active_context_summary)
+            self.assertIn("回写到 state", state.active_context_summary)
+            self.assertIn("resolved_project_constraints 分离", prepared.active_context_summary)
+            self.assertIn("重复扫描的 tool_result", prepared.active_context_summary)
 
     def test_prepare_agent_context_auto_compact_handles_large_text_history(self) -> None:
         from app.context_runtime import prepare_agent_context
@@ -2963,3 +2963,5 @@ class AgentLoopContextPolicyTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+

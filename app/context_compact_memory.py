@@ -164,49 +164,56 @@ _SECTION_SPECS = (
 )
 
 
-def build_compact_memory_context(
+def build_active_context_summary(
     *,
     older_history_summary: str,
     working_memory: WorkingMemory,
-    previous_compact_memory_context: str = "",
+    previous_active_context_summary: str = "",
     previous_snapshot: CompactMemorySnapshot | None = None,
     resolved_user_preferences: list[str] | None = None,
     resolved_project_constraints: list[str] | None = None,
     recent_risks: list[str] | None = None,
 ) -> str:
-    """把结构化 compact memory 快照渲染成压缩阶段使用的短摘要基线。"""
-    snapshot = build_compact_memory_snapshot(
+    """
+    构造“活动上下文摘要”。
+
+    这是新版链路里真正给下一轮请求复用的主摘要基线，不再把旧 compact memory
+    视为主接口；旧接口只保留兼容包装。
+    """
+    snapshot = build_active_context_snapshot(
         older_history_summary=older_history_summary,
         working_memory=working_memory,
         previous_snapshot=previous_snapshot,
-        previous_compact_memory_context=previous_compact_memory_context,
+        previous_active_context_summary=previous_active_context_summary,
         resolved_user_preferences=resolved_user_preferences,
         resolved_project_constraints=resolved_project_constraints,
         recent_risks=recent_risks,
     )
-    return render_compact_memory_context(snapshot)
+    return render_active_context_summary(snapshot)
 
 
-def build_compact_memory_snapshot(
+def build_active_context_snapshot(
     *,
     older_history_summary: str,
     working_memory: WorkingMemory,
     previous_snapshot: CompactMemorySnapshot | None = None,
-    previous_compact_memory_context: str = "",
+    previous_active_context_summary: str = "",
     resolved_user_preferences: list[str] | None = None,
     resolved_project_constraints: list[str] | None = None,
     recent_risks: list[str] | None = None,
 ) -> CompactMemorySnapshot:
     """
-    构造结构化 compact memory 快照。
+    构造结构化活动上下文快照。
 
-    这里不再把上一版自由文本整段递归喂回来，而是优先续带已结构化的稳定字段。
-    只有兼容旧数据时，才从上一版 compact_memory_context 尝试解析少量可续带内容。
+    这里沿用新版 MiniCode 思路：
+    1. 优先复用结构化快照，而不是整段自由文本回灌。
+    2. older_history_summary 只作为低优先级原料，不再主导最终注入基线。
+    3. 只有兼容旧数据时，才从 legacy active context 摘要文本 解析少量可续带内容。
     """
     carry_snapshot = _normalize_snapshot(previous_snapshot)
     if not carry_snapshot:
         carry_snapshot = _normalize_snapshot(
-            _snapshot_from_previous_context(previous_compact_memory_context)
+            _snapshot_from_previous_context(previous_active_context_summary)
         )
     protected_snapshot = _normalize_snapshot(working_memory.build_protected_snapshot())
     snapshot: CompactMemorySnapshot = {}
@@ -277,12 +284,12 @@ def build_compact_memory_snapshot(
     return {key: lines for key, lines in snapshot.items() if lines}
 
 
-def parse_compact_memory_context(text: str) -> CompactMemorySnapshot:
-    """把 compact memory 文本解析回结构化快照，供恢复和全量压缩复用。"""
+def parse_active_context_summary(text: str) -> CompactMemorySnapshot:
+    """把活动上下文摘要解析回结构化快照，供恢复和全量压缩复用。"""
     return _normalize_snapshot(_snapshot_from_previous_context(text))
 
 
-def merge_compact_memory_snapshots(
+def merge_active_context_snapshots(
     *,
     base_snapshot: CompactMemorySnapshot | None,
     overlay_snapshot: CompactMemorySnapshot | None,
@@ -308,7 +315,7 @@ def merge_compact_memory_snapshots(
     return merged
 
 
-def build_event_compact_memory_snapshot(
+def build_active_context_event_snapshot(
     *,
     removed_messages: list[ChatMessage],
 ) -> CompactMemorySnapshot:
@@ -376,13 +383,18 @@ def build_event_compact_memory_snapshot(
     return snapshot
 
 
-def render_compact_memory_context(
+def render_active_context_summary(
     snapshot: CompactMemorySnapshot,
     *,
     section_specs: tuple[tuple[str, int, int, int], ...] = _DEFAULT_RENDER_SECTION_SPECS,
     max_tokens: int = COMPACT_MEMORY_MAX_TOKENS,
 ) -> str:
-    """把结构化快照按预算渲染成 compact memory 文本。"""
+    """
+    把结构化快照按预算渲染成活动上下文摘要。
+
+    这份文本会直接作为下一轮请求的基线，因此优先保留决策、风险、工具结论，
+    而不是把整段 older_history_summary 原样塞回去。
+    """
     normalized_snapshot = _normalize_snapshot(snapshot)
     lines: list[str] = ["结构化压缩记忆", "压缩记忆基线"]
 
@@ -402,9 +414,9 @@ def render_compact_memory_context(
     return "\n".join(lines).strip()
 
 
-def render_full_compact_memory_context(snapshot: CompactMemorySnapshot) -> str:
+def render_full_active_context_summary(snapshot: CompactMemorySnapshot) -> str:
     """full compact 场景下优先渲染语义核心，避免任务/偏好占掉摘要预算。"""
-    return render_compact_memory_context(
+    return render_active_context_summary(
         snapshot,
         section_specs=_FULL_COMPACT_RENDER_SECTION_SPECS,
     )
@@ -759,7 +771,7 @@ def _merge_ranked_snapshot_lines(
 def _build_summary_fallback_section(
     *,
     older_history_summary: str,
-    previous_compact_memory_context: str,
+    previous_active_context_summary: str,
 ) -> list[str]:
     """
     构造低优先级兜底层。
@@ -773,7 +785,7 @@ def _build_summary_fallback_section(
         lines.append("## 旧对话摘要")
         lines.append(_shorten(normalized_summary, 140))
 
-    carry_lines = _extract_previous_baseline_lines(previous_compact_memory_context)
+    carry_lines = _extract_previous_baseline_lines(previous_active_context_summary)
     if carry_lines:
         lines.append("## 上次压缩延续")
         lines.extend(carry_lines[:3])
@@ -781,12 +793,12 @@ def _build_summary_fallback_section(
     return lines
 
 
-def _snapshot_from_previous_context(previous_compact_memory_context: str) -> CompactMemorySnapshot:
+def _snapshot_from_previous_context(previous_active_context_summary: str) -> CompactMemorySnapshot:
     """兼容旧数据：把上一版自由文本基线尽量解析回结构化快照。"""
     snapshot: CompactMemorySnapshot = {}
     current_key = ""
 
-    for raw_line in previous_compact_memory_context.splitlines():
+    for raw_line in previous_active_context_summary.splitlines():
         line = raw_line.strip()
         if not line or line in {"压缩记忆基线", "结构化压缩记忆"}:
             continue
@@ -829,11 +841,11 @@ def _normalize_snapshot(snapshot: CompactMemorySnapshot | object) -> CompactMemo
     return normalized
 
 
-def _extract_previous_baseline_lines(previous_compact_memory_context: str) -> list[str]:
+def _extract_previous_baseline_lines(previous_active_context_summary: str) -> list[str]:
     """从上一版 compact memory 中提取可延续的有效内容，避免递归复制标题。"""
     result: list[str] = []
     current_section = ""
-    for raw_line in previous_compact_memory_context.splitlines():
+    for raw_line in previous_active_context_summary.splitlines():
         line = raw_line.strip()
         if not line:
             continue
@@ -946,3 +958,4 @@ def _looks_like_structured_noise(text: str) -> bool:
     if normalized.count("/") >= 4 and " " not in normalized:
         return True
     return False
+

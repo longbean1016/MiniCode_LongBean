@@ -7,8 +7,8 @@ from dataclasses import dataclass
 from app.compaction_policy import build_compaction_policy
 from app.context_compact_memory import (
     CompactMemorySnapshot,
-    build_compact_memory_snapshot,
-    render_compact_memory_context,
+    build_active_context_snapshot,
+    render_active_context_summary,
 )
 from app.context_auto_compact import AUTO_COMPACT_TRIGGER_RATIO
 from app.context_compactor import CompactionResult
@@ -75,9 +75,9 @@ class PreparedAgentContext:
     policy: ContextPolicy
     preview_stats: ContextStats
     stats: ContextStats
+    active_context_summary: str
+    active_context_snapshot: CompactMemorySnapshot
     older_history_summary: str
-    compact_memory_context: str
-    compact_memory_snapshot: CompactMemorySnapshot
     resolved_user_preferences: list[str]
     resolved_user_policy: ResolvedUserPolicy
     active_user_rules: list[UserPolicyRule]
@@ -102,14 +102,10 @@ def prepare_agent_context(
     """
     组装一次模型调用前的上下文。
 
-    当前保留的核心逻辑：
-    - token 预估
-    - 压力 -> policy
-    - memory shrink
-    - older history summary
-
-    同时把 recent window 的上下文治理统一交给 ContextCompactorPipeline，
-    并把 compact 后的 active context 单独保存到 context_state。
+    主链路已经统一为 active_context_*：
+    1. 先根据预估压力决定压缩级别。
+    2. 再构造 active context 摘要与快照。
+    3. 最后交给 pipeline 处理 recent window、tool_result 和 auto compact。
     """
     usable_budget = _resolve_usable_budget(session)
     analysis_mode = _infer_analysis_mode_from_history(full_history)
@@ -138,7 +134,7 @@ def prepare_agent_context(
         initial_keep_rounds=max(6, initial_policy.keep_rounds),
     )
     preview_memory_context = _build_preview_memory_context(
-        older_history_summary=preview_summary,
+        active_context_summary=preview_summary,
         working_memory=working_memory,
     )
     preview_stats = collect_context_stats(
@@ -152,13 +148,12 @@ def prepare_agent_context(
     policy = decide_context_policy(preview_stats, analysis_mode=analysis_mode)
     session.extra["compaction_level"] = policy.level
 
-    # 命中可复用的 context_state 时，优先在旧 active context 上追加增量消息。
+    # 命中可复用的 active context 时，优先走增量恢复，
+    # 避免每一轮都从 full_history 重新切一次 recent window。
     restored_recent_messages = _try_restore_recent_messages(
         full_history=full_history,
         cached_state=cached_state,
     )
-    # 命中可复用的 active context 时，优先走增量恢复，
-    # 避免每一轮都从 full_history 重新切一次 recent window。
     if restored_recent_messages is not None:
         history_window = HistoryWindow(
             older_messages=[],
@@ -172,14 +167,11 @@ def prepare_agent_context(
             history=full_history,
             keep_rounds=policy.keep_rounds,
         )
-        if history_summarizer is not None:
-            older_history_summary = history_summarizer.summarize(
-                session=session,
-                older_messages=history_window.older_messages,
-                older_round_count=history_window.older_round_count,
-            )
-        else:
-            older_history_summary = build_older_history_summary(history_window.older_messages)
+        older_history_summary = _build_compaction_summary(
+            history_window=history_window,
+            session=session,
+            history_summarizer=history_summarizer,
+        )
 
     resolved_project_constraints = resolve_project_constraints(
         memory_pipeline=memory_pipeline,
@@ -190,7 +182,7 @@ def prepare_agent_context(
         cached_risks=cached_state.recent_risks if cached_state is not None else [],
     )
 
-    compact_memory_snapshot, compact_memory_context = _resolve_compact_memory_context(
+    active_context_snapshot, active_context_summary = _resolve_active_context(
         older_history_summary=older_history_summary,
         working_memory=working_memory,
         cached_state=cached_state,
@@ -214,26 +206,24 @@ def prepare_agent_context(
         session=session,
         working_memory=working_memory,
         memory_pipeline=memory_pipeline,
-        older_history_summary=older_history_summary,
-        compact_memory_context=compact_memory_context,
-        compact_memory_snapshot=compact_memory_snapshot,
+        active_context_summary=active_context_summary,
+        active_context_snapshot=active_context_snapshot,
         tool_registry=tool_registry,
         usable_budget=usable_budget,
         fixed_overhead_tokens=fixed_overhead_tokens,
         base_system_prompt=base_system_prompt,
         user_profile_context=user_profile_context,
-        # 把缓存状态直接传给压缩流水线，让新版 microcompact 节流能接上旧轮次。
+        # 把缓存状态直接传给压缩流水线，让 microcompact 节流能接上旧轮次。
         cached_state=cached_state,
         analysis_mode=analysis_mode,
     )
-    compact_memory_snapshot = (
-        pipeline_result.resolved_compact_memory_snapshot or compact_memory_snapshot
+    active_context_snapshot = (
+        pipeline_result.resolved_active_context_snapshot or active_context_snapshot
     )
-    compact_memory_context = (
-        pipeline_result.resolved_compact_memory_context or compact_memory_context
+    active_context_summary = (
+        pipeline_result.resolved_active_context_summary or active_context_summary
     )
 
-    # 如果 memory 注入后上下文还是高压状态，再强制走一次 auto compact。
     # 如果 memory 注入之后上下文还是高压，就再强制走一次 auto compact。
     # 这一步是第二道保险，避免“摘要已经做了，但 memory 一加回来又超压”。
     if (
@@ -251,9 +241,8 @@ def prepare_agent_context(
             session=session,
             working_memory=working_memory,
             memory_pipeline=memory_pipeline,
-            older_history_summary=older_history_summary,
-            compact_memory_context=compact_memory_context,
-            compact_memory_snapshot=compact_memory_snapshot,
+            active_context_summary=active_context_summary,
+            active_context_snapshot=active_context_snapshot,
             tool_registry=tool_registry,
             usable_budget=usable_budget,
             fixed_overhead_tokens=fixed_overhead_tokens,
@@ -265,19 +254,19 @@ def prepare_agent_context(
             cached_state=cached_state,
             analysis_mode=analysis_mode,
         )
-        compact_memory_snapshot = (
-            pipeline_result.resolved_compact_memory_snapshot or compact_memory_snapshot
+        active_context_snapshot = (
+            pipeline_result.resolved_active_context_snapshot or active_context_snapshot
         )
-        compact_memory_context = (
-            pipeline_result.resolved_compact_memory_context or compact_memory_context
+        active_context_summary = (
+            pipeline_result.resolved_active_context_summary or active_context_summary
         )
 
     _save_active_context_state(
         full_history=full_history,
         session=session,
+        active_context_summary=active_context_summary,
+        active_context_snapshot=active_context_snapshot,
         older_history_summary=older_history_summary,
-        compact_memory_snapshot=compact_memory_snapshot,
-        compact_memory_context=compact_memory_context,
         resolved_user_preferences=resolved_user_preferences,
         resolved_project_constraints=resolved_project_constraints,
         recent_risks=recent_risks,
@@ -289,6 +278,8 @@ def prepare_agent_context(
         compaction_level=policy.level,
         # 把最新 microcompact 时间写回 context_state，供下一轮增量恢复继续复用。
         last_microcompact_at=pipeline_result.last_microcompact_at,
+        auto_compact_failure_count=pipeline_result.auto_compact_failure_count,
+        auto_compact_suppressed_until=pipeline_result.auto_compact_suppressed_until,
     )
 
     return PreparedAgentContext(
@@ -296,9 +287,9 @@ def prepare_agent_context(
         policy=policy,
         preview_stats=preview_stats,
         stats=final_stats,
+        active_context_summary=active_context_summary,
+        active_context_snapshot=active_context_snapshot,
         older_history_summary=older_history_summary,
-        compact_memory_context=compact_memory_context,
-        compact_memory_snapshot=compact_memory_snapshot,
         resolved_user_preferences=resolved_user_preferences,
         resolved_user_policy=resolved_user_policy,
         active_user_rules=active_user_rules,
@@ -338,14 +329,18 @@ def _infer_analysis_mode_from_history(full_history: list[ChatMessage]) -> bool:
     return False
 
 
-def _build_preview_memory_context(*, older_history_summary: str, working_memory: WorkingMemory) -> str:
+def _build_preview_memory_context(
+    *,
+    active_context_summary: str,
+    working_memory: WorkingMemory,
+) -> str:
     """构造预估阶段的轻量 memory_context，不触发长期记忆检索。"""
     sections: list[str] = []
-    if older_history_summary.strip():
-        sections.append(older_history_summary.strip())
+    if active_context_summary.strip():
+        sections.append(active_context_summary.strip())
 
     try:
-        working_memory_text = working_memory.format_for_prompt().strip()
+        working_memory_text = _build_preview_working_memory_brief(working_memory)
     except Exception:
         working_memory_text = ""
 
@@ -353,6 +348,47 @@ def _build_preview_memory_context(*, older_history_summary: str, working_memory:
         sections.append(working_memory_text)
 
     return "\n".join(sections).strip()
+
+
+def _build_preview_working_memory_brief(working_memory: WorkingMemory) -> str:
+    """预估阶段只保留少量高价值 working memory，避免预估值过度膨胀。"""
+    sections: list[str] = []
+    slot_specs = (
+        ("当前任务", "active_task", 2),
+        ("关键决策", "key_decision", 2),
+        ("最近风险", "recent_risk", 2),
+        ("错误上下文", "error_context", 1),
+    )
+    for title, entry_type, limit in slot_specs:
+        entries = working_memory.get_entries_by_type(entry_type)[-limit:]
+        if not entries:
+            continue
+        sections.append(f"## {title}")
+        for entry in entries:
+            content = " ".join(str(entry.content).strip().split())
+            if content:
+                sections.append(f"- {content[:120]}")
+    return "\n".join(sections).strip()
+
+
+def _build_compaction_summary(
+    *,
+    history_window: HistoryWindow,
+    session: SessionData,
+    history_summarizer: OlderHistorySummarizer | None,
+) -> str:
+    """
+    构造 older history 的压缩摘要。
+
+    这段摘要只作为构建 active context 的原料，不再直接主导模型注入上下文。
+    """
+    if history_summarizer is not None:
+        return history_summarizer.summarize(
+            session=session,
+            older_messages=history_window.older_messages,
+            older_round_count=history_window.older_round_count,
+        )
+    return build_older_history_summary(history_window.older_messages)
 
 
 def _resolve_user_policy(workspace: str) -> ResolvedUserPolicy:
@@ -389,7 +425,7 @@ def _build_user_policy_task_context(
     return "\n".join(part for part in parts if part).strip()
 
 
-def _resolve_compact_memory_context(
+def _resolve_active_context(
     *,
     older_history_summary: str,
     working_memory: WorkingMemory,
@@ -398,21 +434,21 @@ def _resolve_compact_memory_context(
     resolved_project_constraints: list[str],
     recent_risks: list[str],
 ) -> tuple[CompactMemorySnapshot, str]:
-    """基于当前 working memory 重建 compact memory，并吸收上一版基线。"""
-    snapshot = build_compact_memory_snapshot(
+    """基于当前 working memory 重建 active context，并吸收上一版基线。"""
+    snapshot = build_active_context_snapshot(
         older_history_summary=older_history_summary,
         working_memory=working_memory,
         previous_snapshot=(
-            cached_state.compact_memory_snapshot if cached_state is not None else None
+            cached_state.active_context_snapshot if cached_state is not None else None
         ),
-        previous_compact_memory_context=(
-            cached_state.compact_memory_context if cached_state is not None else ""
+        previous_active_context_summary=(
+            cached_state.active_context_summary if cached_state is not None else ""
         ),
         resolved_user_preferences=resolved_user_preferences,
         resolved_project_constraints=resolved_project_constraints,
         recent_risks=recent_risks,
     )
-    return snapshot, render_compact_memory_context(snapshot)
+    return snapshot, render_active_context_summary(snapshot)
 
 
 def _build_preview_source(
@@ -422,13 +458,13 @@ def _build_preview_source(
     cached_state: ContextStateData | None,
     initial_keep_rounds: int,
 ) -> tuple[list[ChatMessage], str]:
-    """构造压缩前预估用的 recent 消息和旧历史摘要。"""
+    """构造压缩前预估用的 recent 消息和摘要基线。"""
     restored_recent_messages = _try_restore_recent_messages(
         full_history=full_history,
         cached_state=cached_state,
     )
     if restored_recent_messages is not None and cached_state is not None:
-        return restored_recent_messages, cached_state.older_history_summary
+        return restored_recent_messages, cached_state.active_context_summary
 
     preview_window = select_history_window(
         history=full_history,
@@ -446,7 +482,7 @@ def _try_restore_recent_messages(
     """
     尝试从 active context state 恢复 recent messages。
 
-    思路和 minicode 类似：
+    思路和 MiniCode 类似：
     - 老历史保留为 compact 后的 active context
     - 新增消息只做增量追加
     """
@@ -472,9 +508,9 @@ def _save_active_context_state(
     *,
     full_history: list[ChatMessage],
     session: SessionData,
+    active_context_summary: str,
+    active_context_snapshot: CompactMemorySnapshot,
     older_history_summary: str,
-    compact_memory_snapshot: CompactMemorySnapshot,
-    compact_memory_context: str,
     resolved_user_preferences: list[str],
     resolved_project_constraints: list[str],
     recent_risks: list[str],
@@ -485,6 +521,8 @@ def _save_active_context_state(
     cached_state: ContextStateData | None,
     compaction_level: int,
     last_microcompact_at: float,
+    auto_compact_failure_count: int,
+    auto_compact_suppressed_until: float,
 ) -> None:
     """把当前 compact 后的 active context 状态单独落盘。"""
     history_entries: list[dict[str, object]] = []
@@ -497,13 +535,18 @@ def _save_active_context_state(
         source_message_count=len(full_history),
         source_history_fingerprint=build_history_fingerprint(full_history),
         compacted_messages=list(compacted_messages),
+        active_context_summary=active_context_summary,
+        active_context_snapshot=dict(active_context_snapshot),
         older_history_summary=older_history_summary,
-        compact_memory_context=compact_memory_context,
-        compact_memory_snapshot=dict(compact_memory_snapshot),
         resolved_user_preferences=list(resolved_user_preferences),
         resolved_project_constraints=list(resolved_project_constraints),
         recent_risks=list(recent_risks),
         compaction_level=compaction_level,
+        auto_compact_failure_count=max(0, int(auto_compact_failure_count)),
+        auto_compact_suppressed_until=max(
+            0.0,
+            float(auto_compact_suppressed_until or 0.0),
+        ),
         # 这里保存的是“本轮结束后”的最近一次 microcompact 时间。
         # 下一轮如果直接命中 context_state，就能继续做时间节流判断。
         last_microcompact_at=max(0.0, float(last_microcompact_at or 0.0)),
@@ -513,6 +556,10 @@ def _save_active_context_state(
             final_stats=final_stats,
         ),
     )
+    # 同步到 session.extra，兼容仍从 extra 读取摘要基线的旧路径。
+    session.extra["active_context_summary"] = active_context_summary
+    session.extra["active_context_snapshot"] = dict(active_context_snapshot)
+    session.extra["older_history_summary"] = older_history_summary
     save_context_state(session.workspace, state)
 
 
@@ -525,9 +572,8 @@ def _build_compacted_request(
     session: SessionData,
     working_memory: WorkingMemory,
     memory_pipeline: MemoryPipeline | None,
-    older_history_summary: str,
-    compact_memory_context: str,
-    compact_memory_snapshot: CompactMemorySnapshot,
+    active_context_summary: str,
+    active_context_snapshot: CompactMemorySnapshot,
     tool_registry: ToolRegistry,
     usable_budget: int,
     fixed_overhead_tokens: int,
@@ -546,14 +592,20 @@ def _build_compacted_request(
         workspace=session.workspace,
         usable_budget=usable_budget,
         fixed_overhead_tokens=fixed_overhead_tokens,
-        auto_compact_summary=compact_memory_context,
-        auto_compact_snapshot=compact_memory_snapshot,
+        auto_compact_summary=active_context_summary,
+        auto_compact_snapshot=active_context_snapshot,
         force_auto_compact=force_auto_compact,
         pinned_tool_names=(_ANALYSIS_PINNED_TOOL_NAMES if analysis_mode else None),
         # 命中缓存状态时，把上一次 microcompact 时间透传进 pipeline，
         # 让轻量清理也具备跨轮次的连续性。
         last_microcompact_at=(
             cached_state.last_microcompact_at if cached_state is not None else 0.0
+        ),
+        auto_compact_failure_count=(
+            cached_state.auto_compact_failure_count if cached_state is not None else 0
+        ),
+        auto_compact_suppressed_until=(
+            cached_state.auto_compact_suppressed_until if cached_state is not None else 0.0
         ),
     )
 
@@ -572,7 +624,8 @@ def _build_compacted_request(
             user_input=working_memory.get_primary_user_intent(),
             session=session_snapshot,
             working_memory=working_memory,
-            session_summary_override=older_history_summary,
+            # memory 检索也切到 active context baseline，避免继续由 older_history_summary 主导。
+            session_summary_override=active_context_summary,
             top_k=policy.memory_top_k,
             retrieval_top_k=policy.retrieval_top_k,
             max_memory_chars_per_item=policy.memory_item_chars,

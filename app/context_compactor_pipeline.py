@@ -12,8 +12,8 @@ from app.context_auto_compact import (
 )
 from app.context_compact_memory import (
     CompactMemorySnapshot,
-    parse_compact_memory_context,
-    render_compact_memory_context,
+    parse_active_context_summary,
+    render_active_context_summary,
 )
 from app.context_compactor import (
     CompactionResult,
@@ -38,9 +38,12 @@ class ContextPipelineResult:
     auto_compact_result: AutoCompactResult
     steps_taken: list[str] = field(default_factory=list)
     compaction_history_entry: dict[str, Any] = field(default_factory=dict)
-    resolved_compact_memory_snapshot: CompactMemorySnapshot = field(default_factory=dict)
-    resolved_compact_memory_context: str = ""
+    resolved_active_context_snapshot: CompactMemorySnapshot = field(default_factory=dict)
+    resolved_active_context_summary: str = ""
     last_microcompact_at: float = 0.0
+    auto_compact_failure_count: int = 0
+    auto_compact_suppressed_until: float = 0.0
+    protected_recent_messages: int = 6
 
 
 @dataclass(slots=True)
@@ -209,15 +212,8 @@ class ContextCompactor:
     这样 runtime、context_state、日志、测试都不需要重写。
     """
 
-    def __init__(
-        self,
-        *,
-        auto_compact_dispatcher: AutoCompactDispatcher | None = None,
-    ):
+    def __init__(self):
         self._lightweight_phase = LightweightContextPhase()
-        self._auto_compact = auto_compact_dispatcher or AutoCompactDispatcher(
-            config=AutoCompactDispatcherConfig()
-        )
 
     def process_request(
         self,
@@ -233,7 +229,14 @@ class ContextCompactor:
         force_auto_compact: bool,
         pinned_tool_names: set[str] | None,
         microcompact_state: MicrocompactState,
+        auto_compact_failure_count: int = 0,
+        auto_compact_suppressed_until: float = 0.0,
     ) -> ContextPipelineResult:
+        auto_compact = AutoCompactDispatcher(
+            config=AutoCompactDispatcherConfig(),
+            failure_count=auto_compact_failure_count,
+            suppressed_until=auto_compact_suppressed_until,
+        )
         compaction_result, steps_taken = self._lightweight_phase.run(
             messages=messages,
             config=lightweight_config,
@@ -259,7 +262,7 @@ class ContextCompactor:
             steps_taken.append("microcompact")
 
         recent_tokens_after_compaction = estimate_messages_tokens(compaction_result.messages)
-        auto_compact_result = self._auto_compact.dispatch(
+        auto_compact_result = auto_compact.dispatch(
             messages=compaction_result.messages,
             usable_budget=usable_budget,
             summary_base=auto_compact_summary,
@@ -277,7 +280,7 @@ class ContextCompactor:
             else compaction_result.messages
         )
         normalized_messages = normalize_tool_call_pairs(output_messages)
-        resolved_snapshot, resolved_context = _resolve_compact_memory_outputs(
+        resolved_snapshot, resolved_context = _resolve_active_context_outputs(
             auto_compact_summary=auto_compact_summary,
             auto_compact_snapshot=auto_compact_snapshot,
             auto_compact_result=auto_compact_result,
@@ -309,9 +312,11 @@ class ContextCompactor:
             auto_compact_result=auto_compact_result,
             steps_taken=steps_taken,
             compaction_history_entry=history_entry,
-            resolved_compact_memory_snapshot=resolved_snapshot,
-            resolved_compact_memory_context=resolved_context,
+            resolved_active_context_snapshot=resolved_snapshot,
+            resolved_active_context_summary=resolved_context,
             last_microcompact_at=microcompact_result.last_compact_at,
+            auto_compact_failure_count=auto_compact_result.failure_count,
+            auto_compact_suppressed_until=auto_compact_result.suppressed_until,
         )
 
 
@@ -341,6 +346,8 @@ class ContextCompactorPipeline:
         force_auto_compact: bool = False,
         pinned_tool_names: set[str] | None = None,
         last_microcompact_at: float = 0.0,
+        auto_compact_failure_count: int = 0,
+        auto_compact_suppressed_until: float = 0.0,
     ) -> ContextPipelineResult:
         return self._compactor.process_request(
             messages=messages,
@@ -360,17 +367,19 @@ class ContextCompactorPipeline:
                 last_time_based_compact=max(0.0, float(last_microcompact_at or 0.0)),
                 keep_recent_tool_results=max(0, max_recent_tool_results),
             ),
+            auto_compact_failure_count=auto_compact_failure_count,
+            auto_compact_suppressed_until=auto_compact_suppressed_until,
         )
 
 
-def _resolve_compact_memory_outputs(
+def _resolve_active_context_outputs(
     *,
     auto_compact_summary: str,
     auto_compact_snapshot: CompactMemorySnapshot | None,
     auto_compact_result: AutoCompactResult,
 ) -> tuple[CompactMemorySnapshot, str]:
-    """统一解析 compact memory 的最终输出，避免散落在不同阶段重复拼接。"""
-    resolved_snapshot = auto_compact_snapshot or parse_compact_memory_context(
+    """统一解析 active context 的最终输出，避免散落在不同阶段重复拼接。"""
+    resolved_snapshot = auto_compact_snapshot or parse_active_context_summary(
         auto_compact_summary
     )
     resolved_context = auto_compact_summary.strip()
@@ -378,10 +387,10 @@ def _resolve_compact_memory_outputs(
         resolved_snapshot = auto_compact_result.summary_snapshot
         resolved_context = (
             auto_compact_result.summary_text.strip()
-            or render_compact_memory_context(resolved_snapshot)
+            or render_active_context_summary(resolved_snapshot)
         )
     elif resolved_snapshot and not resolved_context:
-        resolved_context = render_compact_memory_context(resolved_snapshot)
+        resolved_context = render_active_context_summary(resolved_snapshot)
     return resolved_snapshot, resolved_context
 
 

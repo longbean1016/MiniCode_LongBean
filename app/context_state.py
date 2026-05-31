@@ -1,6 +1,6 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
-"""上下文状态模型，描述当前窗口、预算和压缩后的阶段状态。"""
+"""上下文状态模型，描述一次会话压缩后的可恢复状态。"""
 
 import hashlib
 import json
@@ -31,16 +31,19 @@ class ContextStateData:
     source_message_count: int
     source_history_fingerprint: str
     compacted_messages: list[ChatMessage] = field(default_factory=list)
+    # active_context_* 是新版压缩链路的主恢复基线。
+    # older_history_summary 仅作为构建原料保留；legacy compact_memory_* 只通过属性兼容读取。
+    active_context_summary: str = ""
+    active_context_snapshot: dict[str, list[str]] = field(default_factory=dict)
     older_history_summary: str = ""
-    compact_memory_context: str = ""
-    compact_memory_snapshot: dict[str, list[str]] = field(default_factory=dict)
     resolved_user_preferences: list[str] = field(default_factory=list)
     resolved_project_constraints: list[str] = field(default_factory=list)
     recent_risks: list[str] = field(default_factory=list)
     compaction_level: int = 0
-    # 新增：保存上一次 microcompact 的执行时间。
-    # 这样下一轮 prepare_agent_context 命中 context_state 时，
-    # 可以继续沿用同一套节流窗口，而不是把旧 tool_result 反复清理。
+    # 记录 auto compact 的失败次数和短时抑制窗口，使调度行为更接近新版 MiniCode dispatcher。
+    auto_compact_failure_count: int = 0
+    auto_compact_suppressed_until: float = 0.0
+    # 保存上一次 microcompact 的执行时间，用于跨轮次节流。
     last_microcompact_at: float = 0.0
     compaction_history: list[dict[str, Any]] = field(default_factory=list)
     last_token_stats: dict[str, Any] = field(default_factory=dict)
@@ -51,13 +54,15 @@ class ContextStateData:
             "source_message_count": self.source_message_count,
             "source_history_fingerprint": self.source_history_fingerprint,
             "compacted_messages": list(self.compacted_messages),
+            "active_context_summary": self.active_context_summary,
+            "active_context_snapshot": _normalize_snapshot(self.active_context_snapshot),
             "older_history_summary": self.older_history_summary,
-            "compact_memory_context": self.compact_memory_context,
-            "compact_memory_snapshot": _normalize_snapshot(self.compact_memory_snapshot),
             "resolved_user_preferences": list(self.resolved_user_preferences),
             "resolved_project_constraints": list(self.resolved_project_constraints),
             "recent_risks": list(self.recent_risks),
             "compaction_level": self.compaction_level,
+            "auto_compact_failure_count": self.auto_compact_failure_count,
+            "auto_compact_suppressed_until": self.auto_compact_suppressed_until,
             "last_microcompact_at": self.last_microcompact_at,
             "compaction_history": list(self.compaction_history),
             "last_token_stats": dict(self.last_token_stats),
@@ -65,15 +70,20 @@ class ContextStateData:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "ContextStateData":
-        # 旧状态文件没有 last_microcompact_at 时，默认退回 0。
-        # 这样兼容老版本 session，不需要做迁移脚本。
+        # 兼容旧状态文件：active_context_* 缺失时回退读取 compact_memory_*。
         raw_messages = data.get("compacted_messages", [])
         compacted_messages = [item for item in raw_messages if isinstance(item, dict)]
         raw_history = data.get("compaction_history", [])
         compaction_history = [item for item in raw_history if isinstance(item, dict)]
         raw_stats = data.get("last_token_stats", {})
         last_token_stats = dict(raw_stats) if isinstance(raw_stats, dict) else {}
-        compact_memory_snapshot = _normalize_snapshot(data.get("compact_memory_snapshot", {}))
+        active_context_snapshot = _normalize_snapshot(data.get("active_context_snapshot", {}))
+        legacy_snapshot = _normalize_snapshot(data.get("compact_memory_snapshot", {}))
+        if not active_context_snapshot:
+            active_context_snapshot = legacy_snapshot
+        active_context_summary = str(data.get("active_context_summary", "")).strip()
+        if not active_context_summary:
+            active_context_summary = str(data.get("compact_memory_context", "")).strip()
         raw_preferences = data.get("resolved_user_preferences", [])
         resolved_user_preferences = [
             str(item).strip() for item in raw_preferences if str(item).strip()
@@ -83,25 +93,27 @@ class ContextStateData:
             str(item).strip() for item in raw_constraints if str(item).strip()
         ]
         raw_risks = data.get("recent_risks", [])
-        recent_risks = [
-            str(item).strip() for item in raw_risks if str(item).strip()
-        ]
+        recent_risks = [str(item).strip() for item in raw_risks if str(item).strip()]
         return cls(
             session_id=str(data["session_id"]),
             source_message_count=int(data.get("source_message_count", 0)),
             source_history_fingerprint=str(data.get("source_history_fingerprint", "")),
             compacted_messages=compacted_messages,  # type: ignore[arg-type]
+            active_context_summary=active_context_summary,
+            active_context_snapshot=active_context_snapshot,
             older_history_summary=str(data.get("older_history_summary", "")),
-            compact_memory_context=str(data.get("compact_memory_context", "")),
-            compact_memory_snapshot=compact_memory_snapshot,
             resolved_user_preferences=resolved_user_preferences,
             resolved_project_constraints=resolved_project_constraints,
             recent_risks=recent_risks,
             compaction_level=int(data.get("compaction_level", 0)),
+            auto_compact_failure_count=int(data.get("auto_compact_failure_count", 0)),
+            auto_compact_suppressed_until=float(data.get("auto_compact_suppressed_until", 0.0) or 0.0),
             last_microcompact_at=float(data.get("last_microcompact_at", 0.0) or 0.0),
             compaction_history=compaction_history,
             last_token_stats=last_token_stats,
         )
+
+
 
 
 def get_context_state_dir(workspace: str) -> Path:
@@ -169,7 +181,7 @@ def build_token_stats_snapshot(*, preview_stats: ContextStats, final_stats: Cont
 
 
 def _normalize_snapshot(raw_value: object) -> dict[str, list[str]]:
-    """把结构化 compact memory 快照清洗成稳定的 {key: [lines]} 结构。"""
+    """把结构化活动上下文快照清洗成稳定的 {key: [lines]} 结构。"""
     if not isinstance(raw_value, dict):
         return {}
 
@@ -182,3 +194,4 @@ def _normalize_snapshot(raw_value: object) -> dict[str, list[str]]:
         if lines:
             normalized[key] = lines
     return normalized
+

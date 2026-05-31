@@ -1,16 +1,17 @@
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 
 """自动压缩策略模块，负责在上下文逼近阈值时触发历史压缩。"""
 
 from app.context_compact_memory import (
     CompactMemorySnapshot,
-    build_event_compact_memory_snapshot,
-    merge_compact_memory_snapshots,
-    parse_compact_memory_context,
-    render_compact_memory_context,
-    render_full_compact_memory_context,
+    build_active_context_event_snapshot,
+    merge_active_context_snapshots,
+    parse_active_context_summary,
+    render_active_context_summary,
+    render_full_active_context_summary,
 )
 from app.context_message_safety import is_internal_compaction_marker
 from app.context_manager import estimate_messages_tokens, estimate_tokens
@@ -43,6 +44,8 @@ class AutoCompactResult:
     tokens_freed_estimate: int = 0
     summary_text: str = ""
     summary_snapshot: CompactMemorySnapshot | None = None
+    failure_count: int = 0
+    suppressed_until: float = 0.0
 
 
 @dataclass(slots=True)
@@ -58,6 +61,8 @@ class AutoCompactDispatcherConfig:
     target_ratio: float = AUTO_COMPACT_TARGET_RATIO
     tool_result_trigger_ratio: float = AUTO_COMPACT_TOOL_RESULT_TRIGGER_RATIO
     repeated_scan_trigger_count: int = AUTO_COMPACT_REPEATED_SCAN_TRIGGER_COUNT
+    circuit_breaker_limit: int = 3
+    warning_suppress_seconds: float = 30.0
 
 
 class AutoCompactDispatcher:
@@ -68,8 +73,28 @@ class AutoCompactDispatcher:
     具体的 session/full compact 细节仍复用当前项目已有实现。
     """
 
-    def __init__(self, config: AutoCompactDispatcherConfig | None = None):
+    def __init__(
+        self,
+        config: AutoCompactDispatcherConfig | None = None,
+        *,
+        failure_count: int = 0,
+        suppressed_until: float = 0.0,
+    ):
         self._config = config or AutoCompactDispatcherConfig()
+        self._failure_count = max(0, int(failure_count))
+        self._suppressed_until = max(0.0, float(suppressed_until or 0.0))
+
+    @property
+    def failure_count(self) -> int:
+        return self._failure_count
+
+    @property
+    def suppressed_until(self) -> float:
+        return self._suppressed_until
+
+    @property
+    def is_tripped(self) -> bool:
+        return self._failure_count >= self._config.circuit_breaker_limit
 
     def should_trigger(
         self,
@@ -79,6 +104,12 @@ class AutoCompactDispatcher:
         tool_result_tokens: int = 0,
         repeated_scan_count: int = 0,
     ) -> bool:
+        # 与 MiniCode 新版一致：一旦 circuit breaker 触发，
+        # 后续自动压缩先短路，避免每轮都重复做高成本尝试。
+        if self.is_tripped:
+            return False
+        if self._suppressed_until > time.time():
+            return False
         return should_trigger_auto_compact(
             total_tokens=total_tokens,
             usable_budget=usable_budget,
@@ -104,6 +135,15 @@ class AutoCompactDispatcher:
         tool_result_tokens = _estimate_tool_result_tokens(current_messages)
         repeated_scan_count = _count_repeated_scan_results(current_messages)
 
+        if not force_full and self.is_tripped:
+            return AutoCompactResult(
+                messages=current_messages,
+                tokens_before=tokens_before,
+                tokens_after=tokens_before,
+                failure_count=self._failure_count,
+                suppressed_until=self._suppressed_until,
+            )
+
         if not force_full and not self.should_trigger(
             total_tokens=tokens_before,
             usable_budget=usable_budget,
@@ -114,6 +154,8 @@ class AutoCompactDispatcher:
                 messages=current_messages,
                 tokens_before=tokens_before,
                 tokens_after=tokens_before,
+                failure_count=self._failure_count,
+                suppressed_until=self._suppressed_until,
             )
 
         if not force_full:
@@ -127,9 +169,12 @@ class AutoCompactDispatcher:
                 fixed_overhead_tokens=fixed_overhead_tokens,
             )
             if session_result.applied:
+                self._mark_success()
+                session_result.failure_count = self._failure_count
+                session_result.suppressed_until = self._suppressed_until
                 return session_result
 
-        return _run_full_compact(
+        result = _run_full_compact(
             messages=current_messages,
             usable_budget=usable_budget,
             summary_base=summary_base,
@@ -137,6 +182,21 @@ class AutoCompactDispatcher:
             summary_source_messages=summary_source_messages,
             fixed_overhead_tokens=fixed_overhead_tokens,
         )
+        if result.applied:
+            self._mark_success()
+        else:
+            self._mark_failure()
+        result.failure_count = self._failure_count
+        result.suppressed_until = self._suppressed_until
+        return result
+
+    def _mark_success(self) -> None:
+        # 成功压缩后清空失败计数，并在短时间内抑制重复告警/重复压缩。
+        self._failure_count = 0
+        self._suppressed_until = time.time() + self._config.warning_suppress_seconds
+
+    def _mark_failure(self) -> None:
+        self._failure_count += 1
 
 
 def should_trigger_auto_compact(
@@ -200,9 +260,9 @@ def _run_session_memory_compact(
     """优先用已有摘要和工作记忆做一次轻量压缩。"""
     # session compact 优先复用已有结构化摘要，不重新发明摘要语义。
     # 这一层的目标是“把较早历史折进摘要，尽量保住最近窗口”，而不是重新做重型摘要。
-    baseline_snapshot = summary_snapshot or parse_compact_memory_context(summary_base)
+    baseline_snapshot = summary_snapshot or parse_active_context_summary(summary_base)
     snapshot_text = (
-        render_compact_memory_context(baseline_snapshot).strip()
+        render_active_context_summary(baseline_snapshot).strip()
         if baseline_snapshot
         else ""
     )
@@ -589,21 +649,21 @@ def _build_structured_summary_package(
     """同时返回 full compact 的结构化快照和渲染文本。"""
     # full compact 的关键不是生成一段漂亮 prose，
     # 而是把旧历史尽量归并到结构化槽位里，便于下一轮继续被稳定引用。
-    base_snapshot = summary_snapshot or parse_compact_memory_context(summary_base)
+    base_snapshot = summary_snapshot or parse_active_context_summary(summary_base)
     if not base_snapshot and summary_base.strip():
         base_snapshot = {
             "history_summary": [
                 _limit_summary_text(summary_base.strip(), 140),
             ]
         }
-    event_snapshot = build_event_compact_memory_snapshot(
+    event_snapshot = build_active_context_event_snapshot(
         removed_messages=removed_messages,
     )
-    merged_snapshot = merge_compact_memory_snapshots(
+    merged_snapshot = merge_active_context_snapshots(
         base_snapshot=base_snapshot,
         overlay_snapshot=event_snapshot,
     )
-    rendered = render_full_compact_memory_context(merged_snapshot).strip()
+    rendered = render_full_active_context_summary(merged_snapshot).strip()
     if rendered:
         return merged_snapshot, rendered
     normalized_base = summary_base.strip()
