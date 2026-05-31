@@ -55,6 +55,11 @@ def should_trigger_auto_compact(
     """达到高水位时触发自动压缩。"""
     if usable_budget <= 0:
         return False
+    # 触发条件拆成三类：
+    # 1. 总 token 接近上限
+    # 2. tool_result 单独占比过高
+    # 3. 扫描型工具重复太多
+    # 这样可以覆盖“总量没爆，但噪声结构已经开始劣化推理质量”的情况。
     if total_tokens >= int(usable_budget * AUTO_COMPACT_TRIGGER_RATIO):
         return True
     if tool_result_tokens >= int(usable_budget * AUTO_COMPACT_TOOL_RESULT_TRIGGER_RATIO):
@@ -126,6 +131,8 @@ def _run_session_memory_compact(
     fixed_overhead_tokens: int,
 ) -> AutoCompactResult:
     """优先用已有摘要和工作记忆做一次轻量压缩。"""
+    # session compact 优先复用已有结构化摘要，不重新发明摘要语义。
+    # 这一层的目标是“把较早历史折进摘要，尽量保住最近窗口”，而不是重新做重型摘要。
     baseline_snapshot = summary_snapshot or parse_compact_memory_context(summary_base)
     snapshot_text = (
         render_compact_memory_context(baseline_snapshot).strip()
@@ -151,6 +158,8 @@ def _run_session_memory_compact(
             tokens_after=fixed_overhead_tokens + estimate_messages_tokens(messages),
         )
 
+    # 先确定最近 tail，再把更早内容折进 marker。
+    # 这是为了让模型看到的仍是一段自然连续的最新对话，而不是被先裁碎 recent window。
     tail_messages = _select_recent_tail(
         messages=other_messages,
         usable_budget=usable_budget,
@@ -209,6 +218,7 @@ def _run_full_compact(
             tokens_after=fixed_overhead_tokens + estimate_messages_tokens(messages),
         )
 
+    # full compact 会更激进地缩小 tail，因为此时说明 session compact 已经压不下去了。
     tail_messages = _select_recent_tail(
         messages=other_messages,
         usable_budget=usable_budget,
@@ -222,6 +232,8 @@ def _run_full_compact(
     )
     removed_count = max(0, len(other_messages) - len(tail_messages))
     removed_messages = other_messages[:removed_count]
+    # summary_source_messages 允许用“压缩前更完整的历史”来生成摘要，
+    # 避免当前 messages 已经做过 recent 微压缩后，把原始工具上下文丢得太多。
     _, summary_other_messages = _split_system_messages(summary_source_messages or messages)
     if len(summary_other_messages) >= removed_count:
         removed_messages = summary_other_messages[:removed_count]
@@ -295,6 +307,9 @@ def _fit_compacted_messages(
         if tokens_after <= threshold_tokens:
             return compacted, summary_current, tokens_after
 
+        # 先缩 tail，再缩 summary。
+        # 原因是 tail 里保存的是“最近可继续执行的真实对话结构”，
+        # 只要还能删掉更旧的 tail 边缘，就不该先把摘要压到失真。
         if len(tail_current) > min_keep_messages:
             tail_current = _drop_oldest_tail_segment(tail_current, min_keep_messages)
             continue
@@ -367,6 +382,8 @@ def _select_recent_tail(
     kept_reversed: list[ChatMessage] = []
     tail_tokens = 0
 
+    # 从后往前收集，天然更偏向保留最近轮次。
+    # 到达目标预算后立即停，避免把“较早但不关键”的历史继续拖进 tail。
     for message in reversed(messages):
         kept_reversed.append(dict(message))
         tail_tokens += estimate_messages_tokens([message])
@@ -374,6 +391,7 @@ def _select_recent_tail(
             break
 
     tail_messages = list(reversed(kept_reversed))
+    # 截完后再修正边界，保证不会把 tool_call/tool_result 从中间切断。
     return _adjust_tail_for_tool_pairs(messages, tail_messages)
 
 
@@ -386,6 +404,8 @@ def _adjust_tail_for_tool_pairs(
         return tail_messages
 
     tail_start = len(original_messages) - len(tail_messages)
+    # 如果 tail 正好从 tool_result 开始，要把对应 tool_call 一并拉进来。
+    # 否则模型会看到一个“没有调用来源的工具结果”，这类孤立证据很容易让后续推理跑偏。
     while tail_start > 0:
         first_message = original_messages[tail_start]
         if first_message.get("role") != "tool_result":
@@ -409,6 +429,8 @@ def _drop_oldest_tail_segment(
         return tail_messages
 
     next_tail = list(tail_messages[1:])
+    # 如果删完第一条后，新的开头正好是 tool_result，
+    # 说明 assistant_tool_call 被单独删掉了，需要把配对结果也一起挪掉。
     if (
         next_tail
         and next_tail[0].get("role") == "tool_result"
@@ -498,6 +520,8 @@ def _build_structured_summary_package(
     summary_snapshot: CompactMemorySnapshot | None,
 ) -> tuple[CompactMemorySnapshot, str]:
     """同时返回 full compact 的结构化快照和渲染文本。"""
+    # full compact 的关键不是生成一段漂亮 prose，
+    # 而是把旧历史尽量归并到结构化槽位里，便于下一轮继续被稳定引用。
     base_snapshot = summary_snapshot or parse_compact_memory_context(summary_base)
     if not base_snapshot and summary_base.strip():
         base_snapshot = {

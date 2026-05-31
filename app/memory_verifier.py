@@ -13,6 +13,9 @@ from app.memory_store import MemoryEntry
 from app.memory_vector_index import MemoryVectorIndex
 from app.retry import RetryPolicy, run_with_retry, should_retry_model_error
 
+# verifier 只负责判断候选记忆和已有记忆的关系，
+# 不负责从对话里抽取候选记忆本身。
+
 
 # verifier 的最终动作。
 # `supersede_store` 表示：
@@ -194,6 +197,7 @@ class MemoryVerifier:
         candidate: MemoryEntry,
         existing_entries: list[MemoryEntry],
     ) -> list[MemoryEntry]:
+        # 先缩小候选比较集，后续 verifier 模型才不会浪费 token 在无关旧记忆上。
         """
         为候选记忆找出一小组值得验证的旧记忆。
 
@@ -215,6 +219,7 @@ class MemoryVerifier:
         candidate: MemoryEntry,
         similar_entries: list[MemoryEntry],
     ) -> MemoryVerificationDecision:
+        # 先判“值不值得存”，再判“与谁重复/冲突/替代”，能减少无意义验证。
         """
         对候选记忆做二次验证。
 
@@ -278,6 +283,7 @@ class MemoryVerifier:
             if hit.score < self.semantic_min_score:
                 continue
 
+            # 语义召回只做粗筛，真正的 duplicate/conflict/supersede 判断在后面。
             entry = existing_by_id.get(hit.memory_id)
             if entry is None or entry.id in seen_ids:
                 continue
@@ -302,6 +308,7 @@ class MemoryVerifier:
             if candidate_scope and existing_scope and existing_scope != candidate_scope:
                 continue
 
+            # 没有向量检索时，需要借助 category/tag/domain 这些结构信号兜底。
             similarity = self._jaccard_similarity(candidate.content, entry.content)
             same_topic_score = self._same_topic_score(candidate, entry)
 
@@ -579,6 +586,8 @@ class MemoryVerifier:
         if len(normalized_content) < 6:
             return "候选内容过短，缺少稳定可复用信息"
 
+        # 这里尽量把“临时性”和“寒暄性”挡在模型前面，
+        # 让 verifier 的 token 预算留给真正值得比对的候选。
         if any(marker in normalized_content for marker in REJECT_MARKERS):
             return "候选内容含有临时或未确认表达，不适合写入长期记忆"
 
@@ -609,6 +618,7 @@ class MemoryVerifier:
         if normalized_action in MATCH_REQUIRED_ACTIONS:
             if matched_entry is None:
                 return None
+            # 模型 matched id 写错时，允许这里按主题相近度做一次兜底纠正。
             normalized_matched_id = matched_entry.id
         else:
             normalized_matched_id = ""
@@ -670,9 +680,12 @@ class MemoryVerifier:
         if normalized_id and normalized_id in entry_by_id:
             return entry_by_id[normalized_id]
 
+        # 如果模型没给出可用 id，就退回到“主题一致性 + 正文相似度”的混合打分，
+        # 尽量把动作绑到最可能的那条旧记忆上。
         best_entry: MemoryEntry | None = None
         best_score = 0.0
         for entry in similar_entries:
+            # 兜底匹配不只看正文相似度，还会叠加“是不是同一决策面”的结构分。
             score = self._same_topic_score(candidate, entry)
             score += self._jaccard_similarity(candidate.content, entry.content) * 0.35
             if score > best_score:
@@ -719,6 +732,7 @@ class MemoryVerifier:
         if self._normalize_text(candidate.category) == self._normalize_text(existing.category):
             score += 0.20
 
+        # tags / domains 在长期规则里通常比正文措辞更稳定。
         candidate_tags = set(self._normalize_tag_list(candidate.tags))
         existing_tags = set(self._normalize_tag_list(existing.tags))
         tag_overlap = len(candidate_tags & existing_tags)
@@ -740,6 +754,7 @@ class MemoryVerifier:
             f"scope: {candidate.scope}",
             f"content: {candidate.content}",
         ]
+        # tags / domains 即使没直接写在正文里，也会显著影响召回主题是否准确。
         if candidate.tags:
             parts.append(f"tags: {', '.join(candidate.tags)}")
         if candidate.domains:

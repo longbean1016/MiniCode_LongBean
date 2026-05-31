@@ -4,9 +4,12 @@ import re
 from dataclasses import dataclass
 from typing import Any, Callable
 
-"""工具注册与执行基础设施，统一管理校验、调用和结果裁剪。"""
+# 工具注册与执行基础设施，统一管理校验、调用和结果裁剪。
 
 from app.types import ToolContext, ToolResult
+
+# 工具层统一负责输入校验、执行和输出治理，
+# 让上层 agent loop 不需要感知每个工具的细节差异。
 
 
 Validator = Callable[[Any], Any]
@@ -80,6 +83,8 @@ class ToolRegistry:
         if len(output) <= limit:
             return output
 
+        # 这里生成的是给“当前下一步模型”看的主输出，
+        # 目标是尽量保住推理价值，而不是只追求最短。
         lines = output.splitlines()
         total_lines = max(1, len(lines))
         total_chars = len(output)
@@ -134,6 +139,8 @@ class ToolRegistry:
         if len(raw_output) <= limit:
             return raw_output
 
+        # 这份结果主要用于历史回填和上下文压缩，
+        # 因此会比主输出更激进地做裁剪。
         lines = raw_output.splitlines()
         total_lines = max(1, len(lines))
         average_line_length = max(1, len(raw_output) / total_lines)
@@ -168,6 +175,8 @@ class ToolRegistry:
         if not body_lines:
             return self._truncate_head_tail(lines, total_chars, max_lines)
 
+        # 结构化集合输出通常是“头部统计 + 正文列表”，
+        # 因此优先保住头部，再从正文首尾各截一部分样本。
         header_budget = len(header_lines)
         remaining_budget = max_lines - header_budget - 1
         if remaining_budget < 4:
@@ -265,6 +274,8 @@ class ToolRegistry:
         meta["raw_output_chars"] = len(raw_output)
         meta["context_output"] = context_output
         meta["context_output_chars"] = len(context_output)
+        # 一旦发生截断，完整原文仍应留在 meta 里，
+        # 供后续压缩器、调试或精确回放使用。
         if truncated:
             # 保留完整原文，供后续 context compactor 落盘或调试使用。
             meta["raw_output"] = raw_output
@@ -340,4 +351,5 @@ class ToolRegistry:
                 meta={"tool_name": tool_name},
             )
 
+        # 所有工具最终都收敛成统一的 ToolResult 出口。
         return self._normalize_result(tool_name, raw_result)

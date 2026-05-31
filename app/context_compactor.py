@@ -73,6 +73,9 @@ def compact_recent_messages(
     4. 把过旧的 tool_call + tool_result 折叠成 assistant 摘要
     5. 如果仍超预算，再做一次“保护最近消息”的优先裁剪
     """
+    # 第一步先去掉 progress 类消息。
+    # 这类消息只对“流式展示过程”有用，对下一次推理几乎没有事实价值，
+    # 越早删掉，后面的压缩就越能把预算留给真实证据。
     compacted = [
         dict(message)
         for message in messages
@@ -91,6 +94,8 @@ def compact_recent_messages(
 
     # 优先使用工具原始输出；如果 ToolRegistry 已经做过 smart truncate，
     # 会把完整原文放进 meta.raw_output。
+    # 这里单独缓存“工具原始输出”，后面的每个压缩阶段都基于同一份原文做判断。
+    # 这样即使 message["content"] 已经被预览版替换，去重/摘要阶段仍能基于完整证据工作。
     original_tool_contents: dict[int, str] = {
         index: _get_tool_original_content(message)
         for index, message in enumerate(compacted)
@@ -130,6 +135,8 @@ def compact_recent_messages(
         result.messages = compacted
         return result
 
+    # 进入语义压缩前，先挑出“绝不能折”的最近工具结果。
+    # recent window 的核心目标不是尽可能短，而是尽量让模型下一步还能继续引用最近证据。
     protected_tool_indexes = _collect_protected_tool_indexes(
         compacted=compacted,
         max_recent_tool_results=max_recent_tool_results,
@@ -235,6 +242,8 @@ def _dedupe_tool_results(
     result: CompactionResult,
 ) -> None:
     """对重复读取结果做去重，但保留最新一份完整证据。"""
+    # 反向扫描意味着“保留最新一份，折掉更旧的一份”。
+    # 这样模型看到的仍然是离当前推理最近的结果，不会因为去重把最新证据删掉。
     last_seen_by_key: dict[tuple[str, str, str], int] = {}
     last_seen_collection_key: dict[tuple[str, str], int] = {}
     for index in range(len(compacted) - 1, -1, -1):
@@ -255,6 +264,8 @@ def _dedupe_tool_results(
             if collection_key not in last_seen_collection_key:
                 last_seen_collection_key[collection_key] = index
                 continue
+            # list/grep 更像“扫描快照”，这里不要求逐字符完全一致，
+            # 而是按头部统计 + 结果集合做轻量签名，避免同一轮反复扫目录把上下文刷爆。
             compacted[index]["content"] = (
                 "[扫描结果已去重：保留本轮较新的同类结果]\n"
                 f"工具: {tool_name}"
@@ -275,6 +286,9 @@ def _dedupe_tool_results(
             last_seen_by_key[dedupe_key] = index
             continue
 
+        # read_file 则必须更严格。
+        # 只有“规范化路径 + 完整内容 hash”都相同，才认为是同一份文件事实；
+        # 任何一个字符变化，都必须保留为新证据，不能偷懒按文件名模糊折叠。
         compacted[index]["content"] = (
             "[读取结果已去重：文件内容未变化，保留本轮较新的同文件结果]\n"
             f"文件: {read_identity.display_path}"
@@ -359,6 +373,8 @@ def _semantic_compact_old_tool_interactions(
     - 旧 pair 会被压扁为普通消息，不再依赖 tool_call/tool_result 协议
     - 最近和被 pin 的结果仍保留原始结构，继续支持精确引用
     """
+    # 先把 tool_use_id 建立成索引，后面才能按“完整 pair”做折叠。
+    # 这里的核心不是压某一条消息，而是把一次旧工具交互整体沉淀成语义摘要。
     call_index_by_id: dict[str, int] = {}
     tool_index_by_id: dict[str, int] = {}
     for index, message in enumerate(compacted):
@@ -398,6 +414,9 @@ def _semantic_compact_old_tool_interactions(
             if call_index >= 0:
                 indexes_to_drop.add(call_index)
 
+            # 只有在确定这条 tool_result 已经不需要保留结构协议时，
+            # 才把它压成 assistant 文本。这样压完之后，模型看到的是一条普通语义事实，
+            # 不再误以为还存在一个待继续衔接的 tool_call/tool_result 协议对。
             summary = _build_semantic_tool_summary(
                 tool_result=message,
                 tool_call=compacted[call_index] if call_index >= 0 else None,
@@ -442,6 +461,8 @@ def _drop_low_priority_old_messages(
     working = [dict(message) for message in compacted]
     protected_recent_messages = max(0, protected_recent_messages)
 
+    # 这一步是兜底，不是主力压缩手段。
+    # 只有前面的“预览化 / 去重 / 语义折叠”都做完仍超预算，才允许直接删旧消息。
     while estimate_messages_tokens(working) > target_tokens:
         protected_start = max(0, len(working) - protected_recent_messages)
         candidate_index = _find_low_priority_drop_index(
@@ -670,6 +691,8 @@ def _persist_tool_result(
     }
     header = json.dumps(meta, ensure_ascii=False) + "\n---CONTENT---\n"
 
+    # 先写临时文件再原子替换，避免中途异常时留下半截文件，
+    # 也避免并发读到不完整内容。
     temp_fd, temp_path = tempfile.mkstemp(
         dir=str(cache_dir),
         prefix=".tool_result_",

@@ -85,6 +85,8 @@ class OlderHistorySummarizer:
             self._clear_session_state(session)
             return ""
 
+        # fallback summary 先行构造。
+        # 这样后面无论是模型阈值不满足、命中缓存、还是模型调用失败，都有稳定兜底结果。
         fallback_summary = build_older_history_summary(older_messages)
         fingerprint = self._fingerprint_messages(older_messages)
         policy = build_compaction_policy(session)
@@ -100,6 +102,8 @@ class OlderHistorySummarizer:
             0,
         )
 
+        # 旧历史太短时没必要调模型。
+        # 对很小的一段 older_messages，规则摘要往往更稳定，也更省一次模型调用。
         if not self._should_use_model(older_messages):
             self._save_session_state(
                 session=session,
@@ -110,6 +114,8 @@ class OlderHistorySummarizer:
             )
             return fallback_summary
 
+        # 指纹一致说明 older 区域没有实质变化，直接复用缓存摘要即可。
+        # 这里不重新总结，是为了避免“同一段旧历史被模型多次改写措辞”，降低漂移。
         if cached_summary and cached_fingerprint == fingerprint:
             self._save_session_state(
                 session=session,
@@ -120,6 +126,8 @@ class OlderHistorySummarizer:
             )
             return cached_summary
 
+        # 即使 older 区域发生了变化，也不代表每轮都值得重摘要。
+        # round_delta 是一个节流阈值，避免会话很长时摘要器频繁重跑。
         round_delta = max(0, older_round_count - cached_round_count)
         if cached_summary and round_delta < policy.min_round_delta_for_resummarize:
             self._save_session_state(
@@ -131,6 +139,10 @@ class OlderHistorySummarizer:
             )
             return cached_summary
 
+        # 传给摘要模型的输入不是原始消息 JSON，而是按 role 扁平化后的文本。
+        # 这样做有两个好处：
+        # 1. 更省 token
+        # 2. 更明确告诉模型“哪些是 user / assistant / tool result”
         context_text = self._build_context_text(older_messages)
         if not context_text:
             self._save_session_state(
@@ -178,6 +190,9 @@ class OlderHistorySummarizer:
         parts: list[str] = []
 
         for message in older_messages:
+            # 指纹故意只纳入会影响语义判断的字段：
+            # role、tool_name、是否报错、content。
+            # 这样既能捕获真正的事实变化，又不会因为无关元数据变化而频繁失效。
             role = str(message.get("role", "")).strip()
             tool_name = str(message.get("tool_name", "")).strip()
             content = str(message.get("content", "")).strip()
@@ -197,6 +212,8 @@ class OlderHistorySummarizer:
             if not content:
                 continue
 
+            # 不同 role 单独打标签，是为了让摘要模型更容易识别：
+            # 哪些是用户约束，哪些是 agent 的结论，哪些是工具证据。
             if role == "user":
                 lines.append(f"[user] {self._shorten(content, 500)}")
             elif role == "assistant":
@@ -270,6 +287,8 @@ class OlderHistorySummarizer:
         compaction_level: int,
     ) -> None:
         """把旧历史摘要相关的 context state 写入 session.extra。"""
+        # 这些字段本质上就是“older 区域的持久化上下文状态”：
+        # 下轮进来后，无需重新扫描完整旧历史，就能判断是否复用摘要、是否需要升级压缩等级。
         session.extra["older_history_summary"] = summary
         session.extra["older_history_fingerprint"] = fingerprint
         session.extra["last_compacted_round_count"] = older_round_count

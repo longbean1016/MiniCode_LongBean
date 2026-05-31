@@ -27,6 +27,8 @@ from app.working_memory_updater import (
     summarize_failure,
 )
 
+# 写入链路负责显式记忆入口、回合反思、去重验证和写后整理。
+
 
 class MemoryWritePipeline:
     _BLOCKED_REFLECTION_PREFIXES = (
@@ -53,6 +55,7 @@ class MemoryWritePipeline:
         self.memory_guard = memory_guard or MemoryWriteGuard()
 
     def reset_turn_runtime(self, working_memory: WorkingMemory) -> None:
+        # 这些条目只服务当前回合结束时的反思，不能跨轮保留。
         working_memory.clear_entries_by_type(
             "reflection_decision",
             "reflection_failure",
@@ -60,6 +63,8 @@ class MemoryWritePipeline:
         )
 
     def remember_user_intent(self, working_memory: WorkingMemory, user_input: str) -> None:
+        # 用户当轮要求先进入 working memory 立即生效，
+        # 是否进入长期记忆要等显式命令或反思再决定。
         working_memory.protect(
             user_input,
             entry_type="user_intent",
@@ -90,6 +95,7 @@ class MemoryWritePipeline:
         tool_input: object,
     ) -> None:
         for path in extract_active_paths(tool_name, tool_input):
+            # 一条路径同时服务“当前正在处理什么”和“回合结束反思碰过哪些文件”两种语义。
             working_memory.protect(
                 path,
                 entry_type="active_task",
@@ -111,6 +117,7 @@ class MemoryWritePipeline:
         result: ToolResult,
     ) -> None:
         failure_summary = summarize_failure(tool_name, result)
+        # 同一份失败摘要会被当前回合、风险提取和结束反思复用。
         working_memory.protect(
             failure_summary,
             entry_type="error_context",
@@ -137,6 +144,8 @@ class MemoryWritePipeline:
         *,
         content: str,
     ) -> None:
+        # assistant 输出里的关键决策和风险，也要先放进 working memory，
+        # 否则同一回合后续步骤可能就丢了。
         for preference in extract_user_preferences(content):
             working_memory.protect(
                 preference,
@@ -186,6 +195,7 @@ class MemoryWritePipeline:
         decay_log_enabled: bool,
         decay_log_echo: bool,
     ) -> ExplicitMemoryHandleResult:
+        # 先分流 `/user` 这类用户画像命令，再判断是否是显式 memory 指令。
         workspace = str(getattr(self.memory_store, "workspace", "."))
 
         # `/user` 命令只维护工作区根目录的 USER.md。
@@ -342,6 +352,7 @@ class MemoryWritePipeline:
         content = final_step.content.strip()
         if not content:
             return False
+        # 异常收尾不应触发反思，否则容易把错误状态误写成长时记忆。
         return not content.startswith(self._BLOCKED_REFLECTION_PREFIXES)
 
     def _collect_reflection_entries(
@@ -360,6 +371,7 @@ class MemoryWritePipeline:
                 continue
             seen.add(content)
             result.append(content)
+            # 反思阶段只需要少量高价值样本，避免把整个 working memory 原样灌回 extractor。
             if len(result) >= limit:
                 break
 
@@ -374,6 +386,7 @@ class MemoryWritePipeline:
             if not guard_decision.should_store:
                 continue
 
+            # guard 先判“该不该存”，verifier 再判“与旧记忆是什么关系”。
             similar_entries = self.memory_verifier.find_similar_entries(
                 entry,
                 existing_entries,
@@ -386,6 +399,7 @@ class MemoryWritePipeline:
                 verify_decision.action == "supersede_store"
                 and verify_decision.matched_memory_id.strip()
             ):
+                # 不直接删除旧记忆，而是记录替代关系，留给后续整理层慢慢收敛。
                 entry.extra["supersedes_memory_id"] = verify_decision.matched_memory_id.strip()
                 entry.extra["write_action"] = "supersede_store"
 
@@ -406,6 +420,7 @@ class MemoryWritePipeline:
         )
 
         for entry in entries:
+            # 给反思产物补来源证据，方便后续调试为什么它会被写入。
             entry.extra["reflection_admission_source"] = str(admission_source)
             entry.extra["reflection_has_project_file_evidence"] = bool(project_files_touched)
             entry.extra["project_files_touched"] = project_files_touched
@@ -421,6 +436,7 @@ class MemoryWritePipeline:
         if not stored_entries:
             return
 
+        # 先做增量整理和增量 decay，只有满足阈值时才做全量扫描。
         self.memory_curator.curate_new_entries(stored_entries)
         try:
             incremental_decay_result = self.memory_decay.refresh_new_entries(stored_entries)

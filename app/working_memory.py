@@ -99,6 +99,8 @@ class WorkingMemory:
         - 调用方不传 `entry_type` 时，按 `active_task` 处理
         - 传入空字符串时，也会回退到 `active_task`
         """
+        # 工作记忆只服务“当前会话中的持续约束和近期事实”，不是长期记忆库。
+        # 所以这里入库前先做轻量归一化，并在写入后立刻执行限额，防止它本身反过来挤爆 prompt。
         text = _normalize_text(content)
         normalized_type = _normalize_text(entry_type) or "active_task"
         if not text:
@@ -108,6 +110,8 @@ class WorkingMemory:
         if ttl_seconds is not None:
             expires_at = time.time() + ttl_seconds
 
+        # 某些类型天然只应该保留最新版本，例如当前任务、最新用户意图。
+        # 这种场景用 replace_latest_of_type，避免旧版本继续污染后续选择。
         if replace_latest_of_type:
             self.entries = [
                 entry for entry in self.get_entries()
@@ -196,6 +200,8 @@ class WorkingMemory:
             if not slot_entries:
                 continue
 
+            # 同一个槽位内部按“重要度优先，其次时间更近优先”排序。
+            # 这样 prompt 头部更容易先看到当前最该遵守的约束，而不是最早写入的历史条目。
             slot_entries.sort(
                 key=lambda entry: (entry.importance, entry.created_at),
                 reverse=True,
@@ -211,6 +217,8 @@ class WorkingMemory:
                 lines.append(normalized)
                 if len(lines) >= spec.max_entries:
                     break
+            # snapshot 只保存每个槽位最值得带进 prompt 的少量事实，
+            # 不把 WorkingMemory 原样平铺，避免结构化记忆再次膨胀成原始日志。
             if lines:
                 snapshot[slot_name] = lines
         return snapshot
@@ -233,6 +241,7 @@ class WorkingMemory:
             sections.append(f"{_PROMPT_SECTION_TITLES[slot_name]}：")
             sections.extend(f"- {line}" for line in lines)
 
+        # 未列入固定槽位的条目放到补充区，避免因为没建专门槽位就完全失声。
         supplemental_entries = [
             entry for entry in self.get_entries()
             if entry.entry_type not in _ENTRY_TYPE_LIMITS
@@ -247,12 +256,17 @@ class WorkingMemory:
     def _enforce_entry_limits(self) -> None:
         """超过类型/总量上限时，优先删除重要度最低、最旧的条目。"""
         self.clear_expired()
+        # 顺序不能反：
+        # 1. 先按类型限额，防止单一类别霸占全部预算
+        # 2. 再按总 token / 总条数做全局淘汰
+        # 这样“用户偏好被大量 tool_finding 挤掉”的概率会低很多。
         self._enforce_type_limits()
         self._enforce_token_budget()
         while len(self.entries) > self.max_entries:
             self.entries.pop(self._pick_lowest_priority_index())
 
     def _enforce_type_limits(self) -> None:
+        # 每种 entry_type 都有独立上限，防止某一种运行时噪声无限堆积。
         for entry_type, max_allowed in _ENTRY_TYPE_LIMITS.items():
             matching_indexes = [
                 index
@@ -275,6 +289,8 @@ class WorkingMemory:
                 ]
 
     def _enforce_token_budget(self) -> None:
+        # token 预算是真正影响 prompt 注入成本的硬约束，
+        # 即使总条数不多，只要单条太长，也必须继续淘汰。
         while self.get_protected_tokens() > self.max_tokens and self.entries:
             self.entries.pop(self._pick_lowest_priority_index())
 

@@ -12,6 +12,9 @@ from app.memory_store import MemoryEntry, MemoryStore
 from app.session import SessionData
 from app.working_memory import WorkingMemory
 
+# 读取链路只负责挑选和格式化本轮要注入的上下文，
+# 不负责把新内容写回长期记忆。
+
 
 def _shorten(text: str, max_chars: int) -> str:
     cleaned = " ".join(text.strip().split())
@@ -55,6 +58,8 @@ def _dedupe_memories(entries: Iterable[MemoryEntry]) -> list[MemoryEntry]:
         if not normalized_content or normalized_content in seen_content:
             continue
 
+        # 这里的去重优先信任稳定 id；
+        # 没有 id 时再退回到归一化后的正文，避免同一条记忆被不同召回通路重复注入。
         if entry.id:
             seen_ids.add(entry.id)
         seen_content.add(normalized_content)
@@ -69,6 +74,8 @@ def _build_memory_query(
     session_summary: str,
     working_memory: WorkingMemory | None,
 ) -> str:
+    # 检索查询不只来自当前一句用户输入，
+    # 还会吸收会话摘要和 working memory 里的活跃线索。
     parts: list[str] = []
 
     cleaned_user_input = user_input.strip()
@@ -101,6 +108,8 @@ def _build_memory_query(
 
 
 def _score_memory_for_injection(entry: MemoryEntry, query_text: str) -> float:
+    # 这里评估的是“是否值得直接塞进 prompt”的综合价值，
+    # 不是严格意义上的语义相似度。
     query_tokens = _tokenize(query_text)
     content_tokens = _tokenize(entry.content)
 
@@ -146,6 +155,7 @@ def _rerank_related_memories(
     query_text: str,
     max_items: int,
 ) -> list[MemoryEntry]:
+    # 底层检索只给候选，这里再按注入价值做二次排序。
     scored_entries = [
         (_score_memory_for_injection(entry, query_text), entry)
         for entry in _dedupe_memories(entries)
@@ -164,6 +174,8 @@ def _build_memory_debug_lines(
     pinned_memories: list[MemoryEntry],
     picked_memories: list[MemoryEntry],
 ) -> list[str]:
+    # debug_lines 不是给模型看的，而是给检索调试看的：
+    # 方便复盘“为什么这轮注入了这些记忆，而不是另外一些”。
     lines: list[str] = []
     lines.append(f"[memory-retrieval] query={_shorten(query_text, 400)}")
 
@@ -272,6 +284,7 @@ class MemoryReadPipeline:
         )
         pinned_entries = self._pick_pinned_entries()
         pinned_ids = {entry.id for entry in pinned_entries if entry.id}
+        # 固定记忆先占预算，剩余名额再给动态检索结果。
         retrieval_budget = max(0, top_k - len(pinned_entries))
         related_entries = self._search_related_entries(
             query_text=query_text,
@@ -294,6 +307,7 @@ class MemoryReadPipeline:
 
         injected_entries = _dedupe_memories([*pinned_entries, *picked_entries])
         if injected_entries:
+            # 标记“本轮被读过”，但真正的好坏反馈要等回合结束才能知道。
             self.memory_store.mark_memories_accessed(
                 [entry.id for entry in injected_entries if entry.id]
             )
@@ -337,6 +351,7 @@ class MemoryReadPipeline:
             and _normalize_text(entry.scope) in self.retrieval_scopes
         ]
         pinned_entries.sort(
+            # pinned 更像长期硬约束，因此优先看 scope，再看新旧和置信度。
             key=lambda entry: (
                 _scope_priority(entry.scope),
                 float(entry.updated_at),
@@ -353,6 +368,7 @@ class MemoryReadPipeline:
         result: list[MemoryEntry] = []
         for scope in self.retrieval_scopes:
             try:
+                # 分 scope 搜索可以减少 user / project 之间的互相挤占。
                 scope_entries = self.memory_store.search_memories(
                     query=query_text,
                     top_k=top_k,
@@ -371,6 +387,7 @@ class MemoryReadPipeline:
         if not filtered_sections:
             return ""
 
+        # 明确告诉模型：这些只是辅助上下文，和本轮显式要求冲突时以后者为准。
         header = (
             "以下内容是从当前会话和本地记忆中整理出的辅助上下文。"
             "它用于帮助你保持任务连续性、遵守长期约定，并避免重复犯错。"
