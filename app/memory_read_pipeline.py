@@ -38,9 +38,9 @@ def _tokenize(text: str) -> set[str]:
 
 def _scope_priority(scope: str) -> int:
     normalized_scope = _normalize_text(scope)
-    if normalized_scope == "project":
-        return 2
     if normalized_scope == "user":
+        return 2
+    if normalized_scope == "project":
         return 1
     return 0
 
@@ -58,8 +58,8 @@ def _dedupe_memories(entries: Iterable[MemoryEntry]) -> list[MemoryEntry]:
         if not normalized_content or normalized_content in seen_content:
             continue
 
-        # 这里的去重优先信任稳定 id；
-        # 没有 id 时再退回到归一化后的正文，避免同一条记忆被不同召回通路重复注入。
+        # 去重时优先相信稳定 id。
+        # 没有 id 时再回退到归一化正文，避免同一条记忆被不同召回路径重复注入。
         if entry.id:
             seen_ids.add(entry.id)
         seen_content.add(normalized_content)
@@ -75,7 +75,7 @@ def _build_memory_query(
     working_memory: WorkingMemory | None,
 ) -> str:
     # 检索查询不只来自当前一句用户输入，
-    # 还会吸收会话摘要和 working memory 里的活跃线索。
+    # 还会吸收会话压缩基线和 working memory 里的活跃线索。
     parts: list[str] = []
 
     cleaned_user_input = user_input.strip()
@@ -117,16 +117,18 @@ def _score_memory_for_injection(entry: MemoryEntry, query_text: str) -> float:
     if query_tokens and content_tokens:
         overlap_score = len(query_tokens & content_tokens) / max(1, len(query_tokens))
 
+    normalized_query = _normalize_text(query_text)
+
     tag_score = 0.0
     for tag in entry.tags:
         normalized_tag = _normalize_text(tag)
-        if normalized_tag and normalized_tag in _normalize_text(query_text):
+        if normalized_tag and normalized_tag in normalized_query:
             tag_score += 0.08
 
     domain_score = 0.0
     for domain in entry.domains:
         normalized_domain = _normalize_text(domain)
-        if normalized_domain and normalized_domain in _normalize_text(query_text):
+        if normalized_domain and normalized_domain in normalized_query:
             domain_score += 0.06
 
     confidence_score = max(0.0, min(1.0, float(entry.confidence))) * 0.25
@@ -135,7 +137,14 @@ def _score_memory_for_injection(entry: MemoryEntry, query_text: str) -> float:
 
     age_seconds = max(0.0, time.time() - float(entry.updated_at))
     recency_score = max(0.0, 1.0 - age_seconds / (30 * 86400)) * 0.12
-    scope_bonus = 0.08 if _normalize_text(entry.scope) == "project" else 0.04
+
+    normalized_scope = _normalize_text(entry.scope)
+    if normalized_scope == "user":
+        scope_bonus = 0.08
+    elif normalized_scope == "project":
+        scope_bonus = 0.05
+    else:
+        scope_bonus = 0.02
 
     return (
         overlap_score * 1.6
@@ -200,9 +209,7 @@ def _build_memory_debug_lines(
         injected_parts: list[str] = []
         for entry in picked_memories:
             score = _score_memory_for_injection(entry, query_text)
-            injected_parts.append(
-                f"{entry.id}:{entry.scope}:{entry.category}:score={score:.3f}"
-            )
+            injected_parts.append(f"{entry.id}:{entry.scope}:{entry.category}:score={score:.3f}")
         lines.append("[memory-retrieval] injected=" + " | ".join(injected_parts))
     else:
         lines.append("[memory-retrieval] injected=(none)")
@@ -210,26 +217,131 @@ def _build_memory_debug_lines(
     return lines
 
 
-def _format_pinned_memories(entries: list[MemoryEntry], *, max_chars_per_item: int) -> str:
+def _format_memory_section(
+    title: str,
+    entries: list[MemoryEntry],
+    *,
+    max_chars_per_item: int,
+) -> str:
     if not entries:
         return ""
 
-    lines = ["## 固定记忆"]
+    lines = [f"## {title}"]
     for index, entry in enumerate(entries, start=1):
         content = _shorten(entry.content, max_chars_per_item)
         lines.append(f"{index}. ({entry.scope}/{entry.category}) {content}")
     return "\n".join(lines).strip()
 
 
-def _format_long_term_memories(entries: list[MemoryEntry], max_chars_per_item: int) -> str:
-    if not entries:
-        return ""
+def _split_memories_by_scope(
+    entries: list[MemoryEntry],
+) -> tuple[list[MemoryEntry], list[MemoryEntry], list[MemoryEntry]]:
+    user_entries: list[MemoryEntry] = []
+    project_entries: list[MemoryEntry] = []
+    other_entries: list[MemoryEntry] = []
 
-    lines = ["## 相关长期记忆"]
-    for index, entry in enumerate(entries, start=1):
-        content = _shorten(entry.content, max_chars_per_item)
-        lines.append(f"{index}. ({entry.scope}/{entry.category}) {content}")
-    return "\n".join(lines).strip()
+    for entry in entries:
+        normalized_scope = _normalize_text(entry.scope)
+        if normalized_scope == "user":
+            user_entries.append(entry)
+        elif normalized_scope == "project":
+            project_entries.append(entry)
+        else:
+            other_entries.append(entry)
+
+    return user_entries, project_entries, other_entries
+
+
+def _split_user_memory_tiers(
+    entries: list[MemoryEntry],
+) -> tuple[list[MemoryEntry], list[MemoryEntry]]:
+    pinned_user_entries: list[MemoryEntry] = []
+    retrieved_user_entries: list[MemoryEntry] = []
+
+    for entry in entries:
+        if is_pinned_memory_entry(entry):
+            pinned_user_entries.append(entry)
+        else:
+            retrieved_user_entries.append(entry)
+
+    return pinned_user_entries, retrieved_user_entries
+
+
+def _select_injected_entries(
+    *,
+    pinned_entries: list[MemoryEntry],
+    picked_entries: list[MemoryEntry],
+    covered_text: str,
+    top_k: int,
+) -> list[MemoryEntry]:
+    # 这里显式做一次“注入层预算分配”：
+    # 1. 固定记忆永远优先。
+    # 2. 用户长期记忆至少保一条检索结果，避免 tight budget 时只剩项目记忆。
+    # 3. 剩余预算再按原有排序结果补齐。
+    filtered_pinned_entries = [
+        entry for entry in _dedupe_memories(pinned_entries)
+        if not _is_memory_already_covered(entry, covered_text)
+    ]
+    filtered_picked_entries = [
+        entry for entry in _dedupe_memories(picked_entries)
+        if not _is_memory_already_covered(entry, covered_text)
+    ]
+    if top_k <= 0:
+        return filtered_pinned_entries + filtered_picked_entries
+
+    remaining_budget = max(0, top_k - len(filtered_pinned_entries))
+    if remaining_budget <= 0:
+        return filtered_pinned_entries
+
+    user_candidates = [
+        entry for entry in filtered_picked_entries
+        if _normalize_text(entry.scope) == "user"
+    ]
+    project_candidates = [
+        entry for entry in filtered_picked_entries
+        if _normalize_text(entry.scope) == "project"
+    ]
+    other_candidates = [
+        entry for entry in filtered_picked_entries
+        if _normalize_text(entry.scope) not in {"user", "project"}
+    ]
+
+    selected_entries: list[MemoryEntry] = list(filtered_pinned_entries)
+
+    # 用户长期记忆是用户稳定偏好/习惯的主来源，优先保留至少一条。
+    if user_candidates and remaining_budget > 0:
+        selected_entries.append(user_candidates.pop(0))
+        remaining_budget -= 1
+
+    for bucket in (user_candidates, project_candidates, other_candidates):
+        while bucket and remaining_budget > 0:
+            selected_entries.append(bucket.pop(0))
+            remaining_budget -= 1
+
+    return _dedupe_memories(selected_entries)
+
+
+def _build_context_dedupe_text(
+    *,
+    session_summary: str,
+    working_memory_text: str,
+) -> str:
+    # active_context_summary 是当前压缩体系里的会话主基线，
+    # working memory 只保护少量高价值槽位。
+    # 这里把两者拼成“已覆盖文本基线”，避免重复注入长期记忆。
+    parts = [part.strip() for part in (session_summary, working_memory_text) if part.strip()]
+    return _normalize_text("\n".join(parts))
+
+
+def _is_memory_already_covered(entry: MemoryEntry, covered_text: str) -> bool:
+    if not covered_text:
+        return False
+
+    normalized_content = _normalize_text(entry.content)
+    if not normalized_content:
+        return True
+
+    return normalized_content in covered_text
 
 
 def _build_working_memory_brief(
@@ -288,6 +400,7 @@ class MemoryReadPipeline:
         max_memory_chars_per_item: int = 180,
     ) -> MemoryContextResult:
         sections: list[str] = []
+
         session_summary = _shorten(session_summary_override, max_summary_chars)
         if not session_summary:
             cached_active_summary = str(session.extra.get("active_context_summary", "")).strip()
@@ -297,8 +410,11 @@ class MemoryReadPipeline:
             session_summary = _shorten(cached_summary, max_summary_chars)
 
         if session_summary:
-            sections.append("## 会话摘要\n" + session_summary)
+            # active_context_summary 是当前压缩体系里的会话主基线，
+            # 长期记忆和 working memory 都只作为它的补充，而不是平级竞争者。
+            sections.append("## 当前会话压缩基线\n" + session_summary)
 
+        working_memory_text = ""
         if working_memory is not None:
             try:
                 working_memory_text = _build_working_memory_brief(
@@ -308,10 +424,9 @@ class MemoryReadPipeline:
             except Exception:
                 working_memory_text = ""
 
+        if self.memory_store is None:
             if working_memory_text:
                 sections.append("## 当前工作记忆\n" + working_memory_text)
-
-        if self.memory_store is None:
             return MemoryContextResult(prompt_context=self._build_prompt(sections))
 
         query_text = _build_memory_query(
@@ -321,6 +436,7 @@ class MemoryReadPipeline:
         )
         pinned_entries = self._pick_pinned_entries()
         pinned_ids = {entry.id for entry in pinned_entries if entry.id}
+
         # 固定记忆先占预算，剩余名额再给动态检索结果。
         retrieval_budget = max(0, top_k - len(pinned_entries))
         related_entries = self._search_related_entries(
@@ -330,7 +446,9 @@ class MemoryReadPipeline:
         picked_entries = _rerank_related_memories(
             [entry for entry in related_entries if entry.id not in pinned_ids],
             query_text=query_text,
-            max_items=retrieval_budget,
+            # 先尽量保留更完整的候选集合，真正的注入预算分配放到后面统一处理，
+            # 这样 tight budget 时仍有机会优先保住一条相关用户长期记忆。
+            max_items=max(top_k, retrieval_top_k),
         )
 
         debug_lines = _build_memory_debug_lines(
@@ -342,26 +460,40 @@ class MemoryReadPipeline:
         for line in debug_lines:
             log_event(line, echo=False)
 
-        injected_entries = _dedupe_memories([*pinned_entries, *picked_entries])
+        covered_text = _build_context_dedupe_text(
+            session_summary=session_summary,
+            working_memory_text=working_memory_text,
+        )
+        injected_entries = _select_injected_entries(
+            pinned_entries=pinned_entries,
+            picked_entries=picked_entries,
+            covered_text=covered_text,
+            top_k=top_k,
+        )
         if injected_entries:
             # 标记“本轮被读过”，但真正的好坏反馈要等回合结束才能知道。
             self.memory_store.mark_memories_accessed(
                 [entry.id for entry in injected_entries if entry.id]
             )
 
-        pinned_text = _format_pinned_memories(
-            pinned_entries,
-            max_chars_per_item=max_memory_chars_per_item,
-        )
-        related_text = _format_long_term_memories(
-            picked_entries,
-            max_chars_per_item=max_memory_chars_per_item,
-        )
+        user_entries, project_entries, other_entries = _split_memories_by_scope(injected_entries)
+        pinned_user_entries, retrieved_user_entries = _split_user_memory_tiers(user_entries)
+        for title, entries in (
+            ("固定用户长期记忆", pinned_user_entries),
+            ("相关用户长期记忆", retrieved_user_entries),
+            ("项目长期记忆", project_entries),
+            ("其他长期记忆", other_entries),
+        ):
+            section_text = _format_memory_section(
+                title,
+                entries,
+                max_chars_per_item=max_memory_chars_per_item,
+            )
+            if section_text:
+                sections.append(section_text)
 
-        if pinned_text:
-            sections.append(pinned_text)
-        if related_text:
-            sections.append(related_text)
+        if working_memory_text:
+            sections.append("## 当前工作记忆\n" + working_memory_text)
 
         return MemoryContextResult(
             prompt_context=self._build_prompt(sections),

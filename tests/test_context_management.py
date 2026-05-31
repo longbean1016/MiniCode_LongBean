@@ -1837,6 +1837,27 @@ class AgentLoopContextPolicyTests(unittest.TestCase):
         self.assertIn("结构化压缩记忆", rendered)
         self.assertIn("关键工具发现", rendered)
 
+    def test_build_preview_memory_context_keeps_active_context_summary_before_working_memory(self) -> None:
+        from app.context_runtime import _build_preview_memory_context
+
+        working_memory = WorkingMemory()
+        working_memory.protect("继续整理 session 压缩链路", entry_type="active_task", importance=0.9)
+        working_memory.protect("优先保留结构化事实", entry_type="key_decision", importance=0.9)
+
+        preview_context = _build_preview_memory_context(
+            active_context_summary="压缩基线：总结当前会话的主要任务和限制。",
+            working_memory=working_memory,
+        )
+
+        self.assertIn("## 当前会话压缩基线", preview_context)
+        self.assertIn("## 当前工作记忆", preview_context)
+        self.assertLess(
+            preview_context.index("## 当前会话压缩基线"),
+            preview_context.index("## 当前工作记忆"),
+        )
+        self.assertIn("继续整理 session 压缩链路", preview_context)
+        self.assertIn("优先保留结构化事实", preview_context)
+
     def test_working_memory_enforces_protected_slot_limits_and_builds_snapshot(self) -> None:
         working_memory = WorkingMemory(max_entries=20, max_tokens=400)
         working_memory.protect("偏好一：中文回答", entry_type="user_preference", importance=0.8)
@@ -1863,6 +1884,16 @@ class AgentLoopContextPolicyTests(unittest.TestCase):
         self.assertIn("项目约束：", prompt_text)
         self.assertIn("关键工具发现：", prompt_text)
 
+    def test_working_memory_snapshot_does_not_promote_user_intent_into_active_tasks(self) -> None:
+        working_memory = WorkingMemory(max_entries=20, max_tokens=400)
+        working_memory.protect("当前任务：继续清理上下文压缩链路", entry_type="active_task", importance=0.9)
+        working_memory.protect("用户意图：帮我分析压缩和长期记忆注入", entry_type="user_intent", importance=1.0)
+
+        snapshot = working_memory.build_protected_snapshot()
+
+        self.assertIn("当前任务：继续清理上下文压缩链路", snapshot["active_tasks"])
+        self.assertNotIn("用户意图：帮我分析压缩和长期记忆注入", snapshot["active_tasks"])
+
     def test_resolve_recent_risks_filters_directory_tree_markdown_and_file_body_noise(self) -> None:
         from app.context_signal_resolver import resolve_recent_risks
 
@@ -1875,6 +1906,70 @@ class AgentLoopContextPolicyTests(unittest.TestCase):
         risks = resolve_recent_risks(working_memory=working_memory)
 
         self.assertEqual(risks, ["真正风险：大 tool_result 会挤占 recent window"])
+
+    def test_resolve_project_constraints_prefers_long_term_constraints_and_filters_transient_runtime_noise(self) -> None:
+        from app.context_signal_resolver import resolve_project_constraints
+        from app.memory_feedback import MemoryFeedbackStore
+        from app.memory_pipeline import MemoryPipeline
+        from app.memory_read_pipeline import MemoryReadPipeline
+        from app.memory_store import JsonMemoryStore, create_memory_entry
+        from app.memory_write_pipeline import MemoryWritePipeline
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            memory_store = JsonMemoryStore(tmpdir)
+            memory_store.add_memory(
+                create_memory_entry(
+                    content="长期约束：上下文治理逻辑尽量不要继续堆进 main.py。",
+                    category="constraint",
+                    tags=["constraint", "architecture"],
+                    scope="project",
+                    confidence=0.95,
+                    source="task_reflection",
+                )
+            )
+            memory_store.add_memory(
+                create_memory_entry(
+                    content="长期约束：压缩链路相关代码要补中文注释。",
+                    category="constraint",
+                    tags=["constraint", "context_management"],
+                    scope="project",
+                    confidence=0.93,
+                    source="task_reflection",
+                )
+            )
+
+            pipeline = MemoryPipeline(
+                read_pipeline=MemoryReadPipeline(memory_store),
+                write_pipeline=MemoryWritePipeline(
+                    memory_store=memory_store,
+                    memory_extractor=_NoopExtractor(),
+                    memory_verifier=_NoopVerifier(),
+                    memory_curator=_NoopCurator(),
+                    memory_decay=_NoopDecay(),
+                ),
+                feedback_store=MemoryFeedbackStore(memory_store),
+            )
+            working_memory = WorkingMemory()
+            working_memory.protect(
+                "本轮完成后立刻停止，不要继续探索。",
+                entry_type="project_constraint",
+                importance=1.0,
+            )
+            working_memory.protect(
+                "稳定约束：修改压缩链路时保留长期记忆的权重。",
+                entry_type="project_constraint",
+                importance=0.9,
+            )
+
+            constraints = resolve_project_constraints(
+                memory_pipeline=pipeline,
+                working_memory=working_memory,
+            )
+
+            self.assertIn("长期约束：上下文治理逻辑尽量不要继续堆进 main.py。", constraints)
+            self.assertIn("长期约束：压缩链路相关代码要补中文注释。", constraints)
+            self.assertIn("稳定约束：修改压缩链路时保留长期记忆的权重。", constraints)
+            self.assertNotIn("本轮完成后立刻停止，不要继续探索。", constraints)
 
     def test_prepare_agent_context_records_auto_compact_history_when_pressure_remains_high(self) -> None:
         from app.context_runtime import prepare_agent_context
@@ -1960,6 +2055,30 @@ class AgentLoopContextPolicyTests(unittest.TestCase):
         self.assertIn("用户偏好与工作方式", prompt)
         self.assertIn("回答尽量直接", prompt)
         self.assertIn("不需要帮我测试", prompt)
+
+    def test_build_system_prompt_explains_memory_context_layering(self) -> None:
+        from app.prompt import build_system_prompt
+
+        prompt = build_system_prompt(
+            tool_registry=_FakeToolRegistry(),
+            memory_context=(
+                "## 当前会话压缩基线\n"
+                "压缩基线：当前主要在调整压缩和长期记忆注入。\n\n"
+                "## 固定用户长期记忆\n"
+                "- 默认使用中文回答\n\n"
+                "## 项目长期记忆\n"
+                "- 压缩链路代码补中文注释\n\n"
+                "## 当前工作记忆\n"
+                "- 本轮正在收口 prompt 侧说明"
+            ),
+        )
+
+        self.assertIn("【记忆上下文】", prompt)
+        self.assertIn("当前会话压缩基线", prompt)
+        self.assertIn("固定用户长期记忆 / 相关用户长期记忆", prompt)
+        self.assertIn("项目长期记忆", prompt)
+        self.assertIn("当前工作记忆", prompt)
+        self.assertIn("只作为本轮短期辅助", prompt)
 
     def test_run_auto_compact_full_summary_uses_event_sections(self) -> None:
         from app.context_auto_compact import run_auto_compact
@@ -2347,6 +2466,33 @@ class AgentLoopContextPolicyTests(unittest.TestCase):
             )
             self.assertTrue(state.compacted_messages)
             self.assertIn("preview_total", state.last_token_stats)
+
+    def test_context_state_reads_legacy_compact_memory_fields_but_does_not_write_them_back(self) -> None:
+        from app.context_state import ContextStateData
+
+        state = ContextStateData.from_dict(
+            {
+                "session_id": "sess-legacy",
+                "source_message_count": 0,
+                "source_history_fingerprint": "legacy-fp",
+                "compacted_messages": [],
+                "compact_memory_context": "旧压缩基线：优先回答中文。",
+                "compact_memory_snapshot": {
+                    "preferences": ["默认中文回答"],
+                    "stable_constraints": ["压缩链路补中文注释"],
+                },
+                "older_history_summary": "旧摘要",
+            }
+        )
+
+        serialized = state.to_dict()
+
+        self.assertEqual(state.active_context_summary, "旧压缩基线：优先回答中文。")
+        self.assertEqual(state.active_context_snapshot["preferences"], ["默认中文回答"])
+        self.assertNotIn("compact_memory_context", serialized)
+        self.assertNotIn("compact_memory_snapshot", serialized)
+        self.assertIn("active_context_summary", serialized)
+        self.assertIn("active_context_snapshot", serialized)
 
     def test_prepare_agent_context_persists_last_microcompact_at_from_pipeline(self) -> None:
         from app.context_auto_compact import AutoCompactResult

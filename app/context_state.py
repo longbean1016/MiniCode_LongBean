@@ -70,20 +70,16 @@ class ContextStateData:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "ContextStateData":
-        # 兼容旧状态文件：active_context_* 缺失时回退读取 compact_memory_*。
+        # 兼容旧状态文件：只在读取阶段兜底 legacy compact_memory_*。
+        # 新状态写回时统一只使用 active_context_*，避免旧命名继续扩散。
         raw_messages = data.get("compacted_messages", [])
         compacted_messages = [item for item in raw_messages if isinstance(item, dict)]
         raw_history = data.get("compaction_history", [])
         compaction_history = [item for item in raw_history if isinstance(item, dict)]
         raw_stats = data.get("last_token_stats", {})
         last_token_stats = dict(raw_stats) if isinstance(raw_stats, dict) else {}
-        active_context_snapshot = _normalize_snapshot(data.get("active_context_snapshot", {}))
-        legacy_snapshot = _normalize_snapshot(data.get("compact_memory_snapshot", {}))
-        if not active_context_snapshot:
-            active_context_snapshot = legacy_snapshot
-        active_context_summary = str(data.get("active_context_summary", "")).strip()
-        if not active_context_summary:
-            active_context_summary = str(data.get("compact_memory_context", "")).strip()
+        active_context_snapshot = _resolve_active_context_snapshot(data)
+        active_context_summary = _resolve_active_context_summary(data)
         raw_preferences = data.get("resolved_user_preferences", [])
         resolved_user_preferences = [
             str(item).strip() for item in raw_preferences if str(item).strip()
@@ -194,4 +190,20 @@ def _normalize_snapshot(raw_value: object) -> dict[str, list[str]]:
         if lines:
             normalized[key] = lines
     return normalized
+
+
+def _resolve_active_context_snapshot(data: dict[str, Any]) -> dict[str, list[str]]:
+    """优先读取 active_context_snapshot，缺失时再兼容旧字段 compact_memory_snapshot。"""
+    active_context_snapshot = _normalize_snapshot(data.get("active_context_snapshot", {}))
+    if active_context_snapshot:
+        return active_context_snapshot
+    return _normalize_snapshot(data.get("compact_memory_snapshot", {}))
+
+
+def _resolve_active_context_summary(data: dict[str, Any]) -> str:
+    """优先读取 active_context_summary，缺失时再兼容旧字段 compact_memory_context。"""
+    active_context_summary = str(data.get("active_context_summary", "")).strip()
+    if active_context_summary:
+        return active_context_summary
+    return str(data.get("compact_memory_context", "")).strip()
 

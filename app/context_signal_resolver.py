@@ -83,18 +83,22 @@ def resolve_project_constraints(
     lines: list[str] = []
     seen: set[str] = set()
 
+    # 项目长期记忆仍然是压缩链路里的稳定约束主源，
+    # working_memory.project_constraint 只补少量本轮新增但足够稳定的约束。
+    max_lines = 10
+
     for entry in _load_project_constraint_entries(memory_pipeline):
         if not _looks_like_stable_project_constraint(entry.content):
             continue
         _append_unique_line(lines, seen, entry.content, limit=120)
-        if len(lines) >= 8:
+        if len(lines) >= max_lines:
             break
 
     for entry in working_memory.get_entries_by_type("project_constraint"):
         if not _looks_like_stable_project_constraint(entry.content):
             continue
         _append_unique_line(lines, seen, entry.content, limit=120)
-        if len(lines) >= 8:
+        if len(lines) >= max_lines:
             break
 
     return lines

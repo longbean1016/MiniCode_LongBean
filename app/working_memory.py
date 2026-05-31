@@ -49,7 +49,9 @@ class ProtectedSlotSpec:
 _PROTECTED_SLOT_SPECS: dict[str, ProtectedSlotSpec] = {
     "preferences": ProtectedSlotSpec(("user_preference",), 2),
     "stable_constraints": ProtectedSlotSpec(("project_constraint",), 3),
-    "active_tasks": ProtectedSlotSpec(("active_task", "user_intent"), 3),
+    # user_intent 已经会通过当前用户消息和检索 query 参与主链路，
+    # 这里不再把它提升进 active_tasks，避免它和长期记忆/压缩基线重复抢位。
+    "active_tasks": ProtectedSlotSpec(("active_task",), 2),
     "decisions": ProtectedSlotSpec(("key_decision",), 4),
     "open_issues": ProtectedSlotSpec(("recent_risk", "error_context"), 4),
     "tool_findings": ProtectedSlotSpec(("reflection_file", "tool_finding"), 2),

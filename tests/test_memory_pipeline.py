@@ -266,6 +266,242 @@ class MemoryPipelineTests(unittest.TestCase):
             self.assertEqual(by_id[user_entry.id].usage_count, 1)
             self.assertEqual(by_id[unrelated_entry.id].usage_count, 0)
 
+    def test_read_pipeline_uses_active_context_summary_as_primary_baseline_and_orders_user_first(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            memory_store = JsonMemoryStore(tmpdir)
+            user_entry = memory_store.add_memory(
+                create_memory_entry(
+                    content="Prefer concise summaries with file references.",
+                    category="preference",
+                    tags=["style"],
+                    scope="user",
+                    confidence=1.0,
+                    source="manual_memory_input",
+                    extra={"pin_to_prompt": True, "managed_channel": "explicit_memory"},
+                )
+            )
+            project_entry = memory_store.add_memory(
+                create_memory_entry(
+                    content="Use repository services for session persistence changes.",
+                    category="convention",
+                    tags=["session", "architecture"],
+                    scope="project",
+                    confidence=0.92,
+                    source="task_reflection",
+                )
+            )
+
+            session = create_new_session(tmpdir)
+            session.extra["active_context_summary"] = (
+                "压缩基线：当前任务是总结 session persistence 变更，并保留文件引用。"
+            )
+
+            result = MemoryReadPipeline(memory_store).build_context(
+                user_input="Summarize the session persistence update with file references.",
+                session=session,
+                working_memory=WorkingMemory(),
+                top_k=2,
+                retrieval_top_k=4,
+            )
+
+            self.assertIn("## 当前会话压缩基线", result.prompt_context)
+            self.assertIn("压缩基线：当前任务是总结 session persistence 变更", result.prompt_context)
+            self.assertIn("## 固定用户长期记忆", result.prompt_context)
+            self.assertIn("## 项目长期记忆", result.prompt_context)
+            self.assertLess(
+                result.prompt_context.index("## 当前会话压缩基线"),
+                result.prompt_context.index("## 固定用户长期记忆"),
+            )
+            self.assertLess(
+                result.prompt_context.index("## 固定用户长期记忆"),
+                result.prompt_context.index("## 项目长期记忆"),
+            )
+            self.assertLess(
+                result.prompt_context.index(user_entry.content),
+                result.prompt_context.index(project_entry.content),
+            )
+
+    def test_read_pipeline_skips_memories_already_covered_by_summary_or_working_memory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            memory_store = JsonMemoryStore(tmpdir)
+            duplicate_summary_entry = memory_store.add_memory(
+                create_memory_entry(
+                    content="Prefer concise summaries with file references.",
+                    category="preference",
+                    tags=["style"],
+                    scope="user",
+                    confidence=1.0,
+                    source="manual_memory_input",
+                    extra={"pin_to_prompt": True, "managed_channel": "explicit_memory"},
+                )
+            )
+            duplicate_working_entry = memory_store.add_memory(
+                create_memory_entry(
+                    content="Need to summarize session persistence changes.",
+                    category="task",
+                    tags=["session"],
+                    scope="project",
+                    confidence=0.9,
+                    source="task_reflection",
+                )
+            )
+            remaining_entry = memory_store.add_memory(
+                create_memory_entry(
+                    content="Keep repository-level session persistence changes inside repository services.",
+                    category="convention",
+                    tags=["session", "architecture"],
+                    scope="project",
+                    confidence=0.92,
+                    source="task_reflection",
+                )
+            )
+
+            session = create_new_session(tmpdir)
+            session.extra["active_context_summary"] = (
+                "压缩基线：Prefer concise summaries with file references."
+            )
+            working_memory = WorkingMemory()
+            working_memory.protect(
+                "Need to summarize session persistence changes.",
+                entry_type="active_task",
+            )
+
+            result = MemoryReadPipeline(memory_store).build_context(
+                user_input="Summarize the session persistence update with file references.",
+                session=session,
+                working_memory=working_memory,
+                top_k=3,
+                retrieval_top_k=6,
+            )
+
+            self.assertIn(remaining_entry.content, result.prompt_context)
+            self.assertNotIn(
+                "1. (user/preference) Prefer concise summaries with file references.",
+                result.prompt_context,
+            )
+            self.assertNotIn(
+                "1. (project/task) Need to summarize session persistence changes.",
+                result.prompt_context,
+            )
+            self.assertEqual(
+                {entry.id for entry in result.injected_entries},
+                {remaining_entry.id},
+            )
+
+            by_id = {entry.id: entry for entry in memory_store.load_memories()}
+            self.assertEqual(by_id[duplicate_summary_entry.id].usage_count, 0)
+            self.assertEqual(by_id[duplicate_working_entry.id].usage_count, 0)
+            self.assertEqual(by_id[remaining_entry.id].usage_count, 1)
+
+    def test_read_pipeline_splits_pinned_and_retrieved_user_memories_before_project_memories(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            memory_store = JsonMemoryStore(tmpdir)
+            pinned_user_entry = memory_store.add_memory(
+                create_memory_entry(
+                    content="Pinned user preference: always answer in concise Chinese.",
+                    category="preference",
+                    tags=["style"],
+                    scope="user",
+                    confidence=1.0,
+                    source="manual_memory_input",
+                    extra={"pin_to_prompt": True, "managed_channel": "explicit_memory"},
+                )
+            )
+            retrieved_user_entry = memory_store.add_memory(
+                create_memory_entry(
+                    content="Retrieved user preference: include file references when summarizing code changes.",
+                    category="preference",
+                    tags=["summary", "style"],
+                    scope="user",
+                    confidence=0.95,
+                    source="task_reflection",
+                )
+            )
+            project_entry = memory_store.add_memory(
+                create_memory_entry(
+                    content="Project convention: keep context-management wiring out of main.py.",
+                    category="convention",
+                    tags=["architecture", "context_management"],
+                    scope="project",
+                    confidence=0.94,
+                    source="task_reflection",
+                )
+            )
+
+            session = create_new_session(tmpdir)
+            result = MemoryReadPipeline(memory_store).build_context(
+                user_input="Summarize the context management changes with file references in Chinese.",
+                session=session,
+                working_memory=WorkingMemory(),
+                top_k=3,
+                retrieval_top_k=6,
+            )
+
+            self.assertIn("## 固定用户长期记忆", result.prompt_context)
+            self.assertIn("## 相关用户长期记忆", result.prompt_context)
+            self.assertIn("## 项目长期记忆", result.prompt_context)
+            self.assertLess(
+                result.prompt_context.index("## 固定用户长期记忆"),
+                result.prompt_context.index("## 相关用户长期记忆"),
+            )
+            self.assertLess(
+                result.prompt_context.index("## 相关用户长期记忆"),
+                result.prompt_context.index("## 项目长期记忆"),
+            )
+            self.assertIn(pinned_user_entry.content, result.prompt_context)
+            self.assertIn(retrieved_user_entry.content, result.prompt_context)
+            self.assertIn(project_entry.content, result.prompt_context)
+
+    def test_read_pipeline_keeps_user_memory_when_top_k_is_tight(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            memory_store = JsonMemoryStore(tmpdir)
+            pinned_user_entry = memory_store.add_memory(
+                create_memory_entry(
+                    content="Pinned user preference: default to Chinese responses.",
+                    category="preference",
+                    tags=["style"],
+                    scope="user",
+                    confidence=1.0,
+                    source="manual_memory_input",
+                    extra={"pin_to_prompt": True, "managed_channel": "explicit_memory"},
+                )
+            )
+            retrieved_user_entry = memory_store.add_memory(
+                create_memory_entry(
+                    content="Retrieved user preference: preserve compressed context details when possible.",
+                    category="preference",
+                    tags=["compression", "style"],
+                    scope="user",
+                    confidence=0.96,
+                    source="task_reflection",
+                )
+            )
+            project_entry = memory_store.add_memory(
+                create_memory_entry(
+                    content="Project convention: keep long-term memory prominent in compressed context.",
+                    category="convention",
+                    tags=["compression", "memory"],
+                    scope="project",
+                    confidence=0.95,
+                    source="task_reflection",
+                )
+            )
+
+            session = create_new_session(tmpdir)
+            result = MemoryReadPipeline(memory_store).build_context(
+                user_input="Adjust compression so long-term memory remains visible.",
+                session=session,
+                working_memory=WorkingMemory(),
+                top_k=2,
+                retrieval_top_k=6,
+            )
+
+            self.assertIn(pinned_user_entry.content, result.prompt_context)
+            self.assertIn(retrieved_user_entry.content, result.prompt_context)
+            self.assertNotIn(project_entry.content, result.prompt_context)
+
     def test_write_pipeline_reflects_without_stable_completion_marker(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             memory_store = JsonMemoryStore(tmpdir)

@@ -337,7 +337,9 @@ def _build_preview_memory_context(
     """构造预估阶段的轻量 memory_context，不触发长期记忆检索。"""
     sections: list[str] = []
     if active_context_summary.strip():
-        sections.append(active_context_summary.strip())
+        # 预估阶段也尽量复用正式注入时的结构，
+        # 让 token 预估更接近真实请求的上下文形态。
+        sections.append("## 当前会话压缩基线\n" + active_context_summary.strip())
 
     try:
         working_memory_text = _build_preview_working_memory_brief(working_memory)
@@ -345,7 +347,8 @@ def _build_preview_memory_context(
         working_memory_text = ""
 
     if working_memory_text:
-        sections.append(working_memory_text)
+        # preview 里不做长期记忆检索，只保留轻量 working memory 补充位。
+        sections.append("## 当前工作记忆\n" + working_memory_text)
 
     return "\n".join(sections).strip()
 
@@ -354,6 +357,8 @@ def _build_preview_working_memory_brief(working_memory: WorkingMemory) -> str:
     """预估阶段只保留少量高价值 working memory，避免预估值过度膨胀。"""
     sections: list[str] = []
     slot_specs = (
+        # 这里和 MemoryReadPipeline 保持同一组核心槽位，
+        # 避免 preview 与真实注入阶段关注点错位。
         ("当前任务", "active_task", 2),
         ("关键决策", "key_decision", 2),
         ("最近风险", "recent_risk", 2),
