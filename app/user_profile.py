@@ -7,6 +7,79 @@ from pathlib import Path
 
 _SECTION_RE = re.compile(r"^##\s+(.+)$", re.MULTILINE)
 _KV_RE = re.compile(r"^-\s+\*\*(.+?)\*\*:\s*(.+)$")
+_PATH_SCOPED_RULE_RE = re.compile(
+    r"^(?:在|对|针对|对于)\s*([A-Za-z0-9_./\\-]+)(?:\s*(?:目录|文件夹|路径))?(?:\s*(?:下|中|里))?"
+)
+_BARE_PATH_SCOPED_RULE_RE = re.compile(
+    r"^([A-Za-z0-9_./\\-]+)\s*(?:目录|文件夹|路径|下|中|里)\b"
+)
+
+
+@dataclass(frozen=True, slots=True)
+class UserPolicyRule:
+    """一条来自 USER.md 的结构化用户规则。"""
+
+    instruction: str
+    scope_type: str = "path"
+    scope_value: str = ""
+
+    def applies_to(self, task_text: str) -> bool:
+        """判断规则是否命中当前任务。"""
+        if self.scope_type != "path":
+            return True
+
+        normalized_scope = _normalize_scope_value(self.scope_value)
+        normalized_task = _normalize_policy_match_text(task_text)
+        if not normalized_scope or not normalized_task:
+            return False
+
+        candidates = {normalized_scope}
+        basename = normalized_scope.split("/")[-1]
+        if basename:
+            candidates.add(basename)
+
+        return any(candidate and candidate in normalized_task for candidate in candidates)
+
+
+@dataclass(slots=True)
+class ResolvedUserPolicy:
+    """按全局偏好和作用域规则拆开的 USER.md 运行时策略。"""
+
+    global_preferences: list[str] = field(default_factory=list)
+    scoped_rules: list[UserPolicyRule] = field(default_factory=list)
+    source_path: str = ""
+
+    def active_rules_for(self, task_text: str) -> list[UserPolicyRule]:
+        """筛出当前任务真正命中的规则。"""
+        active_rules: list[UserPolicyRule] = []
+        seen: set[tuple[str, str, str]] = set()
+        for rule in self.scoped_rules:
+            if not rule.applies_to(task_text):
+                continue
+            dedupe_key = (
+                rule.scope_type,
+                _normalize_scope_value(rule.scope_value),
+                " ".join(rule.instruction.strip().lower().split()),
+            )
+            if dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+            active_rules.append(rule)
+        return active_rules
+
+    def to_prompt_section(self, active_rules: list[UserPolicyRule] | None = None) -> str:
+        """渲染成每轮 system prompt 可直接注入的文本。"""
+        lines: list[str] = []
+        for item in _dedupe_lines(self.global_preferences)[:6]:
+            lines.append(f"- 全局偏好：{item}")
+
+        for rule in active_rules or []:
+            scope_value = _normalize_scope_value(rule.scope_value) or rule.scope_value.strip()
+            lines.append(f"- 当前任务命中规则（{scope_value}）：{rule.instruction.strip()}")
+
+        if not lines:
+            return ""
+        return "\n".join(lines)
 
 
 @dataclass(slots=True)
@@ -23,6 +96,32 @@ class UserProfileSnapshot:
 
     def to_preference_lines(self) -> list[str]:
         """把 USER.md 内容转成适合注入 state/compact memory 的短偏好列表。"""
+        lines = self._build_structured_preference_lines()
+        if self.custom_instructions.strip():
+            lines.extend(_split_instruction_lines(self.custom_instructions))
+
+        return _dedupe_lines(lines)
+
+    def build_resolved_policy(self) -> ResolvedUserPolicy:
+        """把自由文本偏好拆成全局偏好和作用域规则。"""
+        global_preferences = self._build_structured_preference_lines()
+        scoped_rules: list[UserPolicyRule] = []
+
+        for line in _split_instruction_lines(self.custom_instructions):
+            rule = _build_scoped_rule(line)
+            if rule is None:
+                global_preferences.append(line)
+                continue
+            scoped_rules.append(rule)
+
+        return ResolvedUserPolicy(
+            global_preferences=_dedupe_lines(global_preferences),
+            scoped_rules=_dedupe_policy_rules(scoped_rules),
+            source_path=self.source_path,
+        )
+
+    def _build_structured_preference_lines(self) -> list[str]:
+        """只渲染可稳定映射的结构化偏好字段。"""
         lines: list[str] = []
 
         normalized_language = self.language.strip().lower()
@@ -48,10 +147,7 @@ class UserProfileSnapshot:
         elif self.comments.strip():
             lines.append(self.comments.strip())
 
-        if self.custom_instructions.strip():
-            lines.extend(_split_instruction_lines(self.custom_instructions))
-
-        return _dedupe_lines(lines)
+        return lines
 
 
 def load_user_profile(workspace: str) -> UserProfileSnapshot | None:
@@ -304,6 +400,58 @@ def _merge_manual_instruction_text(*parts: str) -> str:
             seen.add(normalized)
             merged_lines.append(cleaned)
     return "\n".join(merged_lines)
+
+
+def _build_scoped_rule(line: str) -> UserPolicyRule | None:
+    """尽量从自由文本里提取“某个路径/目录下的规则”。"""
+    cleaned = line.strip()
+    if not cleaned:
+        return None
+
+    match = _PATH_SCOPED_RULE_RE.match(cleaned) or _BARE_PATH_SCOPED_RULE_RE.match(cleaned)
+    if match is None:
+        return None
+
+    scope_value = _normalize_scope_value(match.group(1))
+    if not scope_value:
+        return None
+
+    return UserPolicyRule(
+        instruction=cleaned,
+        scope_type="path",
+        scope_value=scope_value,
+    )
+
+
+def _dedupe_policy_rules(rules: list[UserPolicyRule]) -> list[UserPolicyRule]:
+    """对结构化规则做稳定去重。"""
+    result: list[UserPolicyRule] = []
+    seen: set[tuple[str, str, str]] = set()
+    for rule in rules:
+        dedupe_key = (
+            rule.scope_type,
+            _normalize_scope_value(rule.scope_value),
+            " ".join(rule.instruction.strip().lower().split()),
+        )
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        result.append(rule)
+    return result
+
+
+def _normalize_scope_value(value: str) -> str:
+    """把路径作用域统一成稳定匹配格式。"""
+    normalized = str(value).strip().strip("\"'`")
+    normalized = normalized.replace("\\", "/")
+    normalized = normalized.lstrip("./")
+    normalized = normalized.strip("/")
+    return normalized.lower()
+
+
+def _normalize_policy_match_text(text: str) -> str:
+    """归一化任务文本，便于路径规则匹配。"""
+    return " ".join(str(text).strip().lower().replace("\\", "/").split())
 
 
 def _handle_user_set(payload: str, workspace: str) -> str:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from dataclasses import dataclass
+from pathlib import Path
 
 from app.explicit_memory import parse_manual_memory_input
 from app.memory_guard import MemoryWriteGuard
@@ -165,16 +166,33 @@ class MemoryPipelineTests(unittest.TestCase):
             )
             self.assertTrue(error_entries)
 
-    def test_parse_manual_user_memory_is_pinned_for_prompt(self) -> None:
+    def test_parse_manual_user_memory_is_not_treated_as_explicit_long_term_memory(self) -> None:
         intent = parse_manual_memory_input("/memory add user: Prefer concise answers")
+
+        self.assertIsNone(intent)
+
+    def test_parse_manual_memory_usage_only_mentions_project_scope(self) -> None:
+        intent = parse_manual_memory_input("/memory add")
 
         self.assertIsNotNone(intent)
         assert intent is not None
-        self.assertTrue(intent.should_store)
+        self.assertFalse(intent.should_store)
+        self.assertEqual(intent.ack_message, "用法：/memory add [project:] <内容>")
 
-        entry = intent.to_memory_entry(session_id="sess-1")
-        self.assertEqual(entry.scope, "user")
-        self.assertTrue(entry.extra["pin_to_prompt"])
+    def test_parse_manual_memory_keeps_default_and_explicit_project_forms(self) -> None:
+        default_intent = parse_manual_memory_input("/memory add 新增接口时优先补测试")
+        scoped_intent = parse_manual_memory_input(
+            "/memory add project: 修改 session 相关逻辑时优先走 repository/service 层"
+        )
+
+        self.assertIsNotNone(default_intent)
+        self.assertIsNotNone(scoped_intent)
+        assert default_intent is not None
+        assert scoped_intent is not None
+        self.assertTrue(default_intent.should_store)
+        self.assertTrue(scoped_intent.should_store)
+        self.assertEqual(default_intent.scope, "project")
+        self.assertEqual(scoped_intent.scope, "project")
 
     def test_read_pipeline_includes_project_and_user_memories_and_marks_only_injected_usage(
         self,
@@ -295,7 +313,7 @@ class MemoryPipelineTests(unittest.TestCase):
             self.assertEqual(len(result.stored_entries), 1)
             self.assertEqual(memory_store.load_memories()[0].content, candidate_entry.content)
 
-    def test_write_pipeline_handles_explicit_user_memory(self) -> None:
+    def test_write_pipeline_does_not_handle_memory_add_user_alias(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             memory_store = JsonMemoryStore(tmpdir)
             pipeline = MemoryWritePipeline(
@@ -314,12 +332,10 @@ class MemoryPipelineTests(unittest.TestCase):
                 decay_log_echo=False,
             )
 
-            self.assertTrue(result.handled)
-            self.assertIn("已记录", result.assistant_text)
-            stored_entries = memory_store.load_memories()
-            self.assertEqual(len(stored_entries), 1)
-            self.assertEqual(stored_entries[0].scope, "user")
-            self.assertTrue(stored_entries[0].extra["pin_to_prompt"])
+            self.assertFalse(result.handled)
+            self.assertEqual(len(memory_store.load_memories()), 0)
+            self.assertFalse(result.assistant_text)
+            self.assertFalse((Path(memory_store.workspace) / "USER.md").exists())
 
     def test_feedback_store_rewards_success_and_penalizes_failure(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

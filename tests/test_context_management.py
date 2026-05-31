@@ -887,6 +887,37 @@ class ContextManagerTests(unittest.TestCase):
             self.assertIn("回答尽量直接", profile.to_preference_lines())
             self.assertIn("修改代码时加中文注释", profile.to_preference_lines())
 
+    def test_user_profile_loader_builds_structured_policy_from_loose_manual_text(self) -> None:
+        from app.user_profile import load_user_profile
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            user_md_path = f"{tmpdir}\\USER.md"
+            with open(user_md_path, "w", encoding="utf-8") as handle:
+                handle.write(
+                    "# User Profile\n\n"
+                    "## Custom Instructions\n"
+                    "- 回答尽量直接\n"
+                    "- 在tmp新建的代码不需要帮我测试，我自己手动测试\n"
+                    "- 在tmp文件夹写好的文件末尾都加上变量 longbean = 666\n"
+                )
+
+            profile = load_user_profile(tmpdir)
+
+            self.assertIsNotNone(profile)
+            assert profile is not None
+            policy = profile.build_resolved_policy()
+            self.assertIn("回答尽量直接", policy.global_preferences)
+            self.assertEqual(
+                [rule.scope_value for rule in policy.scoped_rules],
+                ["tmp", "tmp"],
+            )
+            self.assertTrue(
+                any("不需要帮我测试" in rule.instruction for rule in policy.scoped_rules)
+            )
+            self.assertTrue(
+                any("longbean = 666" in rule.instruction for rule in policy.scoped_rules)
+            )
+
 
 class ContextCompactorTests(unittest.TestCase):
     def test_compactor_keeps_raw_tool_evidence_when_budget_already_safe(self) -> None:
@@ -1560,6 +1591,42 @@ class AgentLoopContextPolicyTests(unittest.TestCase):
                 any("工具调用" in item or "立即停止" in item for item in state.resolved_project_constraints)
             )
 
+    def test_prepare_agent_context_resolves_active_user_rules_for_current_task(self) -> None:
+        from app.context_runtime import prepare_agent_context
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with open(f"{tmpdir}\\USER.md", "w", encoding="utf-8") as handle:
+                handle.write(
+                    "# User Profile\n\n"
+                    "## Custom Instructions\n"
+                    "- 回答尽量直接\n"
+                    "- 在tmp新建的代码不需要帮我测试，我自己手动测试\n"
+                    "- 在docs目录下编辑文档时保留中文标题\n"
+                )
+
+            tool_registry = _FakeToolRegistry()
+            session = create_new_session(tmpdir)
+            working_memory = WorkingMemory()
+            working_memory.protect("在 tmp 文件夹写一个归并排序的 Java 解法", entry_type="user_intent")
+
+            prepared = prepare_agent_context(
+                full_history=[{"role": "user", "content": "帮我在tmp文件夹写一个归并排序的java解法"}],
+                session=session,
+                tool_registry=tool_registry,
+                working_memory=working_memory,
+                memory_pipeline=None,
+                history_summarizer=None,
+            )
+
+            self.assertIn("回答尽量直接", prepared.resolved_user_policy.global_preferences)
+            self.assertEqual(
+                [rule.scope_value for rule in prepared.active_user_rules],
+                ["tmp"],
+            )
+            self.assertIn("用户偏好与工作方式", str(prepared.messages[0].get("content", "")))
+            self.assertIn("不需要帮我测试", str(prepared.messages[0].get("content", "")))
+            self.assertNotIn("保留中文标题", str(prepared.messages[0].get("content", "")))
+
     def test_build_compact_memory_context_merges_summary_and_working_memory(self) -> None:
         from app.context_compact_memory import build_compact_memory_context
 
@@ -1771,6 +1838,23 @@ class AgentLoopContextPolicyTests(unittest.TestCase):
         self.assertTrue(result.messages)
         self.assertEqual(result.messages[0]["role"], "system")
         self.assertIn("MEMORY_BASELINE_TOKEN", str(result.messages[0]["content"]))
+
+    def test_build_system_prompt_includes_user_profile_context(self) -> None:
+        from app.prompt import build_system_prompt
+
+        prompt = build_system_prompt(
+            tool_registry=_FakeToolRegistry(),
+            memory_context="长期记忆",
+            user_profile_context=(
+                "## 用户偏好与工作方式\n"
+                "- 全局偏好：回答尽量直接\n"
+                "- 当前任务命中规则（tmp）：在tmp新建的代码不需要帮我测试，我自己手动测试"
+            ),
+        )
+
+        self.assertIn("用户偏好与工作方式", prompt)
+        self.assertIn("回答尽量直接", prompt)
+        self.assertIn("不需要帮我测试", prompt)
 
     def test_run_auto_compact_full_summary_uses_event_sections(self) -> None:
         from app.context_auto_compact import run_auto_compact

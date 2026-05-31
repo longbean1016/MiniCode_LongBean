@@ -74,6 +74,7 @@ def _build_analysis_rules() -> str:
 def build_system_prompt(
     tool_registry: ToolRegistry,
     memory_context: str = "",
+    user_profile_context: str = "",
 ) -> str:
     """拼装分层系统提示词，供主循环每轮发送给模型。"""
     sections = [
@@ -83,6 +84,9 @@ def build_system_prompt(
         "【失败重试策略】\n" + _build_retry_policy(),
         "【回答风格】\n" + _build_response_style(),
     ]
+
+    if user_profile_context.strip():
+        sections.append("【用户偏好与工作方式】\n" + user_profile_context.strip())
 
     # 记忆上下文属于每轮都可能变化的动态部分。
     # 只有在确实有内容时才加入，避免 system prompt 里出现空标题。

@@ -186,6 +186,7 @@ def _build_test_config(workspace_root: str) -> AppConfig:
         workspace_root=workspace_root,
         qdrant_enabled=False,
         qdrant_url="http://localhost:6333",
+        qdrant_path="",
         qdrant_api_key="",
         qdrant_collection="project_memories",
         model_retry_max_attempts=1,

@@ -15,6 +15,7 @@ from app.memory_models import (
 from app.memory_reflection_policy import decide_project_reflection
 from app.memory_store import MemoryEntry, MemoryStore
 from app.types import AgentStep, ChatMessage, ToolResult
+from app.user_profile import handle_user_profile_command
 from app.working_memory import WorkingMemory
 from app.working_memory_updater import (
     extract_active_paths,
@@ -34,7 +35,6 @@ class MemoryWritePipeline:
         "未识别的模型返回类型",
         "模型返回了空的工具调用",
     )
-
     def __init__(
         self,
         *,
@@ -186,6 +186,22 @@ class MemoryWritePipeline:
         decay_log_enabled: bool,
         decay_log_echo: bool,
     ) -> ExplicitMemoryHandleResult:
+        workspace = str(getattr(self.memory_store, "workspace", "."))
+
+        # `/user` 命令只维护工作区根目录的 USER.md。
+        user_profile_result = handle_user_profile_command(user_input, workspace)
+        if user_profile_result.handled:
+            assistant_text = user_profile_result.response_text
+            return ExplicitMemoryHandleResult(
+                handled=True,
+                history=self._append_direct_exchange(
+                    history,
+                    user_input=user_input,
+                    assistant_text=assistant_text,
+                ),
+                assistant_text=assistant_text,
+            )
+
         intent = parse_manual_memory_input(user_input)
         if intent is None:
             return ExplicitMemoryHandleResult(

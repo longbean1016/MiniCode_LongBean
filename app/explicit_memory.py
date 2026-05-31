@@ -104,11 +104,16 @@ def parse_manual_memory_input(user_input: str) -> ExplicitMemoryIntent | None:
         return ExplicitMemoryIntent(
             should_store=False,
             continue_to_agent=False,
-            ack_message="用法：/memory add [user|project:] <内容>",
+            ack_message="用法：/memory add [project:] <内容>",
         )
 
     scope = "project"
-    scope_match = re.match(r"^(user|project)\s*:\s*(.+)$", content, flags=re.I)
+    # `/memory add user:` 这条旧写法不再解析，避免被误当成 project 正文写入。
+    if re.match(r"^user\s*:", content, flags=re.I):
+        return None
+
+    # `/memory add` 只支持默认 project 和记显式 `project:` 前缀。
+    scope_match = re.match(r"^(project)\s*:\s*(.*)$", content, flags=re.I)
     if scope_match:
         scope = scope_match.group(1).strip().lower()
         content = scope_match.group(2).strip()
@@ -117,16 +122,14 @@ def parse_manual_memory_input(user_input: str) -> ExplicitMemoryIntent | None:
         return ExplicitMemoryIntent(
             should_store=False,
             continue_to_agent=False,
-            ack_message="用法：/memory add [user|project:] <内容>",
+            ack_message="用法：/memory add [project:] <内容>",
         )
-
-    category = "convention" if scope == "project" else "preference"
 
     return ExplicitMemoryIntent(
         should_store=True,
         continue_to_agent=False,
         scope=scope,
-        category=category,
+        category="convention",
         source="manual_memory_input",
         content=content,
         tags=["manual", "chat"],

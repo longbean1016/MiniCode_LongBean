@@ -37,6 +37,7 @@ from app.prompt import build_system_prompt
 from app.session import SessionData
 from app.tooling import ToolRegistry
 from app.types import ChatMessage
+from app.user_profile import ResolvedUserPolicy, UserPolicyRule, load_user_profile
 from app.working_memory import WorkingMemory
 
 _ANALYSIS_MODE_KEYWORDS = (
@@ -76,11 +77,14 @@ class PreparedAgentContext:
     compact_memory_context: str
     compact_memory_snapshot: CompactMemorySnapshot
     resolved_user_preferences: list[str]
+    resolved_user_policy: ResolvedUserPolicy
+    active_user_rules: list[UserPolicyRule]
     resolved_project_constraints: list[str]
     recent_risks: list[str]
     history_window: HistoryWindow
     compaction_result: CompactionResult
     memory_context: str
+    user_profile_context: str
 
 
 def prepare_agent_context(
@@ -106,8 +110,21 @@ def prepare_agent_context(
     """
     usable_budget = _resolve_usable_budget(session)
     analysis_mode = _infer_analysis_mode_from_history(full_history)
-    base_system_prompt = build_system_prompt(tool_registry=tool_registry, memory_context="")
     cached_state = load_context_state(session.workspace, session.session_id)
+    resolved_user_preferences = resolve_user_preferences(workspace=session.workspace)
+    resolved_user_policy = _resolve_user_policy(session.workspace)
+    active_user_rules = resolved_user_policy.active_rules_for(
+        _build_user_policy_task_context(
+            full_history=full_history,
+            working_memory=working_memory,
+        )
+    )
+    user_profile_context = resolved_user_policy.to_prompt_section(active_user_rules)
+    base_system_prompt = build_system_prompt(
+        tool_registry=tool_registry,
+        memory_context="",
+        user_profile_context=user_profile_context,
+    )
 
     # 先做压缩前预估，用来判断这一轮的真实上下文压力。
     initial_policy = build_compaction_policy(session)
@@ -158,7 +175,6 @@ def prepare_agent_context(
         else:
             older_history_summary = build_older_history_summary(history_window.older_messages)
 
-    resolved_user_preferences = resolve_user_preferences(workspace=session.workspace)
     resolved_project_constraints = resolve_project_constraints(
         memory_pipeline=memory_pipeline,
         working_memory=working_memory,
@@ -197,6 +213,7 @@ def prepare_agent_context(
         usable_budget=usable_budget,
         fixed_overhead_tokens=fixed_overhead_tokens,
         base_system_prompt=base_system_prompt,
+        user_profile_context=user_profile_context,
         analysis_mode=analysis_mode,
     )
     compact_memory_snapshot = (
@@ -229,6 +246,7 @@ def prepare_agent_context(
             usable_budget=usable_budget,
             fixed_overhead_tokens=fixed_overhead_tokens,
             base_system_prompt=base_system_prompt,
+            user_profile_context=user_profile_context,
             force_auto_compact=True,
             analysis_mode=analysis_mode,
         )
@@ -265,11 +283,14 @@ def prepare_agent_context(
         compact_memory_context=compact_memory_context,
         compact_memory_snapshot=compact_memory_snapshot,
         resolved_user_preferences=resolved_user_preferences,
+        resolved_user_policy=resolved_user_policy,
+        active_user_rules=active_user_rules,
         resolved_project_constraints=resolved_project_constraints,
         recent_risks=recent_risks,
         history_window=history_window,
         compaction_result=pipeline_result.compaction_result,
         memory_context=memory_context,
+        user_profile_context=user_profile_context,
     )
 
 
@@ -314,6 +335,40 @@ def _build_preview_memory_context(*, older_history_summary: str, working_memory:
         sections.append(working_memory_text)
 
     return "\n".join(sections).strip()
+
+
+def _resolve_user_policy(workspace: str) -> ResolvedUserPolicy:
+    """从工作区 USER.md 解析结构化用户策略。"""
+    profile = load_user_profile(workspace)
+    if profile is None:
+        return ResolvedUserPolicy()
+    return profile.build_resolved_policy()
+
+
+def _build_user_policy_task_context(
+    *,
+    full_history: list[ChatMessage],
+    working_memory: WorkingMemory,
+) -> str:
+    """提取当前任务文本，用于筛选命中的路径规则。"""
+    parts: list[str] = []
+    primary_intent = working_memory.get_primary_user_intent().strip()
+    if primary_intent:
+        parts.append(primary_intent)
+
+    recent_user_messages: list[str] = []
+    for message in reversed(full_history):
+        if message.get("role") != "user":
+            continue
+        content = str(message.get("content", "")).strip()
+        if not content:
+            continue
+        recent_user_messages.append(content)
+        if len(recent_user_messages) >= 3:
+            break
+
+    parts.extend(reversed(recent_user_messages))
+    return "\n".join(part for part in parts if part).strip()
 
 
 def _resolve_compact_memory_context(
@@ -455,6 +510,7 @@ def _build_compacted_request(
     usable_budget: int,
     fixed_overhead_tokens: int,
     base_system_prompt: str,
+    user_profile_context: str,
     force_auto_compact: bool = False,
     analysis_mode: bool = False,
 ) -> tuple[ContextPipelineResult, str, ContextStats, list[ChatMessage]]:
@@ -498,6 +554,7 @@ def _build_compacted_request(
     system_prompt = build_system_prompt(
         tool_registry=tool_registry,
         memory_context=memory_context,
+        user_profile_context=user_profile_context,
     )
     messages: list[ChatMessage] = [{"role": "system", "content": system_prompt}]
     messages.extend(pipeline_result.messages)
