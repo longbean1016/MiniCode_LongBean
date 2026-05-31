@@ -55,6 +55,19 @@ def _build_response_style()->str:
 4. 默认使用中文回答。
 """.strip()
 
+
+def _build_analysis_rules() -> str:
+    """代码分析专用规则：尽量把模型的自由补全压到最小。"""
+    return """
+代码分析规则：
+1. 当用户要求“分析文件 / 梳理链路 / 调用链 / 串联流程”时，先用结构化工具确认事实，再组织回答。
+2. 优先顺序：get_ast_info / find_symbols / file_overview -> 必要时再 read_file 查看局部源码。
+3. 如果 read_file 返回 TRUNCATED: yes，说明当前只拿到了部分文件，不能据此声称“文件后面没有更多逻辑”。
+4. 只能引用已经从工具结果里真实观察到的函数名、类名、参数名、step.type 或统计数字。
+5. 如果用户只给了文件名，没有给完整路径，先定位真实路径；若存在多个同名文件，必须说明歧义。
+6. 如果证据不足，就明确写“未确认”；禁止为了回答完整而补出不存在的函数、参数或控制流。
+""".strip()
+
     
 
 
@@ -66,6 +79,7 @@ def build_system_prompt(
     sections = [
         "【角色约束】\n" + _build_role_constraints(),
         "【工具使用规则】\n" + _build_tool_rules(tool_registry),
+        "【代码分析规则】\n" + _build_analysis_rules(),
         "【失败重试策略】\n" + _build_retry_policy(),
         "【回答风格】\n" + _build_response_style(),
     ]

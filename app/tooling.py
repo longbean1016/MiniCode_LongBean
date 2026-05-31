@@ -15,6 +15,8 @@ _TOOL_OUTPUT_LIMITS: dict[str, int] = {
     "read_file": 40_000,
     "grep_files": 16_000,
     "list_files": 12_000,
+    "file_overview": 10_000,
+    "find_references": 8_000,
     "run_command": 30_000,
 }
 _DEFAULT_MAX_OUTPUT = 18_000
@@ -22,6 +24,8 @@ _TOOL_CONTEXT_OUTPUT_LIMITS: dict[str, int] = {
     "read_file": 6_000,
     "grep_files": 4_000,
     "list_files": 3_500,
+    "file_overview": 2_500,
+    "find_references": 2_000,
     "run_command": 5_000,
 }
 _DEFAULT_CONTEXT_OUTPUT_LIMIT = 6_000
@@ -92,6 +96,14 @@ class ToolRegistry:
                 max_lines,
             )
 
+        if tool_name in {"find_references"}:
+            # 引用结果本质上也是命中列表，优先保留首尾样本而不是整段平铺。
+            return self._truncate_structured_collection_output(
+                lines,
+                total_chars,
+                max_lines,
+            )
+
         if tool_name in {"list_files"}:
             # 目录列表和 grep 一样属于集合输出，适合保留头部统计和首尾目录项。
             return self._truncate_structured_collection_output(
@@ -127,8 +139,10 @@ class ToolRegistry:
 
         if tool_name == "read_file":
             return self._truncate_head_tail(lines, len(raw_output), max_lines, head_ratio=0.55, tail_ratio=0.25)
-        if tool_name in {"grep_files", "list_files"}:
+        if tool_name in {"grep_files", "list_files", "find_references"}:
             return self._truncate_structured_collection_output(lines, len(raw_output), max_lines)
+        if tool_name == "file_overview":
+            return self._truncate_head_tail(lines, len(raw_output), max_lines, head_ratio=0.7, tail_ratio=0.15)
         if tool_name == "run_command":
             error_lines = self._extract_error_lines(lines, max_keep=6)
             base = self._truncate_head_tail(lines, len(raw_output), max_lines, head_ratio=0.35, tail_ratio=0.35)

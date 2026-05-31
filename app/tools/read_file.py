@@ -104,7 +104,8 @@ def _run(validated_input: dict[str, int | str], context: ToolContext) -> ToolRes
             output=(
                 f"同一轮里已经读取过相同区间：{raw_path}\n"
                 f"offset={offset}, limit={limit}\n"
-                "请改读新的 offset/limit 区间，或改用 grep_files / file_overview 等工具。"
+                "请改读新的 offset/limit 区间，或改用 file_overview / find_references 等结构化工具；"
+                "如果现有证据已经足够，也可以直接基于已读内容作答。"
             ),
             error="READ_REPEAT_BLOCKED",
             meta={

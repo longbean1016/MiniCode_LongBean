@@ -5,6 +5,9 @@ import unittest
 from dataclasses import dataclass
 from unittest.mock import patch
 
+import app.agent_loop as agent_loop_module
+import app.context_manager as context_manager_module
+from app.context_compactor import compact_recent_messages
 from app.agent_loop import run_agent_once
 from app.memory_models import MemoryContextResult
 from app.session import create_new_session
@@ -13,6 +16,778 @@ from app.working_memory import WorkingMemory
 
 
 class ContextManagerTests(unittest.TestCase):
+    def test_analysis_mode_gets_wider_context_policy_than_normal_mode(self) -> None:
+        stats = context_manager_module.ContextStats(
+            usable_budget=128_000,
+            total_tokens=20_000,
+            usage_ratio=0.50,
+            system_tokens=200,
+            recent_tokens=15_000,
+            memory_tokens=4_800,
+            tool_result_tokens=5_000,
+            message_count=12,
+            tool_result_count=4,
+        )
+
+        normal_policy = context_manager_module.decide_context_policy(stats)
+        analysis_policy = context_manager_module.decide_context_policy(
+            stats,
+            analysis_mode=True,
+        )
+
+        self.assertGreaterEqual(analysis_policy.keep_rounds, normal_policy.keep_rounds)
+        self.assertGreater(analysis_policy.max_recent_tool_results, normal_policy.max_recent_tool_results)
+        self.assertGreater(analysis_policy.truncate_tool_result_chars, normal_policy.truncate_tool_result_chars)
+
+    def test_compactor_keeps_latest_pinned_structured_tool_result(self) -> None:
+        messages = [
+            {"role": "user", "content": "分析 app/main.py 链路"},
+            {"role": "tool_result", "tool_name": "file_overview", "content": "旧的 file_overview"},
+            {"role": "tool_result", "tool_name": "read_file", "content": "read_file 结果"},
+            {"role": "tool_result", "tool_name": "file_overview", "content": "新的 file_overview"},
+        ]
+
+        result = compact_recent_messages(
+            messages,
+            max_recent_tool_results=1,
+            truncate_tool_result_chars=4000,
+            pinned_tool_names={"file_overview"},
+        )
+
+        tool_results = [message for message in result.messages if message.get("role") == "tool_result"]
+        self.assertEqual(tool_results[-1]["content"], "新的 file_overview")
+        self.assertTrue(
+            any(message.get("content") == "新的 file_overview" for message in tool_results)
+        )
+
+    def test_analysis_tracker_records_observed_symbols_from_structured_tools(self) -> None:
+        tracker = agent_loop_module._create_analysis_tracker("分析 app/agent_loop.py 串联链路")
+
+        agent_loop_module._record_analysis_evidence(
+            tracker,
+            tool_name="file_overview",
+            tool_input={"path": "app/agent_loop.py"},
+            result=ToolResult(
+                ok=True,
+                output=(
+                    "文件: app/agent_loop.py\n"
+                    "\n"
+                    "函数:\n"
+                    "run_agent_once(user_input, model) @L327\n"
+                    "continue_agent_from_history(history, model) @L365\n"
+                    "_run_agent_loop(builder, model) @L394\n"
+                ),
+            ),
+        )
+
+        self.assertEqual(
+            tracker["observed_functions"],
+            {"run_agent_once", "continue_agent_from_history", "_run_agent_loop"},
+        )
+        self.assertTrue(tracker["observed_functions"].issubset(tracker["observed_symbols"]))
+
+    def test_analysis_evidence_requires_covered_target_and_observed_top_level_symbols(self) -> None:
+        tracker = agent_loop_module._create_analysis_tracker("分析 app/agent_loop.py 串联链路")
+
+        agent_loop_module._record_analysis_evidence(
+            tracker,
+            tool_name="read_file",
+            tool_input={"path": "app/agent_loop.py"},
+            result=ToolResult(ok=True, output="FILE: app/agent_loop.py\n"),
+        )
+        agent_loop_module._record_analysis_evidence(
+            tracker,
+            tool_name="find_references",
+            tool_input={"symbol": "_run_agent_loop", "path": "app/agent_loop.py"},
+            result=ToolResult(ok=True, output="app/agent_loop.py:394: def _run_agent_loop(...)\n"),
+        )
+
+        self.assertFalse(agent_loop_module._has_sufficient_analysis_evidence(tracker))
+
+        agent_loop_module._record_analysis_evidence(
+            tracker,
+            tool_name="get_ast_info",
+            tool_input={"path": "app/agent_loop.py"},
+            result=ToolResult(
+                ok=True,
+                output=(
+                    "文件: app/agent_loop.py\n"
+                    "\n"
+                    "函数:\n"
+                    "function run_agent_once(user_input, model) @L327\n"
+                    "function continue_agent_from_history(history, model) @L365\n"
+                    "function _run_agent_loop(builder, model) @L394\n"
+                ),
+            ),
+        )
+
+        self.assertTrue(agent_loop_module._has_sufficient_analysis_evidence(tracker))
+
+    def test_analysis_convergence_nudge_lists_confirmed_functions_and_blocks_unknown_names(self) -> None:
+        tracker = agent_loop_module._create_analysis_tracker("分析 app/agent_loop.py 串联链路")
+        tracker["overview_paths"].add("app/agent_loop.py")
+        tracker["observed_functions"].update(
+            {"run_agent_once", "continue_agent_from_history", "_run_agent_loop"}
+        )
+        tracker["observed_symbols"].update(tracker["observed_functions"])
+
+        nudge = agent_loop_module._build_analysis_convergence_nudge(tracker)
+
+        self.assertIn("已确认函数名", nudge)
+        self.assertIn("run_agent_once", nudge)
+        self.assertIn("continue_agent_from_history", nudge)
+        self.assertIn("禁止引用未观察到的标识符", nudge)
+
+    def test_analysis_tracker_records_observed_step_types_and_file_counts(self) -> None:
+        tracker = agent_loop_module._create_analysis_tracker("analyze app/main.py call chain")
+
+        agent_loop_module._record_analysis_evidence(
+            tracker,
+            tool_name="file_overview",
+            tool_input={"path": "app/main.py"},
+            result=ToolResult(
+                ok=True,
+                output=(
+                    "文件: app/main.py\n"
+                    "总行数: 404\n"
+                    "\n"
+                    "函数:\n"
+                    "_build_arg_parser() @L36\n"
+                    "_load_or_create_session(workspace, session_id, resume) @L62\n"
+                    "_replace_pending_tool_result(history, tool_use_id, tool_name, content, is_error) @L86\n"
+                    "main() @L131\n"
+                ),
+            ),
+        )
+        agent_loop_module._record_analysis_evidence(
+            tracker,
+            tool_name="read_file",
+            tool_input={"path": "app/main.py"},
+            result=ToolResult(
+                ok=True,
+                output=(
+                    "FILE: app/main.py\n"
+                    "OFFSET: 0\n"
+                    "END: 1000\n"
+                    "TOTAL_CHARS: 2000\n"
+                    "TRUNCATED: no\n"
+                    "if step.type == \"approval\" and step.approval is not None:\n"
+                    "    answer = input(\"是否允许本次执行？(y/n)> \").strip().lower()\n"
+                    "if step.type == \"assistant\":\n"
+                    "    memory_pipeline.finalize_turn(...)\n"
+                ),
+            ),
+        )
+
+        self.assertEqual(tracker["observed_step_types"], {"approval", "assistant"})
+        self.assertEqual(tracker["observed_file_line_counts"]["app/main.py"], 404)
+        self.assertEqual(tracker["observed_file_function_counts"]["app/main.py"], 4)
+
+    def test_analysis_fact_validator_rejects_unobserved_step_type_and_counts(self) -> None:
+        tracker = agent_loop_module._create_analysis_tracker("analyze app/main.py call chain")
+        tracker["candidate_paths"].add("app/main.py")
+        tracker["covered_paths"].add("app/main.py")
+        tracker["observed_functions"].update(
+            {
+                "_build_arg_parser",
+                "_load_or_create_session",
+                "_replace_pending_tool_result",
+                "main",
+            }
+        )
+        tracker["observed_symbols"].update(tracker["observed_functions"])
+        tracker["observed_step_types"].update({"approval", "assistant"})
+        tracker["observed_file_line_counts"]["app/main.py"] = 404
+        tracker["observed_file_function_counts"]["app/main.py"] = 4
+
+        invalid_claims = agent_loop_module._find_unsupported_analysis_claims(
+            tracker,
+            '核心分支会判断 step.type == "tool_use"，文件共 405 行，包含 5 个函数。',
+        )
+
+        self.assertTrue(any("tool_use" in claim for claim in invalid_claims))
+        self.assertTrue(any("405" in claim for claim in invalid_claims))
+        self.assertTrue(any("5" in claim for claim in invalid_claims))
+
+    def test_analysis_fact_validator_rejects_unsupported_unread_claims_after_full_read(self) -> None:
+        tracker = agent_loop_module._create_analysis_tracker("analyze app/main.py call chain")
+        tracker["candidate_paths"].add("app/main.py")
+        tracker["covered_paths"].add("app/main.py")
+        tracker["fully_read_paths"].add("app/main.py")
+
+        invalid_claims = agent_loop_module._find_unsupported_analysis_claims(
+            tracker,
+            (
+                "仍然不确定的点："
+                "_build_arg_parser 的具体参数未读取到第 36~60 行的代码；"
+                "命令行循环细节未读取到第 131 行之后的实现。"
+            ),
+        )
+
+        self.assertTrue(any("unread_claim" in claim for claim in invalid_claims))
+        self.assertTrue(any("36~60" in claim or "131" in claim for claim in invalid_claims))
+
+    def test_analysis_validator_allows_observed_dotted_call_sites(self) -> None:
+        tracker = agent_loop_module._create_analysis_tracker("analyze app/main.py call chain")
+        agent_loop_module._record_analysis_evidence(
+            tracker,
+            tool_name="read_file",
+            tool_input={"path": "app/main.py"},
+            result=ToolResult(
+                ok=True,
+                output=(
+                    "FILE: app/main.py\n"
+                    "OFFSET: 0\n"
+                    "END: 300\n"
+                    "TOTAL_CHARS: 300\n"
+                    "TRUNCATED: no\n"
+                    "config = load_config()\n"
+                    "step, history = run_agent_once(...)\n"
+                    "result = tool_registry.execute_tool(...)\n"
+                ),
+            ),
+        )
+
+        invalid_names = agent_loop_module._find_unobserved_answer_function_names(
+            tracker,
+            "它会调用 load_config()、run_agent_once() 和 tool_registry.execute_tool()。",
+        )
+
+        self.assertEqual(invalid_names, [])
+
+    def test_analysis_validator_ignores_python_file_extensions_in_answers(self) -> None:
+        tracker = agent_loop_module._create_analysis_tracker("analyze app/main.py call chain")
+        tracker["observed_symbols"].update({"main", "run_agent_once"})
+
+        invalid_names = agent_loop_module._find_unobserved_answer_function_names(
+            tracker,
+            "入口文件是 app/main.py，它后续会调用 run_agent_once()。",
+        )
+
+        self.assertEqual(invalid_names, [])
+
+    def test_analysis_evidence_is_not_sufficient_after_only_truncated_read(self) -> None:
+        tracker = agent_loop_module._create_analysis_tracker("分析 app/main.py 串联链路")
+        agent_loop_module._record_analysis_evidence(
+            tracker,
+            tool_name="file_overview",
+            tool_input={"path": "app/main.py"},
+            result=ToolResult(
+                ok=True,
+                output=(
+                    "文件: app/main.py\n"
+                    "总行数: 404\n"
+                    "\n"
+                    "函数:\n"
+                    "_build_arg_parser() @L36\n"
+                    "_load_or_create_session() @L62\n"
+                    "_replace_pending_tool_result() @L86\n"
+                    "main() @L131\n"
+                ),
+            ),
+        )
+        agent_loop_module._record_analysis_evidence(
+            tracker,
+            tool_name="read_file",
+            tool_input={"path": "app/main.py", "offset": 0, "limit": 8000},
+            result=ToolResult(
+                ok=True,
+                output=(
+                    "FILE: app/main.py\n"
+                    "OFFSET: 0\n"
+                    "END: 8000\n"
+                    "TOTAL_CHARS: 12000\n"
+                    "TRUNCATED: yes - call read_file again with offset 8000\n"
+                ),
+            ),
+        )
+
+        self.assertFalse(agent_loop_module._has_sufficient_analysis_evidence(tracker))
+
+    def test_analysis_redundant_block_allows_followup_read_for_new_offset(self) -> None:
+        tracker = agent_loop_module._create_analysis_tracker("分析 app/main.py 串联链路")
+        agent_loop_module._record_analysis_evidence(
+            tracker,
+            tool_name="file_overview",
+            tool_input={"path": "app/main.py"},
+            result=ToolResult(
+                ok=True,
+                output=(
+                    "文件: app/main.py\n"
+                    "总行数: 404\n"
+                    "\n"
+                    "函数:\n"
+                    "_build_arg_parser() @L36\n"
+                    "_load_or_create_session() @L62\n"
+                    "_replace_pending_tool_result() @L86\n"
+                    "main() @L131\n"
+                ),
+            ),
+        )
+        agent_loop_module._record_analysis_evidence(
+            tracker,
+            tool_name="read_file",
+            tool_input={"path": "app/main.py", "offset": 0, "limit": 8000},
+            result=ToolResult(
+                ok=True,
+                output=(
+                    "FILE: app/main.py\n"
+                    "OFFSET: 0\n"
+                    "END: 8000\n"
+                    "TOTAL_CHARS: 12000\n"
+                    "TRUNCATED: yes - call read_file again with offset 8000\n"
+                ),
+            ),
+        )
+
+        should_block = agent_loop_module._should_block_redundant_analysis_calls(
+            tracker,
+            calls=[
+                {
+                    "tool_name": "read_file",
+                    "input": {"path": "app/main.py", "offset": 8000, "limit": 8000},
+                }
+            ],
+            step_index=2,
+            max_steps=8,
+        )
+
+        self.assertFalse(should_block)
+
+    def test_agent_loop_retries_when_analysis_final_answer_uses_unobserved_function_names(self) -> None:
+        class _InvalidThenCorrectedAnalysisModel:
+            def __init__(self) -> None:
+                self.call_count = 0
+                self.calls: list[list[dict[str, object]]] = []
+
+            def next(self, messages, on_stream_chunk=None, store=None):  # type: ignore[no-untyped-def]
+                self.calls.append(list(messages))
+                self.call_count += 1
+                if self.call_count == 1:
+                    return AgentStep(
+                        type="tool_calls",
+                        calls=[
+                            {
+                                "id": "tool-1",
+                                "tool_name": "get_ast_info",
+                                "input": {"path": "app/agent_loop.py"},
+                            }
+                        ],
+                    )
+                if self.call_count == 2:
+                    return AgentStep(
+                        type="assistant",
+                        content="核心函数是 agent_loop()，它会先 build_initial_history() 再调用 ModelAdapter.chat()。",
+                        kind="final",
+                    )
+                if not any(
+                    message.get("role") == "user"
+                    and "禁止引用未观察到的标识符" in str(message.get("content", ""))
+                    for message in messages
+                ):
+                    raise AssertionError("missing symbol-grounding correction nudge")
+                return AgentStep(
+                    type="assistant",
+                    content=(
+                        "真实入口是 run_agent_once() 和 continue_agent_from_history()，"
+                        "它们都会进入 _run_agent_loop()。"
+                    ),
+                    kind="final",
+                )
+
+        class _AnalysisToolRegistry:
+            def list_tool_name(self) -> list[str]:
+                return ["get_ast_info"]
+
+            def execute_tool(self, tool_name: str, input_data: object, context: object) -> object:
+                return ToolResult(
+                    ok=True,
+                    output=(
+                        "文件: app/agent_loop.py\n"
+                        "\n"
+                        "函数:\n"
+                        "function run_agent_once(user_input, model) @L327\n"
+                        "function continue_agent_from_history(history, model) @L365\n"
+                        "function _run_agent_loop(builder, model) @L394\n"
+                    ),
+                )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            session = create_new_session(tmpdir)
+            working_memory = WorkingMemory()
+            model = _InvalidThenCorrectedAnalysisModel()
+
+            step, _next_history = run_agent_once(
+                user_input="分析 app/agent_loop.py 的链路",
+                model=model,
+                tool_registry=_AnalysisToolRegistry(),  # type: ignore[arg-type]
+                tool_context=ToolContext(cwd=tmpdir),
+                session=session,
+                working_memory=working_memory,
+                memory_pipeline=None,
+                max_steps=4,
+                session_id="sess-analysis-symbol-guard",
+            )
+
+            self.assertEqual(step.type, "assistant")
+            self.assertIn("run_agent_once()", step.content)
+            self.assertNotIn("agent_loop()", step.content)
+            self.assertEqual(len(model.calls), 3)
+
+    def test_agent_loop_retries_when_analysis_final_answer_uses_unobserved_step_type(self) -> None:
+        class _InvalidThenCorrectedMainAnalysisModel:
+            def __init__(self) -> None:
+                self.call_count = 0
+                self.calls: list[list[dict[str, object]]] = []
+
+            def next(self, messages, on_stream_chunk=None, store=None):  # type: ignore[no-untyped-def]
+                self.calls.append(list(messages))
+                self.call_count += 1
+                if self.call_count == 1:
+                    return AgentStep(
+                        type="tool_calls",
+                        calls=[
+                            {
+                                "id": "tool-1",
+                                "tool_name": "file_overview",
+                                "input": {"path": "app/main.py"},
+                            }
+                        ],
+                    )
+                if self.call_count == 2:
+                    return AgentStep(
+                        type="tool_calls",
+                        calls=[
+                            {
+                                "id": "tool-2",
+                                "tool_name": "read_file",
+                                "input": {"path": "app/main.py"},
+                            }
+                        ],
+                    )
+                if self.call_count == 3:
+                    return AgentStep(
+                        type="assistant",
+                        content='核心分支会判断 step.type == "tool_use"，文件共 405 行。',
+                        kind="final",
+                    )
+                if not any(
+                    message.get("role") == "user"
+                    and "step.type" in str(message.get("content", ""))
+                    for message in messages
+                ):
+                    raise AssertionError("missing fact-grounding correction nudge")
+                return AgentStep(
+                    type="assistant",
+                    content='核心分支会判断 step.type == "approval" 和 step.type == "assistant"，文件共 404 行。',
+                    kind="final",
+                )
+
+        class _MainAnalysisToolRegistry:
+            def list_tool_name(self) -> list[str]:
+                return ["file_overview", "read_file"]
+
+            def execute_tool(self, tool_name: str, input_data: object, context: object) -> object:
+                if tool_name == "file_overview":
+                    return ToolResult(
+                        ok=True,
+                        output=(
+                            "文件: app/main.py\n"
+                            "总行数: 404\n"
+                            "\n"
+                            "函数:\n"
+                            "_build_arg_parser() @L36\n"
+                            "_load_or_create_session(workspace, session_id, resume) @L62\n"
+                            "_replace_pending_tool_result(history, tool_use_id, tool_name, content, is_error) @L86\n"
+                            "main() @L131\n"
+                        ),
+                    )
+                return ToolResult(
+                    ok=True,
+                    output=(
+                        "FILE: app/main.py\n"
+                        "OFFSET: 0\n"
+                        "END: 1000\n"
+                        "TOTAL_CHARS: 2000\n"
+                        "TRUNCATED: no\n"
+                        "if step.type == \"approval\" and step.approval is not None:\n"
+                        "if step.type == \"assistant\":\n"
+                        "    memory_pipeline.finalize_turn(...)\n"
+                    ),
+                )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            session = create_new_session(tmpdir)
+            working_memory = WorkingMemory()
+            model = _InvalidThenCorrectedMainAnalysisModel()
+
+            step, _next_history = run_agent_once(
+                user_input="analyze app/main.py call chain",
+                model=model,
+                tool_registry=_MainAnalysisToolRegistry(),  # type: ignore[arg-type]
+                tool_context=ToolContext(cwd=tmpdir),
+                session=session,
+                working_memory=working_memory,
+                memory_pipeline=None,
+                max_steps=5,
+                session_id="sess-analysis-fact-guard",
+            )
+
+            self.assertEqual(step.type, "assistant")
+            self.assertIn('step.type == "approval"', step.content)
+            self.assertIn("404", step.content)
+            self.assertNotIn("tool_use", step.content)
+            self.assertEqual(len(model.calls), 4)
+
+    def test_agent_loop_retries_when_analysis_final_answer_claims_unread_code_after_full_read(self) -> None:
+        class _InvalidThenCorrectedUncertaintyModel:
+            def __init__(self) -> None:
+                self.call_count = 0
+                self.calls: list[list[dict[str, object]]] = []
+
+            def next(self, messages, on_stream_chunk=None, store=None):  # type: ignore[no-untyped-def]
+                self.calls.append(list(messages))
+                self.call_count += 1
+                if self.call_count == 1:
+                    return AgentStep(
+                        type="tool_calls",
+                        calls=[
+                            {
+                                "id": "tool-1",
+                                "tool_name": "file_overview",
+                                "input": {"path": "app/main.py"},
+                            }
+                        ],
+                    )
+                if self.call_count == 2:
+                    return AgentStep(
+                        type="tool_calls",
+                        calls=[
+                            {
+                                "id": "tool-2",
+                                "tool_name": "read_file",
+                                "input": {"path": "app/main.py"},
+                            }
+                        ],
+                    )
+                if self.call_count == 3:
+                    return AgentStep(
+                        type="assistant",
+                        content=(
+                            "仍然不确定的点："
+                            "_build_arg_parser 的具体参数未读取到第 36~60 行的代码；"
+                            "命令行循环细节未读取到第 131 行之后的实现。"
+                        ),
+                        kind="final",
+                    )
+                if not any(
+                    message.get("role") == "user"
+                    and "已完整读取" in str(message.get("content", ""))
+                    for message in messages
+                ):
+                    raise AssertionError("missing unread-claim correction nudge")
+                return AgentStep(
+                    type="assistant",
+                    content=(
+                        "_build_arg_parser 只定义了 --session 和 --resume；"
+                        "main 里 while True 循环读取输入，quit/exit 会保存会话后退出。"
+                    ),
+                    kind="final",
+                )
+
+        class _FullyReadMainToolRegistry:
+            def list_tool_name(self) -> list[str]:
+                return ["file_overview", "read_file"]
+
+            def execute_tool(self, tool_name: str, input_data: object, context: object) -> object:
+                if tool_name == "file_overview":
+                    return ToolResult(
+                        ok=True,
+                        output=(
+                            "文件: app/main.py\n"
+                            "总行数: 404\n"
+                            "\n"
+                            "函数:\n"
+                            "_build_arg_parser() @L36\n"
+                            "_load_or_create_session(workspace, session_id, resume) @L62\n"
+                            "_replace_pending_tool_result(history, tool_use_id, tool_name, content, is_error) @L86\n"
+                            "main() @L131\n"
+                        ),
+                    )
+                return ToolResult(
+                    ok=True,
+                    output=(
+                        "FILE: app/main.py\n"
+                        "OFFSET: 0\n"
+                        "END: 800\n"
+                        "TOTAL_CHARS: 800\n"
+                        "TRUNCATED: no\n"
+                        "def _build_arg_parser():\n"
+                        "    parser.add_argument(\"--session\")\n"
+                        "    parser.add_argument(\"--resume\")\n"
+                        "def main():\n"
+                        "    while True:\n"
+                        "        user_input = input(\"You> \").strip()\n"
+                        "        if user_input.lower() in {\"quit\", \"exit\"}:\n"
+                        "            save_session(session)\n"
+                    ),
+                )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            session = create_new_session(tmpdir)
+            working_memory = WorkingMemory()
+            model = _InvalidThenCorrectedUncertaintyModel()
+
+            step, _next_history = run_agent_once(
+                user_input="analyze app/main.py call chain",
+                model=model,
+                tool_registry=_FullyReadMainToolRegistry(),  # type: ignore[arg-type]
+                tool_context=ToolContext(cwd=tmpdir),
+                session=session,
+                working_memory=working_memory,
+                memory_pipeline=None,
+                max_steps=5,
+                session_id="sess-analysis-unread-guard",
+            )
+
+            self.assertEqual(step.type, "assistant")
+            self.assertIn("--session", step.content)
+            self.assertIn("while True", step.content)
+            self.assertNotIn("未读取到", step.content)
+            self.assertEqual(len(model.calls), 4)
+
+    def test_agent_loop_escalates_after_repeated_blocked_analysis_tool_calls(self) -> None:
+        class _BlockedThenFinalModel:
+            def __init__(self) -> None:
+                self.call_count = 0
+                self.calls: list[list[dict[str, object]]] = []
+
+            def next(self, messages, on_stream_chunk=None, store=None):  # type: ignore[no-untyped-def]
+                self.calls.append(list(messages))
+                self.call_count += 1
+                if self.call_count == 1:
+                    return AgentStep(
+                        type="tool_calls",
+                        calls=[
+                            {
+                                "id": "tool-1",
+                                "tool_name": "file_overview",
+                                "input": {"path": "app/main.py"},
+                            }
+                        ],
+                    )
+                if self.call_count <= 5:
+                    if self.call_count == 5 and not any(
+                        message.get("role") == "user"
+                        and "下一条消息必须直接输出最终答案" in str(message.get("content", ""))
+                        for message in messages
+                    ):
+                        raise AssertionError("missing force-answer nudge")
+                    return AgentStep(
+                        type="tool_calls",
+                        calls=[
+                            {
+                                "id": f"tool-{self.call_count}",
+                                "tool_name": "read_file",
+                                "input": {"path": "app/main.py"},
+                            }
+                        ],
+                    )
+                return AgentStep(
+                    type="assistant",
+                    content="main 会先 load_config()，再进入 while True 循环处理用户输入。",
+                    kind="final",
+                )
+
+        class _RepeatedReadToolRegistry:
+            def list_tool_name(self) -> list[str]:
+                return ["file_overview", "read_file"]
+
+            def execute_tool(self, tool_name: str, input_data: object, context: object) -> object:
+                if tool_name == "file_overview":
+                    return ToolResult(
+                        ok=True,
+                        output=(
+                            "文件: app/main.py\n"
+                            "总行数: 404\n"
+                            "\n"
+                            "函数:\n"
+                            "_build_arg_parser() @L36\n"
+                            "_load_or_create_session(workspace, session_id, resume) @L62\n"
+                            "_replace_pending_tool_result(history, tool_use_id, tool_name, content, is_error) @L86\n"
+                            "main() @L131\n"
+                        ),
+                    )
+                return ToolResult(
+                    ok=True,
+                    output=(
+                        "FILE: app/main.py\n"
+                        "OFFSET: 0\n"
+                        "END: 300\n"
+                        "TOTAL_CHARS: 300\n"
+                        "TRUNCATED: no\n"
+                        "config = load_config()\n"
+                        "while True:\n"
+                        "    user_input = input(\"You> \").strip()\n"
+                    ),
+                )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            session = create_new_session(tmpdir)
+            working_memory = WorkingMemory()
+            model = _BlockedThenFinalModel()
+
+            step, _next_history = run_agent_once(
+                user_input="分析 app/main.py 串联的链路",
+                model=model,
+                tool_registry=_RepeatedReadToolRegistry(),  # type: ignore[arg-type]
+                tool_context=ToolContext(cwd=tmpdir),
+                session=session,
+                working_memory=working_memory,
+                memory_pipeline=None,
+                max_steps=8,
+                session_id="sess-analysis-force-answer",
+            )
+
+            self.assertEqual(step.type, "assistant")
+            self.assertIn("load_config()", step.content)
+            self.assertLessEqual(len(model.calls), 6)
+
+    def test_agent_loop_injects_analysis_tool_priority_nudge_before_first_model_call(self) -> None:
+        class _InspectFirstPromptModel:
+            def __init__(self) -> None:
+                self.calls: list[list[dict[str, object]]] = []
+
+            def next(self, messages, on_stream_chunk=None, store=None):  # type: ignore[no-untyped-def]
+                self.calls.append(list(messages))
+                return AgentStep(type="assistant", content="收到", kind="final")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            session = create_new_session(tmpdir)
+            working_memory = WorkingMemory()
+            model = _InspectFirstPromptModel()
+
+            run_agent_once(
+                user_input="分析 app/agent_loop.py 串联链路",
+                model=model,
+                tool_registry=_FakeToolRegistry(),
+                tool_context=ToolContext(cwd=tmpdir),
+                session=session,
+                working_memory=working_memory,
+                memory_pipeline=None,
+                max_steps=1,
+                session_id="sess-analysis-priority",
+            )
+
+            self.assertEqual(len(model.calls), 1)
+            self.assertTrue(
+                any(
+                    message.get("role") == "user"
+                    and "优先使用 get_ast_info 或 find_symbols" in str(message.get("content", ""))
+                    for message in model.calls[0]
+                )
+            )
+
     def test_default_usable_context_budget_matches_minicode_style_default(self) -> None:
         from app.context_manager import DEFAULT_USABLE_CONTEXT_BUDGET
 
@@ -114,15 +889,50 @@ class ContextManagerTests(unittest.TestCase):
 
 
 class ContextCompactorTests(unittest.TestCase):
-    def test_compactor_truncates_large_tool_results_and_clears_old_ones(self) -> None:
+    def test_compactor_keeps_raw_tool_evidence_when_budget_already_safe(self) -> None:
+        from app.context_compactor import compact_recent_messages
+
+        messages = [
+            {"role": "assistant_tool_call", "tool_use_id": "call-1", "tool_name": "read_file", "input": {"path": "app/old.py"}},
+            {"role": "tool_result", "tool_use_id": "call-1", "tool_name": "read_file", "content": "FILE: app/old.py\n\nold\n", "meta": {"path": "app/old.py"}},
+            {"role": "assistant_tool_call", "tool_use_id": "call-2", "tool_name": "read_file", "input": {"path": "app/new.py"}},
+            {"role": "tool_result", "tool_use_id": "call-2", "tool_name": "read_file", "content": "FILE: app/new.py\n\nnew\n", "meta": {"path": "app/new.py"}},
+        ]
+
+        result = compact_recent_messages(
+            messages,
+            max_recent_tool_results=1,
+            truncate_tool_result_chars=10_000,
+            target_tokens=10_000,
+        )
+
+        self.assertEqual(result.semantic_compacted_pairs, 0)
+        self.assertTrue(
+            any(
+                message.get("role") == "assistant_tool_call"
+                and message.get("tool_use_id") == "call-1"
+                for message in result.messages
+            )
+        )
+        self.assertTrue(
+            any(
+                message.get("role") == "tool_result"
+                and message.get("tool_use_id") == "call-1"
+                for message in result.messages
+            )
+        )
+
+    def test_compactor_truncates_large_tool_results_and_semantically_compacts_old_ones(self) -> None:
         from app.context_compactor import compact_recent_messages
 
         messages = [
             {"role": "user", "content": "开始任务"},
-            {"role": "tool_result", "tool_name": "read_file", "content": "A" * 5000},
-            {"role": "tool_result", "tool_name": "list_files", "content": "B" * 100},
-            {"role": "tool_result", "tool_name": "grep_files", "content": "C" * 100},
-            {"role": "tool_result", "tool_name": "read_file", "content": "D" * 100},
+            {"role": "assistant_tool_call", "tool_use_id": "call-1", "tool_name": "read_file", "input": {"path": "app/a.py"}},
+            {"role": "tool_result", "tool_use_id": "call-1", "tool_name": "read_file", "content": "A" * 5000, "meta": {"path": "app/a.py"}},
+            {"role": "assistant_tool_call", "tool_use_id": "call-2", "tool_name": "list_files", "input": {"path": "app"}},
+            {"role": "tool_result", "tool_use_id": "call-2", "tool_name": "list_files", "content": "B" * 100},
+            {"role": "assistant_tool_call", "tool_use_id": "call-3", "tool_name": "read_file", "input": {"path": "app/d.py"}},
+            {"role": "tool_result", "tool_use_id": "call-3", "tool_name": "read_file", "content": "D" * 100, "meta": {"path": "app/d.py"}},
         ]
 
         result = compact_recent_messages(
@@ -131,11 +941,78 @@ class ContextCompactorTests(unittest.TestCase):
             truncate_tool_result_chars=800,
         )
 
-        self.assertEqual(len(result.messages), len(messages))
         self.assertGreaterEqual(result.truncated_tool_results, 1)
         self.assertGreaterEqual(result.cleared_old_tool_results, 1)
-        self.assertIn("已省略", result.messages[1]["content"])
-        self.assertIn("已省略", result.messages[2]["content"])
+        self.assertGreaterEqual(result.semantic_compacted_pairs, 1)
+        self.assertTrue(
+            any(
+                message.get("role") == "assistant"
+                and "旧工具结果摘要" in str(message.get("content", ""))
+                for message in result.messages
+            )
+        )
+        recent_tool_results = [
+            message for message in result.messages if message.get("role") == "tool_result"
+        ]
+        self.assertEqual(len(recent_tool_results), 2)
+        self.assertEqual(recent_tool_results[-1]["meta"]["path"], "app/d.py")
+
+    def test_compactor_keeps_recent_tool_call_pair_for_protected_tool_result(self) -> None:
+        from app.context_compactor import compact_recent_messages
+
+        messages = [
+            {"role": "assistant_tool_call", "tool_use_id": "call-1", "tool_name": "read_file", "input": {"path": "app/old.py"}},
+            {"role": "tool_result", "tool_use_id": "call-1", "tool_name": "read_file", "content": "FILE: app/old.py\n\nold\n", "meta": {"path": "app/old.py"}},
+            {"role": "assistant_tool_call", "tool_use_id": "call-2", "tool_name": "read_file", "input": {"path": "app/new.py"}},
+            {"role": "tool_result", "tool_use_id": "call-2", "tool_name": "read_file", "content": "FILE: app/new.py\n\nnew\n", "meta": {"path": "app/new.py"}},
+        ]
+
+        result = compact_recent_messages(
+            messages,
+            max_recent_tool_results=1,
+            truncate_tool_result_chars=10_000,
+        )
+
+        self.assertTrue(
+            any(
+                message.get("role") == "assistant_tool_call"
+                and message.get("tool_use_id") == "call-2"
+                for message in result.messages
+            )
+        )
+        self.assertTrue(
+            any(
+                message.get("role") == "tool_result"
+                and message.get("tool_use_id") == "call-2"
+                for message in result.messages
+            )
+        )
+        self.assertTrue(
+            any(
+                message.get("role") == "assistant"
+                and "app/old.py" in str(message.get("content", ""))
+                for message in result.messages
+            )
+        )
+
+    def test_compactor_drops_assistant_progress_before_model_call(self) -> None:
+        from app.context_compactor import compact_recent_messages
+
+        messages = [
+            {"role": "user", "content": "分析 main.py"},
+            {"role": "assistant_progress", "content": "先看看文件结构"},
+            {"role": "assistant_tool_call", "tool_use_id": "call-1", "tool_name": "file_overview", "input": {"path": "app/main.py"}},
+            {"role": "tool_result", "tool_use_id": "call-1", "tool_name": "file_overview", "content": "文件: app/main.py"},
+        ]
+
+        result = compact_recent_messages(
+            messages,
+            max_recent_tool_results=2,
+            truncate_tool_result_chars=10_000,
+        )
+
+        self.assertEqual(result.dropped_progress_messages, 1)
+        self.assertFalse(any(message.get("role") == "assistant_progress" for message in result.messages))
 
     def test_compactor_persists_large_tool_result_and_replaces_with_line_preview(self) -> None:
         from app.context_compactor import compact_recent_messages
@@ -298,6 +1175,45 @@ class ContextCompactorTests(unittest.TestCase):
         self.assertEqual(result.deduped_read_results, 1)
         self.assertIn("扫描结果已去重", result.messages[0]["content"])
         self.assertEqual(result.messages[1]["content"], list_output)
+
+    def test_compactor_drops_old_low_priority_messages_when_still_over_target(self) -> None:
+        from app.context_compactor import compact_recent_messages
+
+        messages = [
+            {"role": "user", "content": "分析 main.py 串联链路"},
+            {"role": "assistant", "content": "背景说明 " + ("A" * 600)},
+            {"role": "assistant_tool_call", "tool_use_id": "call-1", "tool_name": "read_file", "input": {"path": "app/old_a.py"}},
+            {"role": "tool_result", "tool_use_id": "call-1", "tool_name": "read_file", "content": "FILE: app/old_a.py\n\nold-a\n", "meta": {"path": "app/old_a.py"}},
+            {"role": "assistant_tool_call", "tool_use_id": "call-2", "tool_name": "read_file", "input": {"path": "app/old_b.py"}},
+            {"role": "tool_result", "tool_use_id": "call-2", "tool_name": "read_file", "content": "FILE: app/old_b.py\n\nold-b\n", "meta": {"path": "app/old_b.py"}},
+            {"role": "assistant_tool_call", "tool_use_id": "call-3", "tool_name": "read_file", "input": {"path": "app/new.py"}},
+            {"role": "tool_result", "tool_use_id": "call-3", "tool_name": "read_file", "content": "FILE: app/new.py\n\nnew\n", "meta": {"path": "app/new.py"}},
+        ]
+
+        result = compact_recent_messages(
+            messages,
+            max_recent_tool_results=1,
+            truncate_tool_result_chars=10_000,
+            target_tokens=120,
+            protected_recent_messages=2,
+        )
+
+        self.assertGreaterEqual(result.semantic_compacted_pairs, 1)
+        self.assertGreaterEqual(result.priority_dropped_messages, 1)
+        self.assertTrue(
+            any(
+                message.get("role") == "assistant_tool_call"
+                and message.get("tool_use_id") == "call-3"
+                for message in result.messages
+            )
+        )
+        self.assertTrue(
+            any(
+                message.get("role") == "tool_result"
+                and message.get("tool_use_id") == "call-3"
+                for message in result.messages
+            )
+        )
 
 
 class _FakeModel:
@@ -1478,6 +2394,324 @@ class AgentLoopContextPolicyTests(unittest.TestCase):
                 "结构化工具摘要：grep_files 命中过多，已保留首尾样本",
             )
             self.assertIn("raw_output", tool_results[0]["meta"])
+
+    def test_agent_loop_continues_after_progress_response(self) -> None:
+        class _ProgressThenFinalModel:
+            def __init__(self) -> None:
+                self.call_count = 0
+                self.calls: list[list[dict[str, object]]] = []
+
+            def next(self, messages, on_stream_chunk=None, store=None):  # type: ignore[no-untyped-def]
+                self.calls.append(list(messages))
+                self.call_count += 1
+                if self.call_count == 1:
+                    return AgentStep(
+                        type="assistant",
+                        content="我先整理 agent_loop 的主干调用顺序。",
+                        kind="progress",
+                    )
+                return AgentStep(
+                    type="assistant",
+                    content="最终结论：agent_loop 会先准备上下文，再在模型和工具之间循环。",
+                    kind="final",
+                )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            session = create_new_session(tmpdir)
+            working_memory = WorkingMemory()
+            model = _ProgressThenFinalModel()
+
+            step, next_history = run_agent_once(
+                user_input="分析 agent_loop 链路",
+                model=model,
+                tool_registry=_FakeToolRegistry(),
+                tool_context=ToolContext(cwd=tmpdir),
+                session=session,
+                working_memory=working_memory,
+                memory_pipeline=None,
+                max_steps=2,
+                session_id="sess-progress-continue",
+            )
+
+            self.assertEqual(step.type, "assistant")
+            self.assertEqual(step.kind, "final")
+            self.assertIn("最终结论", step.content)
+            self.assertEqual(len(model.calls), 2)
+            self.assertTrue(
+                any(message.get("role") == "assistant_progress" for message in next_history)
+            )
+            self.assertTrue(
+                any(
+                    message.get("role") == "user"
+                    and "继续" in str(message.get("content", ""))
+                    for message in model.calls[1]
+                )
+            )
+            self.assertFalse(
+                any(
+                    message.get("role") == "user"
+                    and "继续" in str(message.get("content", ""))
+                    for message in next_history
+                )
+            )
+
+    def test_agent_loop_injects_convergence_nudge_after_repeated_exploration(self) -> None:
+        class _RepeatedExplorationModel:
+            def __init__(self) -> None:
+                self.call_count = 0
+                self.calls: list[list[dict[str, object]]] = []
+
+            def next(self, messages, on_stream_chunk=None, store=None):  # type: ignore[no-untyped-def]
+                self.calls.append(list(messages))
+                self.call_count += 1
+                if self.call_count == 1:
+                    return AgentStep(
+                        type="tool_calls",
+                        calls=[
+                            {
+                                "id": "tool-1",
+                                "tool_name": "read_file",
+                                "input": {"path": "app/agent_loop.py"},
+                            }
+                        ],
+                    )
+                if self.call_count == 2:
+                    return AgentStep(
+                        type="tool_calls",
+                        calls=[
+                            {
+                                "id": "tool-2",
+                                "tool_name": "find_symbols",
+                                "input": {"path": "app/agent_loop.py", "keyword": "_run_agent_loop"},
+                            }
+                        ],
+                    )
+                if not any(
+                    message.get("role") == "user"
+                    and "你已经拿到了工具结果" in str(message.get("content", ""))
+                    for message in messages
+                ):
+                    raise AssertionError("missing convergence nudge")
+                return AgentStep(
+                    type="assistant",
+                    content="结论：当前信息已经足够，可以直接总结 agent_loop 的链路。",
+                    kind="final",
+                )
+
+        class _RepeatedExplorationToolRegistry:
+            def list_tool_name(self) -> list[str]:
+                return ["read_file", "find_symbols"]
+
+            def execute_tool(self, tool_name: str, input_data: object, context: object) -> object:
+                if tool_name == "read_file":
+                    return ToolResult(
+                        ok=True,
+                        output="FILE: app/agent_loop.py\n\ndef _run_agent_loop(...): pass\n",
+                    )
+                return ToolResult(
+                    ok=True,
+                    output="SYMBOL: _run_agent_loop\nSYMBOL: run_agent_once\n",
+                )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            session = create_new_session(tmpdir)
+            working_memory = WorkingMemory()
+            model = _RepeatedExplorationModel()
+
+            step, next_history = run_agent_once(
+                user_input="分析 agent_loop 串联链路",
+                model=model,
+                tool_registry=_RepeatedExplorationToolRegistry(),  # type: ignore[arg-type]
+                tool_context=ToolContext(cwd=tmpdir),
+                session=session,
+                working_memory=working_memory,
+                memory_pipeline=None,
+                max_steps=3,
+                session_id="sess-convergence-nudge",
+            )
+
+            self.assertEqual(step.type, "assistant")
+            self.assertIn("信息已经足够", step.content)
+            self.assertEqual(len(model.calls), 3)
+            self.assertFalse(
+                any(
+                    message.get("role") == "user"
+                    and "你已经拿到了工具结果" in str(message.get("content", ""))
+                    for message in next_history
+                )
+            )
+
+
+    def test_analysis_tracker_extracts_directory_qualified_path_and_bare_filename(self) -> None:
+        tracker = agent_loop_module._create_analysis_tracker(
+            "帮我分析一下 app目录下的main.py 串联链路，并顺便看看 agent_loop.py 的入口"
+        )
+
+        self.assertIn("app/main.py", tracker["candidate_paths"])
+        self.assertIn("agent_loop.py", tracker["requested_basenames"])
+        self.assertEqual(tracker["analysis_kind"], "call_chain")
+
+    def test_call_chain_analysis_requires_real_source_read_even_after_overview(self) -> None:
+        tracker = agent_loop_module._create_analysis_tracker("分析 app/main.py 串联链路")
+
+        agent_loop_module._record_analysis_evidence(
+            tracker,
+            tool_name="file_overview",
+            tool_input={"path": "app/main.py"},
+            result=ToolResult(
+                ok=True,
+                output=(
+                    "文件: app/main.py\n"
+                    "总行数: 404\n"
+                    "\n"
+                    "函数:\n"
+                    "_build_arg_parser() @L36\n"
+                    "_load_or_create_session() @L62\n"
+                    "_replace_pending_tool_result() @L86\n"
+                    "main() @L131\n"
+                ),
+            ),
+        )
+
+        self.assertFalse(agent_loop_module._has_sufficient_analysis_evidence(tracker))
+
+    def test_call_chain_analysis_with_bare_filename_requires_unique_matched_target(self) -> None:
+        tracker = agent_loop_module._create_analysis_tracker("分析 main.py 串联链路")
+
+        agent_loop_module._record_analysis_evidence(
+            tracker,
+            tool_name="file_overview",
+            tool_input={"path": "app/main.py"},
+            result=ToolResult(
+                ok=True,
+                output="文件: app/main.py\n函数:\nmain() @L131\n",
+            ),
+        )
+        agent_loop_module._record_analysis_evidence(
+            tracker,
+            tool_name="read_file",
+            tool_input={"path": "app/main.py"},
+            result=ToolResult(
+                ok=True,
+                output=(
+                    "FILE: app/main.py\n"
+                    "OFFSET: 0\n"
+                    "END: 300\n"
+                    "TOTAL_CHARS: 300\n"
+                    "TRUNCATED: no\n"
+                    "config = load_config()\n"
+                    "step, history = run_agent_once(...)\n"
+                ),
+            ),
+        )
+
+        self.assertTrue(agent_loop_module._has_sufficient_analysis_evidence(tracker))
+
+        ambiguous_tracker = agent_loop_module._create_analysis_tracker("分析 main.py 串联链路")
+        agent_loop_module._record_analysis_evidence(
+            ambiguous_tracker,
+            tool_name="file_overview",
+            tool_input={"path": "app/main.py"},
+            result=ToolResult(
+                ok=True,
+                output="文件: app/main.py\n函数:\nmain() @L131\n",
+            ),
+        )
+        agent_loop_module._record_analysis_evidence(
+            ambiguous_tracker,
+            tool_name="file_overview",
+            tool_input={"path": "pkg/main.py"},
+            result=ToolResult(
+                ok=True,
+                output="文件: pkg/main.py\n函数:\nmain() @L88\n",
+            ),
+        )
+        agent_loop_module._record_analysis_evidence(
+            ambiguous_tracker,
+            tool_name="read_file",
+            tool_input={"path": "app/main.py"},
+            result=ToolResult(
+                ok=True,
+                output=(
+                    "FILE: app/main.py\n"
+                    "OFFSET: 0\n"
+                    "END: 300\n"
+                    "TOTAL_CHARS: 300\n"
+                    "TRUNCATED: no\n"
+                    "config = load_config()\n"
+                ),
+            ),
+        )
+
+        self.assertFalse(agent_loop_module._has_sufficient_analysis_evidence(ambiguous_tracker))
+
+    def test_analysis_fact_validator_rejects_unobserved_cli_args(self) -> None:
+        tracker = agent_loop_module._create_analysis_tracker("analyze app/main.py call chain")
+        tracker["candidate_paths"].add("app/main.py")
+        tracker["covered_paths"].add("app/main.py")
+        tracker["observed_functions"].update({"_build_arg_parser", "main"})
+        tracker["observed_symbols"].update(tracker["observed_functions"])
+        tracker["observed_file_cli_args"]["app/main.py"] = {"--session", "--resume"}
+
+        invalid_claims = agent_loop_module._find_unsupported_analysis_claims(
+            tracker,
+            "参数包括 --session、--resume、--workspace 和 --task。",
+        )
+
+        self.assertTrue(any("--workspace" in claim for claim in invalid_claims))
+        self.assertTrue(any("--task" in claim for claim in invalid_claims))
+
+    def test_agent_loop_redirects_call_chain_analysis_to_structure_first(self) -> None:
+        class _ReadFileFirstModel:
+            def __init__(self) -> None:
+                self.call_count = 0
+                self.calls: list[list[dict[str, object]]] = []
+
+            def next(self, messages, on_stream_chunk=None, store=None):  # type: ignore[no-untyped-def]
+                self.calls.append(list(messages))
+                self.call_count += 1
+                if self.call_count == 1:
+                    return AgentStep(
+                        type="tool_calls",
+                        calls=[
+                            {
+                                "id": "tool-1",
+                                "tool_name": "read_file",
+                                "input": {"path": "app/main.py"},
+                            }
+                        ],
+                    )
+                if not any(
+                    message.get("role") == "user"
+                    and "先使用 get_ast_info" in str(message.get("content", ""))
+                    for message in messages
+                ):
+                    raise AssertionError("missing structure-first nudge")
+                return AgentStep(
+                    type="assistant",
+                    content="已改用结构化证据优先策略。",
+                    kind="final",
+                )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            session = create_new_session(tmpdir)
+            working_memory = WorkingMemory()
+            model = _ReadFileFirstModel()
+
+            step, _next_history = run_agent_once(
+                user_input="分析 app/main.py 的调用链",
+                model=model,
+                tool_registry=_FakeToolRegistry(),
+                tool_context=ToolContext(cwd=tmpdir),
+                session=session,
+                working_memory=working_memory,
+                memory_pipeline=None,
+                max_steps=3,
+                session_id="sess-structure-first",
+            )
+
+            self.assertEqual(step.type, "assistant")
+            self.assertEqual(len(model.calls), 2)
 
 
 if __name__ == "__main__":

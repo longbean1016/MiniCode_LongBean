@@ -170,6 +170,7 @@ def main() -> None:
             embedding_model=config.embedding_model,
             embedding_dimensions=config.embedding_dimensions,
             qdrant_url=config.qdrant_url,
+            qdrant_path=config.qdrant_path,
             qdrant_api_key=config.qdrant_api_key,
             collection_name=config.qdrant_collection,
             retry_max_attempts=config.vector_retry_max_attempts,

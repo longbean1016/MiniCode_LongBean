@@ -136,12 +136,16 @@ def collect_context_stats(
     )
 
 
-def decide_context_policy(stats: ContextStats) -> ContextPolicy:
+def decide_context_policy(
+    stats: ContextStats,
+    *,
+    analysis_mode: bool = False,
+) -> ContextPolicy:
     """根据上下文占用比例决定压缩等级和记忆注入预算。"""
     ratio = stats.usage_ratio
 
     if ratio >= 0.80:
-        return ContextPolicy(
+        policy = ContextPolicy(
             level=3,
             keep_rounds=3,
             memory_top_k=1,
@@ -150,8 +154,8 @@ def decide_context_policy(stats: ContextStats) -> ContextPolicy:
             max_recent_tool_results=2,
             truncate_tool_result_chars=800,
         )
-    if ratio >= 0.65:
-        return ContextPolicy(
+    elif ratio >= 0.65:
+        policy = ContextPolicy(
             level=2,
             keep_rounds=4,
             memory_top_k=2,
@@ -160,8 +164,8 @@ def decide_context_policy(stats: ContextStats) -> ContextPolicy:
             max_recent_tool_results=3,
             truncate_tool_result_chars=1600,
         )
-    if ratio >= 0.45:
-        return ContextPolicy(
+    elif ratio >= 0.45:
+        policy = ContextPolicy(
             level=1,
             keep_rounds=5,
             memory_top_k=3,
@@ -170,12 +174,28 @@ def decide_context_policy(stats: ContextStats) -> ContextPolicy:
             max_recent_tool_results=4,
             truncate_tool_result_chars=2500,
         )
+    else:
+        policy = ContextPolicy(
+            level=0,
+            keep_rounds=6,
+            memory_top_k=4,
+            retrieval_top_k=8,
+            memory_item_chars=180,
+            max_recent_tool_results=5,
+            truncate_tool_result_chars=4000,
+        )
+
+    # 代码分析任务里，tool_result 往往承载真实符号表和文件事实。
+    # 如果压得和普通问答一样狠，就容易出现“前面看过、后面答错”的现象。
+    if not analysis_mode:
+        return policy
+
     return ContextPolicy(
-        level=0,
-        keep_rounds=6,
-        memory_top_k=4,
-        retrieval_top_k=8,
-        memory_item_chars=180,
-        max_recent_tool_results=5,
-        truncate_tool_result_chars=4000,
+        level=policy.level,
+        keep_rounds=min(policy.keep_rounds + 1, 8),
+        memory_top_k=policy.memory_top_k,
+        retrieval_top_k=policy.retrieval_top_k,
+        memory_item_chars=policy.memory_item_chars,
+        max_recent_tool_results=max(policy.max_recent_tool_results, 8),
+        truncate_tool_result_chars=max(policy.truncate_tool_result_chars, 6000),
     )

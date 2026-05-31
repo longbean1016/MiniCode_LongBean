@@ -82,7 +82,13 @@ def _run(validated_input: dict[str, int | str], context: ToolContext) -> ToolRes
     if not target_path.is_dir():
         return ToolResult(
             ok=False,
-            output=f"目标不是目录：{raw_path}",
+            output=(
+                f"目标不是目录：{raw_path}\n"
+                "grep_files 只能搜索目录。\n"
+                "如果你要理解单个文件，请优先改用 read_file、file_overview 或 find_references。"
+            ),
+            error="SEARCH_EXPECTS_DIRECTORY",
+            meta={"path": raw_path},
         )
 
     matches: list[str] = []

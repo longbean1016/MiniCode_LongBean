@@ -8,7 +8,11 @@ from app.context_compact_memory import (
     parse_compact_memory_context,
     render_compact_memory_context,
 )
-from app.context_auto_compact import AutoCompactResult, run_auto_compact
+from app.context_auto_compact import (
+    AUTO_COMPACT_TARGET_RATIO,
+    AutoCompactResult,
+    run_auto_compact,
+)
 from app.context_compactor import CompactionResult, compact_recent_messages
 from app.context_manager import estimate_messages_tokens
 from app.context_message_safety import normalize_tool_call_pairs
@@ -54,6 +58,7 @@ class ContextCompactorPipeline:
         auto_compact_summary: str,
         auto_compact_snapshot: CompactMemorySnapshot | None = None,
         force_auto_compact: bool = False,
+        pinned_tool_names: set[str] | None = None,
     ) -> ContextPipelineResult:
         # 先做轻量 recent-window 压缩，把最肥的 tool_result 处理掉。
         compaction_result = compact_recent_messages(
@@ -61,6 +66,9 @@ class ContextCompactorPipeline:
             max_recent_tool_results=max_recent_tool_results,
             truncate_tool_result_chars=truncate_tool_result_chars,
             workspace=workspace,
+            pinned_tool_names=pinned_tool_names,
+            target_tokens=max(1, int(usable_budget * AUTO_COMPACT_TARGET_RATIO) - fixed_overhead_tokens),
+            protected_recent_messages=6,
         )
         steps_taken = [
             "tool_budget",
@@ -86,6 +94,9 @@ class ContextCompactorPipeline:
             "truncated_tool_results": compaction_result.truncated_tool_results,
             "cleared_old_tool_results": compaction_result.cleared_old_tool_results,
             "deduped_read_results": compaction_result.deduped_read_results,
+            "semantic_compacted_pairs": compaction_result.semantic_compacted_pairs,
+            "dropped_progress_messages": compaction_result.dropped_progress_messages,
+            "priority_dropped_messages": compaction_result.priority_dropped_messages,
             "recent_tokens_after_compaction": recent_tokens_after_compaction,
             "tokens_freed_estimate": (
                 compaction_result.tokens_freed_estimate + auto_compact_result.tokens_freed_estimate

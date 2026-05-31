@@ -39,6 +39,30 @@ from app.tooling import ToolRegistry
 from app.types import ChatMessage
 from app.working_memory import WorkingMemory
 
+_ANALYSIS_MODE_KEYWORDS = (
+    "分析",
+    "链路",
+    "调用链",
+    "串联",
+    "流程",
+    "入口",
+    "结构",
+    "梳理",
+    "trace",
+    "analyze",
+    "analysis",
+    "call chain",
+    "workflow",
+    "walkthrough",
+)
+_ANALYSIS_PINNED_TOOL_NAMES = {
+    "file_overview",
+    "get_ast_info",
+    "find_symbols",
+    "locate_symbol",
+    "find_references",
+}
+
 
 @dataclass(slots=True)
 class PreparedAgentContext:
@@ -81,6 +105,7 @@ def prepare_agent_context(
     并把 compact 后的 active context 单独保存到 context_state。
     """
     usable_budget = _resolve_usable_budget(session)
+    analysis_mode = _infer_analysis_mode_from_history(full_history)
     base_system_prompt = build_system_prompt(tool_registry=tool_registry, memory_context="")
     cached_state = load_context_state(session.workspace, session.session_id)
 
@@ -103,7 +128,7 @@ def prepare_agent_context(
         usable_budget=usable_budget,
     )
 
-    policy = decide_context_policy(preview_stats)
+    policy = decide_context_policy(preview_stats, analysis_mode=analysis_mode)
     session.extra["compaction_level"] = policy.level
 
     # 命中可复用的 context_state 时，优先在旧 active context 上追加增量消息。
@@ -172,6 +197,7 @@ def prepare_agent_context(
         usable_budget=usable_budget,
         fixed_overhead_tokens=fixed_overhead_tokens,
         base_system_prompt=base_system_prompt,
+        analysis_mode=analysis_mode,
     )
     compact_memory_snapshot = (
         pipeline_result.resolved_compact_memory_snapshot or compact_memory_snapshot
@@ -204,6 +230,7 @@ def prepare_agent_context(
             fixed_overhead_tokens=fixed_overhead_tokens,
             base_system_prompt=base_system_prompt,
             force_auto_compact=True,
+            analysis_mode=analysis_mode,
         )
         compact_memory_snapshot = (
             pipeline_result.resolved_compact_memory_snapshot or compact_memory_snapshot
@@ -253,6 +280,23 @@ def _resolve_usable_budget(session: SessionData) -> int:
         return max(1, int(raw_value))
     except (TypeError, ValueError):
         return DEFAULT_USABLE_CONTEXT_BUDGET
+
+
+def _infer_analysis_mode_from_history(full_history: list[ChatMessage]) -> bool:
+    """根据最近真实用户请求判断当前是否是代码分析任务。"""
+    for message in reversed(full_history):
+        if message.get("role") != "user":
+            continue
+        content = str(message.get("content", "")).strip()
+        if not content:
+            continue
+        lowered = content.lower()
+        if any(keyword in content for keyword in _ANALYSIS_MODE_KEYWORDS):
+            return True
+        if any(keyword in lowered for keyword in _ANALYSIS_MODE_KEYWORDS):
+            return True
+        return False
+    return False
 
 
 def _build_preview_memory_context(*, older_history_summary: str, working_memory: WorkingMemory) -> str:
@@ -412,6 +456,7 @@ def _build_compacted_request(
     fixed_overhead_tokens: int,
     base_system_prompt: str,
     force_auto_compact: bool = False,
+    analysis_mode: bool = False,
 ) -> tuple[ContextPipelineResult, str, ContextStats, list[ChatMessage]]:
     """统一构造一次 compact 后的请求消息，避免 runtime 内重复拼装。"""
     pipeline_result = pipeline.process_request(
@@ -425,6 +470,7 @@ def _build_compacted_request(
         auto_compact_summary=compact_memory_context,
         auto_compact_snapshot=compact_memory_snapshot,
         force_auto_compact=force_auto_compact,
+        pinned_tool_names=(_ANALYSIS_PINNED_TOOL_NAMES if analysis_mode else None),
     )
 
     session_snapshot = SessionData(

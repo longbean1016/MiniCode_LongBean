@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import uuid
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable
 
 from openai import OpenAI
@@ -46,6 +47,7 @@ class MemoryVectorIndex:
         embedding_model: str,
         embedding_dimensions: int,
         qdrant_url: str,
+        qdrant_path: str,
         qdrant_api_key: str,
         collection_name: str,
         retry_max_attempts: int = 3,
@@ -69,6 +71,8 @@ class MemoryVectorIndex:
         self.embedding_model = embedding_model
         self.embedding_dimensions = max(0, int(embedding_dimensions))
         self.collection_name = collection_name
+        self.qdrant_url = qdrant_url.strip()
+        self.qdrant_path = qdrant_path.strip()
 
         # embedding 和 Qdrant 都不是主回答链路，
         # 所以这里允许轻量重试和短时间熔断。
@@ -95,13 +99,20 @@ class MemoryVectorIndex:
             recovery_timeout_seconds=circuit_recovery_timeout_seconds,
         )
 
-        self.qdrant = QdrantClient(
-            url=qdrant_url,
-            api_key=qdrant_api_key or None,
-            timeout=10.0,  # type: ignore
-            check_compatibility=False,
-            trust_env=False,
-        )
+        if self.qdrant_path:
+            # 本地 embedded 模式下，Qdrant 会把 collection 数据直接落到项目目录。
+            Path(self.qdrant_path).mkdir(parents=True, exist_ok=True)
+            self.qdrant = QdrantClient(
+                path=self.qdrant_path,
+            )
+        else:
+            self.qdrant = QdrantClient(
+                url=self.qdrant_url,
+                api_key=qdrant_api_key or None,
+                timeout=10.0,  # type: ignore
+                check_compatibility=False,
+                trust_env=False,
+            )
 
         # collection 在第一次拿到 embedding 维度后再自动创建。
         self._collection_initialized = False

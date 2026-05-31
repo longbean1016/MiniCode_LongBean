@@ -130,6 +130,9 @@ class AppConfig:
     # Qdrant 服务端地址，例如 http://localhost:6333
     qdrant_url: str
 
+    # Qdrant 本地持久化目录；非空时优先走本地 embedded 模式
+    qdrant_path: str
+
     # Qdrant API Key，本地无鉴权时可为空
     qdrant_api_key: str
 

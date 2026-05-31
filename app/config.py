@@ -79,8 +79,9 @@ def load_config() -> AppConfig:
     - `EMBEDDING_API_KEY`: embedding 服务专用 API Key
     - `EMBEDDING_BASE_URL`: embedding 服务专用接口地址
     - `EMBEDDING_DIMENSIONS`: 可选的向量维度
-    - `QDRANT_ENABLED`: 是否启用 Qdrant 服务端向量索引
-    - `QDRANT_URL`: Qdrant 服务地址
+    - `QDRANT_ENABLED`: 是否启用 Qdrant 向量索引
+    - `QDRANT_URL`: Qdrant 服务地址；为空时可退回本地 embedded 模式
+    - `QDRANT_PATH`: Qdrant 本地持久化目录；非空时优先使用
     - `QDRANT_API_KEY`: Qdrant API Key（本地无鉴权时可留空）
     - `QDRANT_COLLECTION`: 向量集合名
     """
@@ -97,6 +98,10 @@ def load_config() -> AppConfig:
 
     qdrant_enabled = _get_bool_env("QDRANT_ENABLED", default=False)
     qdrant_url = _get_env("QDRANT_URL", default="http://localhost:6333")
+    raw_qdrant_path = _get_env("QDRANT_PATH", default=".qdrant_storage").strip()
+    qdrant_path = ""
+    if raw_qdrant_path:
+        qdrant_path = str((Path(workspace_root) / raw_qdrant_path).resolve())
     qdrant_api_key = _get_env("QDRANT_API_KEY", default="")
     qdrant_collection = _get_env("QDRANT_COLLECTION", default="project_memories")
     model_retry_max_attempts = _get_int_env("MODEL_RETRY_MAX_ATTEMPTS", default=3)
@@ -185,6 +190,7 @@ def load_config() -> AppConfig:
         workspace_root=workspace_root,
         qdrant_enabled=qdrant_enabled,
         qdrant_url=qdrant_url,
+        qdrant_path=qdrant_path,
         qdrant_api_key=qdrant_api_key,
         qdrant_collection=qdrant_collection,
         model_retry_max_attempts=model_retry_max_attempts,
