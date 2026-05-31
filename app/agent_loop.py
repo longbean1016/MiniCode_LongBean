@@ -236,6 +236,9 @@ def _run_agent_loop(
     task_text = _extract_latest_real_user_message(builder.build())
     analysis_tracker: dict[str, object] | None = None
     if _is_code_analysis_request(task_text):
+        # 分析类任务会额外维护一份“证据账本”。
+        # 后面每次读文件/查符号，都会往里面沉淀可验证事实，
+        # 最终用它判断是否该停止探索、是否允许直接放行答案。
         analysis_tracker = _create_analysis_tracker(task_text)
         target_resolution_nudge = _build_analysis_target_resolution_nudge(analysis_tracker)
         pending_user_nudge = NUDGE_ANALYSIS_TOOL_PRIORITY
@@ -301,6 +304,8 @@ def _run_agent_loop(
             prepared_context.messages,
             pending_user_nudge,
         )
+        # nudge 只对“这一次模型请求”生效，不会写回 builder 历史。
+        # 这样既能引导下一步动作，又不会污染后续真正的会话记录。
         if pending_user_nudge:
             log_event(
                 f"[session={session_id or '-'}] 第 {step_index + 1} 轮注入临时引导提示"
@@ -322,6 +327,7 @@ def _run_agent_loop(
             )
         except Exception as error:
             if is_context_overflow_error(error):
+                # 只有明确判断为上下文溢出时，才会尝试改写消息后重试模型。
                 recovery_result = recover_from_context_overflow(
                     messages=messages,
                     usable_budget=prepared_context.stats.usable_budget,
@@ -349,7 +355,8 @@ def _run_agent_loop(
                                 )
                                 continue
 
-                            # 对代码分析类回答做最后一道符号校验，避免把猜测出的函数名直接放行。
+                            # 对代码分析类回答做最后一道事实校验。
+                            # 这里拦的不是“回答不好”，而是“引用了未观察到的函数名/统计数字/step.type”。
                             if (
                                 analysis_tracker is not None
                                 and _has_sufficient_analysis_evidence(analysis_tracker)
@@ -441,6 +448,8 @@ def _run_agent_loop(
         if step.type == "assistant":
             if step.kind == "progress":
                 builder.add_progress(step.content)
+                # progress 代表模型认为还没收敛。
+                # 这里不结束本轮，而是把进度消息写入历史后继续驱动下一轮决策。
                 if analysis_tracker is not None and _has_sufficient_analysis_evidence(analysis_tracker):
                     pending_user_nudge = _build_analysis_convergence_nudge(analysis_tracker)
                 else:
@@ -538,6 +547,8 @@ def _run_agent_loop(
                 analysis_tracker is not None
                 and _should_redirect_analysis_to_structure_first(analysis_tracker, step.calls)
             ):
+                # 链路分析早期如果一上来就 read_file，很容易在半截源码上脑补流程。
+                # 先强制拿一份 file_overview / AST / symbol 级结构，再决定读哪一段源码。
                 pending_user_nudge = NUDGE_ANALYSIS_TOOL_PRIORITY + "\n" + NUDGE_ANALYSIS_STRUCTURE_FIRST
                 log_event(
                     f"[session={session_id or '-'}] 第 {step_index + 1} 轮检测到分析任务过早直接 read_file，要求先获取结构化证据"
@@ -555,6 +566,8 @@ def _run_agent_loop(
                 )
             ):
                 blocked_analysis_tool_call_count += 1
+                # 第一次拦截时先温和提示“证据够了可以回答”；
+                # 连续第二次还想继续探索，就升级成强制直接作答。
                 if blocked_analysis_tool_call_count >= 2:
                     pending_user_nudge = _build_analysis_force_answer_nudge(analysis_tracker)
                 else:
@@ -572,8 +585,8 @@ def _run_agent_loop(
                 tool_use_id = call["id"]
                 tool_target = _extract_tool_target(tool_input)
 
-                # 从工具输入里尽量提取活跃路径。
-                # 这一步会覆盖 path / file_path / directory / run_command 等常见形式。
+                # 这里只沉淀“当前任务正在碰哪些路径/命令/目标”。
+                # 后面的 working_memory 和 memory_pipeline 会把这些线索变成短期上下文。
                 if memory_pipeline is not None:
                     memory_pipeline.record_tool_call(
                         working_memory,
@@ -639,9 +652,13 @@ def _run_agent_loop(
                 )
 
                 if _is_exploration_tool(tool_name):
+                    # exploration_history 只是一个轻量信号，
+                    # 用来判断是不是连续在探索同一个目标。
                     exploration_history.append((tool_name, tool_target))
 
                 if analysis_tracker is not None:
+                    # 真正严格的分析证据都沉淀在 tracker 里，
+                    # 例如哪些函数名是观察到的、哪段 read_file 已读过、是否已完整读完目标文件。
                     _record_analysis_evidence(
                         analysis_tracker,
                         tool_name=tool_name,
@@ -678,8 +695,8 @@ def _run_agent_loop(
                     reason = str(result.meta.get("reason", ""))
                     action_key = str(result.meta.get("action_key", ""))
 
-                    # 授权中断前也要补一条 tool_result，避免历史里只留下 tool_call
-                    # 否则下一轮把这段历史再发给模型时，会因为协议断链而报 400
+                    # 授权前先补一条占位 tool_result，保证消息协议完整。
+                    # 否则历史里只剩 tool_call 没有 tool_result，下一次继续会话时会断链。
                     builder.add_tool_result(
                         tool_use_id=tool_use_id,
                         tool_name=tool_name,
@@ -725,6 +742,8 @@ def _run_agent_loop(
                 step_index=step_index,
                 max_steps=max_steps,
             ):
+                # 这层提示比分析专项护栏更通用：
+                # 只要检测到连续探索或接近步数上限，就提醒模型先判断是否已经够答。
                 if analysis_tracker is not None and _has_sufficient_analysis_evidence(analysis_tracker):
                     pending_user_nudge = _build_analysis_convergence_nudge(analysis_tracker)
                 else:

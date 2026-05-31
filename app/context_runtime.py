@@ -147,6 +147,7 @@ def prepare_agent_context(
         usable_budget=usable_budget,
     )
 
+    # 先基于“预估上下文”选压缩级别，而不是等真正超预算了再补救。
     policy = decide_context_policy(preview_stats, analysis_mode=analysis_mode)
     session.extra["compaction_level"] = policy.level
 
@@ -155,6 +156,8 @@ def prepare_agent_context(
         full_history=full_history,
         cached_state=cached_state,
     )
+    # 命中可复用的 active context 时，优先走增量恢复，
+    # 避免每一轮都从 full_history 重新切一次 recent window。
     if restored_recent_messages is not None:
         history_window = HistoryWindow(
             older_messages=[],
@@ -197,6 +200,8 @@ def prepare_agent_context(
 
     fixed_overhead_tokens = max(0, preview_stats.total_tokens - preview_stats.recent_tokens)
     pipeline = ContextCompactorPipeline()
+    # pipeline 负责真正把“摘要、memory、tool_result 裁剪、系统提示词”拼成最终请求。
+    # prepare_agent_context 自己只做编排，不直接改写消息细节。
     pipeline_result, memory_context, final_stats, messages = _build_compacted_request(
         pipeline=pipeline,
         source_recent_messages=history_window.recent_messages,
@@ -226,6 +231,8 @@ def prepare_agent_context(
     )
 
     # 如果 memory 注入后上下文还是高压状态，再强制走一次 auto compact。
+    # 如果 memory 注入之后上下文还是高压，就再强制走一次 auto compact。
+    # 这一步是第二道保险，避免“摘要已经做了，但 memory 一加回来又超压”。
     if (
         final_stats.usage_ratio >= AUTO_COMPACT_TRIGGER_RATIO
         and pipeline_result.auto_compact_result.strategy != "full"

@@ -182,6 +182,8 @@ def parse_user_md(content: str) -> UserProfileSnapshot:
     profile = UserProfileSnapshot()
     sections = _split_sections(content)
 
+    # 结构化字段只抽“当前系统真的会消费”的那部分，
+    # 其他更自由的用户要求统一落到 custom_instructions，避免解析器越来越脆。
     preferences = _parse_key_values(sections.get("preferences", ""))
     coding_style = _parse_key_values(sections.get("coding_style", ""))
 
@@ -203,6 +205,8 @@ def serialize_user_md(profile: UserProfileSnapshot) -> str:
 
     # 只输出当前项目真正会参与上下文管理的字段，避免 USER.md 越写越散。
     preference_lines: list[str] = []
+    # 这里只序列化“当前上下文系统会稳定使用的字段”，
+    # 避免 USER.md 被越来越多的临时偏好污染成一个难以维护的大杂烩。
     if profile.language.strip():
         preference_lines.append(f"- **Language**: {profile.language.strip()}")
     if profile.verbosity.strip():
@@ -285,6 +289,7 @@ def handle_user_profile_command(user_input: str, workspace: str) -> UserProfileC
 
     if args.lower().startswith("add "):
         payload = args[4:].strip()
+        # add 更偏“增量追加偏好”，不要求用户给出结构化 key。
         return UserProfileCommandResult(
             handled=True,
             response_text=_handle_user_add(payload, workspace),
@@ -292,6 +297,7 @@ def handle_user_profile_command(user_input: str, workspace: str) -> UserProfileC
 
     if args.lower().startswith("set "):
         payload = args[4:].strip()
+        # set 走显式字段更新，适合 language / verbosity 这类稳定配置。
         return UserProfileCommandResult(
             handled=True,
             response_text=_handle_user_set(payload, workspace),

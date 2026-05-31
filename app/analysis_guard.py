@@ -610,6 +610,8 @@ def _record_analysis_evidence(
     if not isinstance(tool_input, dict):
         return
 
+    # 这里做的不是“保存原始工具输出”，而是把后面真正要校验的事实拆出来：
+    # 例如目标文件路径、已确认的函数名、read_file 覆盖范围、CLI 参数等。
     raw_target = tool_input.get("path")
     target = _normalize_target(raw_target) if isinstance(raw_target, str) and raw_target.strip() else ""
     covered_paths = tracker["covered_paths"]
@@ -676,10 +678,14 @@ def _record_analysis_evidence(
             and signature_limit is not None
             and signature_limit > 0
         ):
+            # read_file 用“路径 + offset + limit”做精确片段签名。
+            # 这样后面判断重复探索时，不会把不同片段误认为同一次读取。
             signatures = read_segments.setdefault(target, set())
             if isinstance(signatures, set):
                 signatures.add(_build_analysis_read_signature(target, signature_offset, signature_limit))
         if offset == 0 and truncated is False:
+            # 只有从 0 开始且明确未截断，才算完整读过文件。
+            # 否则即使读到过这个路径，也不能支持“我已经完整分析了该文件”的结论。
             fully_read_paths.add(target)
             truncated_read_paths.discard(target)
         elif truncated is True:
@@ -739,6 +745,8 @@ def _has_sufficient_analysis_evidence(tracker: dict[str, object]) -> bool:
             return False
 
         if analysis_kind == "call_chain":
+            # 链路分析比普通文件概览更严格：
+            # 既要看过结构化入口，也要至少看过一段真实源码或 AST，避免只靠概览硬串流程。
             if primary_path not in overview_paths and primary_path not in ast_paths:
                 return False
             if primary_path not in read_paths and primary_path not in ast_paths:
@@ -773,6 +781,8 @@ def _should_block_redundant_analysis_calls(
     if not _all_calls_are_exploration(calls, is_exploration_tool=is_exploration_tool):
         return False
 
+    # 进入这里说明“这批 calls 都是探索类工具，且已有答案所需证据”。
+    # 下面要判断的是：这些探索是不是还在重复读旧内容，而不是继续补新证据。
     remaining_steps = max_steps - step_index - 1
     overview_paths = tracker["overview_paths"]
     read_segments = tracker["read_segments"]
@@ -811,6 +821,7 @@ def _should_block_redundant_analysis_calls(
                 and signature_limit is not None
                 and signature_limit > 0
             ):
+                # 如果这次读取的还是同一片 offset/limit，直接视为重复探索。
                 signatures = read_segments.get(target, set())
                 signature = _build_analysis_read_signature(target, signature_offset, signature_limit)
                 if isinstance(signatures, set) and signature in signatures:
@@ -827,6 +838,7 @@ def _should_block_redundant_analysis_calls(
             redundant_calls += 1
 
     if remaining_steps <= 1:
+        # 接近最大步数时，宁可要求收敛，也不再给模型继续兜圈子的机会。
         return True
 
     return redundant_calls == len(calls) and redundant_calls > 0
@@ -837,6 +849,8 @@ def _build_analysis_convergence_nudge(tracker: dict[str, object]) -> str:
     evidence_lines: list[str] = []
     analysis_kind = str(tracker.get("analysis_kind", "file_summary"))
 
+    # 这里只挑“足够约束答案”的少量事实，不把整份 tracker 倒给模型。
+    # 目的不是复述工具输出，而是提醒模型：哪些内容已经确认、哪些内容禁止脑补。
     if analysis_kind == "call_chain":
         evidence_lines.append("当前任务类型: 链路分析")
 
