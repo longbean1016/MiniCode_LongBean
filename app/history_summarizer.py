@@ -6,6 +6,14 @@ import hashlib
 
 from openai import OpenAI
 
+from app.context_compact_memory import (
+    CompactMemorySnapshot,
+    merge_active_context_snapshots,
+    parse_active_context_summary,
+    prioritize_snapshot_for_current_focus,
+    render_active_context_summary,
+    render_full_active_context_summary,
+)
 from app.circuit_breaker import CircuitBreaker
 from app.compaction_policy import build_compaction_policy
 from app.history_window import build_older_history_summary
@@ -185,6 +193,78 @@ class OlderHistorySummarizer:
 
         return total_chars >= self.min_total_chars
 
+    def summarize_active_context_compaction(
+        self,
+        *,
+        strategy: str,
+        removed_messages: list[ChatMessage],
+        fallback_summary: str,
+        fallback_snapshot: CompactMemorySnapshot | None,
+        focus_lines: list[str] | None = None,
+    ) -> tuple[str, CompactMemorySnapshot | None]:
+        """
+        为 session/full compact 生成“模型优先，规则兜底”的结构化摘要。
+
+        返回值约定：
+        - 成功时返回模型参与融合后的 summary_text / summary_snapshot
+        - 失败、熔断、结果不可解析时，原样退回 fallback
+        """
+        normalized_fallback = fallback_summary.strip()
+        normalized_snapshot = (
+            dict(fallback_snapshot)
+            if fallback_snapshot
+            else parse_active_context_summary(normalized_fallback)
+        )
+        if not removed_messages:
+            return normalized_fallback, normalized_snapshot or None
+
+        if not self._should_use_compaction_model(removed_messages):
+            return normalized_fallback, normalized_snapshot or None
+
+        context_text = self._build_context_text(removed_messages)
+        if not context_text:
+            return normalized_fallback, normalized_snapshot or None
+
+        try:
+            model_summary = self._call_compaction_model(
+                strategy=strategy,
+                context_text=context_text,
+                focus_lines=list(focus_lines or []),
+            ).strip()
+        except Exception:
+            model_summary = ""
+
+        if not model_summary:
+            return normalized_fallback, normalized_snapshot or None
+
+        model_snapshot = parse_active_context_summary(model_summary)
+        if not model_snapshot:
+            # 模型可能没带“结构化压缩记忆”总标题，这里补一个再试一次解析。
+            model_snapshot = parse_active_context_summary(
+                "结构化压缩记忆\n" + model_summary
+            )
+        if not model_snapshot:
+            return normalized_fallback, normalized_snapshot or None
+
+        # 模型优先产出新的结构化槽位；规则摘要继续兜底补齐遗漏 section。
+        merged_snapshot = merge_active_context_snapshots(
+            base_snapshot=normalized_snapshot,
+            overlay_snapshot=model_snapshot,
+        )
+        if strategy == "full" and focus_lines:
+            # full compact 仍保留当前实现里的焦点对齐，
+            # 避免模型摘要虽然可用，但又把旧主题工具发现带回来。
+            merged_snapshot = prioritize_snapshot_for_current_focus(
+                merged_snapshot,
+                focus_lines=list(focus_lines),
+                drop_unaligned_tool_findings=True,
+            )
+            rendered = render_full_active_context_summary(merged_snapshot).strip()
+        else:
+            rendered = render_active_context_summary(merged_snapshot).strip()
+
+        return rendered or normalized_fallback, merged_snapshot or None
+
     def _fingerprint_messages(self, older_messages: list[ChatMessage]) -> str:
         """为旧历史生成稳定指纹。"""
         parts: list[str] = []
@@ -265,6 +345,80 @@ class OlderHistorySummarizer:
                 on_retry=lambda attempt, error, delay: log_event(
                     (
                         f"旧历史摘要模型调用失败，准备第 {attempt + 1} 次尝试："
+                        f"{type(error).__name__}: {error}，等待 {delay:.1f}s"
+                    ),
+                    echo=False,
+                ),
+            )
+        except Exception as error:
+            self.circuit_breaker.record_failure(error)
+            raise
+
+        self.circuit_breaker.record_success()
+        return response.choices[0].message.content or ""
+
+    def _should_use_compaction_model(self, removed_messages: list[ChatMessage]) -> bool:
+        """压缩摘要场景单独使用一套更轻的模型阈值。"""
+        if len(removed_messages) < 3:
+            return False
+
+        total_chars = 0
+        for message in removed_messages:
+            total_chars += len(str(message.get("content", "")))
+        return total_chars >= 240
+
+    def _call_compaction_model(
+        self,
+        *,
+        strategy: str,
+        context_text: str,
+        focus_lines: list[str],
+    ) -> str:
+        """调模型生成结构化压缩摘要，输出格式必须能被 active context 解析器消费。"""
+        strategy_label = "full compact" if strategy == "full" else "session compact"
+        focus_text = "\n".join(f"- {line}" for line in focus_lines if str(line).strip())
+        system_prompt = (
+            "你是一个代码 Agent 的结构化压缩摘要器。\n"
+            "你的任务是把一段会话历史压成后续轮次可持续复用的结构化摘要。\n"
+            "必须优先保留：当前任务、关键决策、未解决问题、关键工具发现、稳定约束。\n"
+            "不要写流水账，不要复述无价值工具输出，不要包含 ROOT/FILE/OFFSET/PREVIEW 之类的元信息。\n"
+            "输出必须使用中文，并严格使用下面这些 markdown 标题中的若干个：\n"
+            "## 当前任务\n"
+            "## 关键决策\n"
+            "## 未解决问题（最近风险）\n"
+            "## 关键工具发现（上次压缩延续）\n"
+            "## 项目约束\n"
+            "每个 section 下只写短 bullet，单条尽量一句话。\n"
+            f"当前工作模式：{strategy_label}。\n"
+        )
+        user_prompt = (
+            "请基于下面这批将被压缩掉的历史消息，生成结构化压缩摘要。\n"
+            "如果有明确的当前焦点，请优先围绕当前焦点组织摘要。\n\n"
+            f"当前焦点提示：\n{focus_text or '- 无显式焦点提示'}\n\n"
+            f"历史消息：\n{context_text}"
+        )
+
+        if not self.circuit_breaker.allow_request():
+            raise RuntimeError("history_summarizer 熔断中")
+
+        def _request_model() -> object:
+            return self.client.chat.completions.create(
+                model=self.model_name,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                extra_body={"thinking": {"type": "disabled"}},
+            )
+
+        try:
+            response = run_with_retry(
+                _request_model,
+                policy=self.retry_policy,
+                should_retry=should_retry_model_error,
+                on_retry=lambda attempt, error, delay: log_event(
+                    (
+                        f"压缩摘要模型调用失败，准备第 {attempt + 1} 次尝试："
                         f"{type(error).__name__}: {error}，等待 {delay:.1f}s"
                     ),
                     echo=False,

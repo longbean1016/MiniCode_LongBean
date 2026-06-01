@@ -898,6 +898,8 @@ class ContextManagerTests(unittest.TestCase):
             self.assertTrue(
                 any("不用帮我测试" in rule.instruction for rule in policy.scoped_rules)
             )
+            self.assertNotIn("我的名字是长豆角", policy.global_preferences)
+            self.assertNotIn("我给你取名字为小多", policy.global_preferences)
 
     def test_user_profile_loader_accepts_loose_manual_text_in_user_md(self) -> None:
         from app.user_profile import load_user_profile
@@ -949,6 +951,36 @@ class ContextManagerTests(unittest.TestCase):
             self.assertTrue(
                 any("longbean = 666" in rule.instruction for rule in policy.scoped_rules)
             )
+
+    def test_user_profile_loader_keeps_section_content_isolated(self) -> None:
+        from app.user_profile import load_user_profile
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            user_md_path = f"{tmpdir}\\USER.md"
+            with open(user_md_path, "w", encoding="utf-8") as handle:
+                handle.write(
+                    "# User Profile\n\n"
+                    "## Identity\n"
+                    "- 我的名字是长豆角，我给你取名字为锦程哥哥\n\n"
+                    "## Preference Instructions\n"
+                    "- 写代码时加上注释解释说明\n\n"
+                    "## Custom Instructions\n"
+                    "- 在tmp目录新建的代码不用帮我测试\n"
+                )
+
+            profile = load_user_profile(tmpdir)
+
+            self.assertIsNotNone(profile)
+            assert profile is not None
+            self.assertIn("我的名字是长豆角，我给你取名字为锦程哥哥", profile.identity_instructions)
+            self.assertNotIn("我的名字是长豆角，我给你取名字为锦程哥哥", profile.preference_instructions)
+            self.assertNotIn("我的名字是长豆角，我给你取名字为锦程哥哥", profile.custom_instructions)
+            self.assertIn("写代码时加上注释解释说明", profile.preference_instructions)
+            self.assertNotIn("写代码时加上注释解释说明", profile.identity_instructions)
+            self.assertNotIn("写代码时加上注释解释说明", profile.custom_instructions)
+            self.assertIn("在tmp目录新建的代码不用帮我测试", profile.custom_instructions)
+            self.assertNotIn("在tmp目录新建的代码不用帮我测试", profile.identity_instructions)
+            self.assertNotIn("在tmp目录新建的代码不用帮我测试", profile.preference_instructions)
 
     def test_split_instruction_lines_uses_different_limits_for_different_categories(self) -> None:
         from app.user_profile import UserProfileSnapshot
@@ -1337,6 +1369,14 @@ class ContextCompactorTests(unittest.TestCase):
             {"role": "tool_result", "tool_use_id": "call-2", "tool_name": "read_file", "content": "FILE: app/b.py\n\n" + ("B" * 3000), "meta": {"path": "app/b.py"}},
             {"role": "assistant_tool_call", "tool_use_id": "call-3", "tool_name": "read_file", "input": {"path": "app/c.py"}},
             {"role": "tool_result", "tool_use_id": "call-3", "tool_name": "read_file", "content": "FILE: app/c.py\n\n" + ("C" * 3000), "meta": {"path": "app/c.py"}},
+            {"role": "assistant_tool_call", "tool_use_id": "call-4", "tool_name": "read_file", "input": {"path": "app/d.py"}},
+            {"role": "tool_result", "tool_use_id": "call-4", "tool_name": "read_file", "content": "FILE: app/d.py\n\n" + ("D" * 3000), "meta": {"path": "app/d.py"}},
+            {"role": "assistant_tool_call", "tool_use_id": "call-5", "tool_name": "read_file", "input": {"path": "app/e.py"}},
+            {"role": "tool_result", "tool_use_id": "call-5", "tool_name": "read_file", "content": "FILE: app/e.py\n\n" + ("E" * 3000), "meta": {"path": "app/e.py"}},
+            {"role": "assistant_tool_call", "tool_use_id": "call-6", "tool_name": "read_file", "input": {"path": "app/f.py"}},
+            {"role": "tool_result", "tool_use_id": "call-6", "tool_name": "read_file", "content": "FILE: app/f.py\n\n" + ("F" * 3000), "meta": {"path": "app/f.py"}},
+            {"role": "assistant_tool_call", "tool_use_id": "call-7", "tool_name": "read_file", "input": {"path": "app/g.py"}},
+            {"role": "tool_result", "tool_use_id": "call-7", "tool_name": "read_file", "content": "FILE: app/g.py\n\n" + ("G" * 3000), "meta": {"path": "app/g.py"}},
         ]
 
         result = pipeline.process_request(
@@ -1361,15 +1401,15 @@ class ContextCompactorTests(unittest.TestCase):
         self.assertTrue(
             any(
                 message.get("role") == "assistant_tool_call"
-                and message.get("tool_use_id") == "call-3"
+                and message.get("tool_use_id") == "call-7"
                 for message in result.messages
             )
         )
         self.assertTrue(
             any(
                 message.get("role") == "tool_result"
-                and message.get("tool_use_id") == "call-3"
-                and "FILE: app/c.py" in str(message.get("content", ""))
+                and message.get("tool_use_id") == "call-7"
+                and "FILE: app/g.py" in str(message.get("content", ""))
                 for message in result.messages
             )
         )
@@ -1386,6 +1426,14 @@ class ContextCompactorTests(unittest.TestCase):
             {"role": "tool_result", "tool_use_id": "call-2", "tool_name": "read_file", "content": "FILE: app/b.py\n\n" + ("B" * 3000)},
             {"role": "assistant_tool_call", "tool_use_id": "call-3", "tool_name": "read_file", "input": {"path": "app/c.py"}},
             {"role": "tool_result", "tool_use_id": "call-3", "tool_name": "read_file", "content": "FILE: app/c.py\n\n" + ("C" * 3000)},
+            {"role": "assistant_tool_call", "tool_use_id": "call-4", "tool_name": "read_file", "input": {"path": "app/d.py"}},
+            {"role": "tool_result", "tool_use_id": "call-4", "tool_name": "read_file", "content": "FILE: app/d.py\n\n" + ("D" * 3000)},
+            {"role": "assistant_tool_call", "tool_use_id": "call-5", "tool_name": "read_file", "input": {"path": "app/e.py"}},
+            {"role": "tool_result", "tool_use_id": "call-5", "tool_name": "read_file", "content": "FILE: app/e.py\n\n" + ("E" * 3000)},
+            {"role": "assistant_tool_call", "tool_use_id": "call-6", "tool_name": "read_file", "input": {"path": "app/f.py"}},
+            {"role": "tool_result", "tool_use_id": "call-6", "tool_name": "read_file", "content": "FILE: app/f.py\n\n" + ("F" * 3000)},
+            {"role": "assistant_tool_call", "tool_use_id": "call-7", "tool_name": "read_file", "input": {"path": "app/g.py"}},
+            {"role": "tool_result", "tool_use_id": "call-7", "tool_name": "read_file", "content": "FILE: app/g.py\n\n" + ("G" * 3000)},
         ]
 
         result = pipeline.process_request(
@@ -1401,6 +1449,161 @@ class ContextCompactorTests(unittest.TestCase):
 
         self.assertNotIn("microcompact", result.steps_taken)
         self.assertEqual(result.compaction_result.cleared_old_tool_results, 0)
+        self.assertEqual(
+            result.compaction_history_entry.get("microcompact_reason"),
+            "cooldown",
+        )
+        self.assertEqual(
+            result.compaction_history_entry.get("microcompact_tool_results"),
+            7,
+        )
+
+    def test_context_pipeline_microcompact_reports_below_threshold_reason(self) -> None:
+        from app.context_compactor_pipeline import ContextCompactorPipeline
+
+        pipeline = ContextCompactorPipeline()
+        messages = [{"role": "user", "content": "继续分析"}]
+        for index in range(1, 6):
+            tool_use_id = f"call-{index}"
+            path = f"app/{index}.py"
+            messages.append(
+                {
+                    "role": "assistant_tool_call",
+                    "tool_use_id": tool_use_id,
+                    "tool_name": "read_file",
+                    "input": {"path": path},
+                }
+            )
+            messages.append(
+                {
+                    "role": "tool_result",
+                    "tool_use_id": tool_use_id,
+                    "tool_name": "read_file",
+                    "content": f"FILE: {path}\n\n" + ("X" * 200),
+                }
+            )
+
+        result = pipeline.process_request(
+            messages=messages,
+            max_recent_tool_results=1,
+            truncate_tool_result_chars=10_000,
+            workspace="d:\\MiniCode-ByMyself",
+            usable_budget=1_000_000,
+            fixed_overhead_tokens=0,
+            auto_compact_summary="",
+        )
+
+        self.assertNotIn("microcompact", result.steps_taken)
+        self.assertEqual(
+            result.compaction_history_entry.get("microcompact_reason"),
+            "below_threshold",
+        )
+        self.assertEqual(
+            result.compaction_history_entry.get("microcompact_tool_results"),
+            5,
+        )
+        self.assertEqual(
+            result.compaction_history_entry.get("microcompact_keep_recent"),
+            5,
+        )
+
+    def test_context_pipeline_microcompact_matches_minicode_time_based_policy(self) -> None:
+        from app.context_compactor_pipeline import ContextCompactorPipeline
+
+        pipeline = ContextCompactorPipeline()
+        messages = [{"role": "user", "content": "继续分析最近读取结果"}]
+        for index in range(1, 7):
+            tool_use_id = f"call-{index}"
+            path = f"app/{index}.py"
+            messages.append(
+                {
+                    "role": "assistant_tool_call",
+                    "tool_use_id": tool_use_id,
+                    "tool_name": "read_file",
+                    "input": {"path": path},
+                }
+            )
+            messages.append(
+                {
+                    "role": "tool_result",
+                    "tool_use_id": tool_use_id,
+                    "tool_name": "read_file",
+                    "content": f"FILE: {path}\n\n" + ("X" * 200),
+                }
+            )
+
+        result = pipeline.process_request(
+            messages=messages,
+            max_recent_tool_results=1,
+            truncate_tool_result_chars=10_000,
+            workspace="d:\\MiniCode-ByMyself",
+            usable_budget=1_000_000,
+            fixed_overhead_tokens=0,
+            auto_compact_summary="",
+        )
+
+        self.assertIn("microcompact", result.steps_taken)
+        self.assertGreaterEqual(result.compaction_result.cleared_old_tool_results, 1)
+        self.assertEqual(
+            result.compaction_history_entry.get("microcompact_reason"),
+            "applied",
+        )
+        self.assertEqual(
+            result.compaction_history_entry.get("microcompact_tool_results"),
+            6,
+        )
+
+    def test_prepare_agent_context_promotes_microcompacted_tool_findings_into_working_memory(self) -> None:
+        from app.context_runtime import prepare_agent_context
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tool_registry = _FakeToolRegistry()
+            session = create_new_session(tmpdir)
+            session.extra["usable_context_budget"] = 10_000
+            working_memory = WorkingMemory()
+            working_memory.protect("继续分析上下文压缩链路", entry_type="user_intent")
+
+            full_history = [
+                {"role": "user", "content": "继续分析最近几次读取结果"},
+                {"role": "assistant_tool_call", "tool_use_id": "call-1", "tool_name": "read_file", "input": {"path": "app/a.py"}},
+                {
+                    "role": "tool_result",
+                    "tool_use_id": "call-1",
+                    "tool_name": "read_file",
+                    "content": (
+                        "FILE: app/a.py\n"
+                        "CORE_FACT: 重复扫描的 tool_result 会挤占 recent window\n"
+                        "CORE_FACT_2: microcompact 前要先承接关键工具发现\n"
+                    ),
+                },
+                {"role": "assistant_tool_call", "tool_use_id": "call-2", "tool_name": "read_file", "input": {"path": "app/b.py"}},
+                {"role": "tool_result", "tool_use_id": "call-2", "tool_name": "read_file", "content": "FILE: app/b.py\n\n" + ("B" * 2600)},
+                {"role": "assistant_tool_call", "tool_use_id": "call-3", "tool_name": "read_file", "input": {"path": "app/c.py"}},
+                {"role": "tool_result", "tool_use_id": "call-3", "tool_name": "read_file", "content": "FILE: app/c.py\n\n" + ("C" * 2600)},
+                {"role": "assistant_tool_call", "tool_use_id": "call-4", "tool_name": "read_file", "input": {"path": "app/d.py"}},
+                {"role": "tool_result", "tool_use_id": "call-4", "tool_name": "read_file", "content": "FILE: app/d.py\n\n" + ("D" * 2600)},
+                {"role": "assistant_tool_call", "tool_use_id": "call-5", "tool_name": "read_file", "input": {"path": "app/e.py"}},
+                {"role": "tool_result", "tool_use_id": "call-5", "tool_name": "read_file", "content": "FILE: app/e.py\n\n" + ("E" * 2600)},
+                {"role": "assistant_tool_call", "tool_use_id": "call-6", "tool_name": "read_file", "input": {"path": "app/f.py"}},
+                {"role": "tool_result", "tool_use_id": "call-6", "tool_name": "read_file", "content": "FILE: app/f.py\n\n" + ("F" * 2600)},
+            ]
+
+            prepared = prepare_agent_context(
+                full_history=full_history,
+                session=session,
+                tool_registry=tool_registry,
+                working_memory=working_memory,
+                memory_pipeline=None,
+                history_summarizer=None,
+            )
+
+            self.assertIn("microcompact", prepared.pipeline_steps)
+            self.assertTrue(
+                any(
+                    "重复扫描的 tool_result 会挤占 recent window" in item
+                    for item in prepared.active_context_snapshot.get("tool_findings", [])
+                )
+            )
 
 
 class _FakeModel:
@@ -1410,6 +1613,22 @@ class _FakeModel:
     def next(self, messages, on_stream_chunk=None, store=None):  # type: ignore[no-untyped-def]
         self.calls.append(list(messages))
         return AgentStep(type="assistant", content="ok", kind="final")
+
+
+class _FakeSemanticCompactionSummarizer:
+    def __init__(self, summary_text: str = "", snapshot: dict[str, list[str]] | None = None) -> None:
+        self.summary_text = summary_text
+        self.snapshot = snapshot
+        self.calls: list[dict[str, object]] = []
+
+    def summarize_active_context_compaction(self, **kwargs: object) -> tuple[str, dict[str, list[str]] | None]:
+        self.calls.append(dict(kwargs))
+        return self.summary_text, self.snapshot
+
+
+class _FailingSemanticCompactionSummarizer:
+    def summarize_active_context_compaction(self, **kwargs: object) -> tuple[str, dict[str, list[str]] | None]:
+        raise RuntimeError("semantic compaction unavailable")
 
 
 class _OverflowThenSuccessModel:
@@ -1888,6 +2107,20 @@ class AgentLoopContextPolicyTests(unittest.TestCase):
         self.assertIn("结构化压缩记忆", rendered)
         self.assertIn("关键工具发现", rendered)
 
+    def test_parse_active_context_summary_recovers_stable_facts_into_tool_findings(self) -> None:
+        from app.context_compact_memory import parse_active_context_summary
+
+        snapshot = parse_active_context_summary(
+            "压缩记忆基线\n"
+            "## 稳定事实\n"
+            "1. 复用上一次压缩基线，而不是重新拼 older_history_summary。\n"
+        )
+
+        self.assertIn("tool_findings", snapshot)
+        self.assertTrue(
+            any("复用上一次压缩基线" in item for item in snapshot["tool_findings"])
+        )
+
     def test_build_preview_memory_context_keeps_active_context_summary_before_working_memory(self) -> None:
         from app.context_runtime import _build_preview_memory_context
 
@@ -2166,9 +2399,10 @@ class AgentLoopContextPolicyTests(unittest.TestCase):
         marker = str(result.messages[0]["content"])
         self.assertTrue(result.applied)
         self.assertIn("结构化压缩记忆", marker)
-        self.assertNotIn("## 当前任务", marker)
+        self.assertIn("## 当前任务", marker)
+        self.assertIn("## 未解决问题（最近风险）", marker)
         self.assertIn("## 关键决策", marker)
-        self.assertIn("## 关键工具发现（上次压缩延续）", marker)
+        self.assertNotIn("ROOT: .", marker)
 
     def test_limit_summary_text_can_use_token_budget_for_full_compact(self) -> None:
         from app.context_auto_compact import _limit_summary_text
@@ -2181,7 +2415,7 @@ class AgentLoopContextPolicyTests(unittest.TestCase):
                     f"- 第{index}条结论："
                     "context_auto_compact.py 需要按 token 预算保留结构化摘要，"
                     "避免因为字符硬截断而把最后一条关键决策截半。"
-                    "同时要让 full compact 先保留 decisions，再考虑 tool_findings，"
+                    "同时要让 full compact 先保留 active_tasks 和 open_issues，再考虑 decisions / tool_findings，"
                     "这样在高压上下文里也能把真正影响回答的语义核心保下来。"
                     for index in range(1, 9)
                 ],
@@ -2251,6 +2485,8 @@ class AgentLoopContextPolicyTests(unittest.TestCase):
         marker = str(result.messages[0]["content"])
         self.assertIn("重复扫描的 tool_result", marker)
         self.assertIn("resolved_project_constraints 分离", marker)
+        self.assertNotIn("FILE: tmp/alpha.txt", marker)
+        self.assertNotIn("FILLER_HEADER", marker)
 
     def test_build_active_context_event_snapshot_prefers_semantic_tool_findings(self) -> None:
         from app.context_compact_memory import build_active_context_event_snapshot
@@ -2335,6 +2571,12 @@ class AgentLoopContextPolicyTests(unittest.TestCase):
                 for item in result.summary_snapshot.get("tool_findings", [])
             )
         )
+        self.assertFalse(
+            any(
+                "ROOT:" in item or "offset=" in item.lower() or "limit=" in item.lower()
+                for item in result.summary_snapshot.get("tool_findings", [])
+            )
+        )
         self.assertTrue(
             any(
                 "回写到下一轮基线" in item
@@ -2342,6 +2584,214 @@ class AgentLoopContextPolicyTests(unittest.TestCase):
             )
         )
         self.assertTrue(result.summary_text.strip())
+
+    def test_run_auto_compact_full_summary_drops_stale_tool_findings_from_base_snapshot(self) -> None:
+        from app.context_auto_compact import run_auto_compact
+
+        messages = [
+            {"role": "user", "content": "当前任务：修复 main.js 里的挂载错误，并解释为什么压缩后会偏题。" * 8},
+            {"role": "assistant", "content": "结论：full compact 必须先保住当前任务，再保留旧结论。" * 8},
+        ]
+
+        result = run_auto_compact(
+            messages=messages,
+            usable_budget=320,
+            summary_base="结构化压缩记忆\n## 关键工具发现（上次压缩延续）\n- 旧主题：编辑功能要用 editingIndex\n- 旧主题：从 CDN 切到包引入时要保留 index.html\n",
+            summary_snapshot={
+                "tool_findings": [
+                    "旧主题：编辑功能要用 editingIndex",
+                    "旧主题：从 CDN 切到包引入时要保留 index.html",
+                ],
+                "decisions": ["旧决策：保留历史工具发现"],
+            },
+            fixed_overhead_tokens=0,
+            force_full=True,
+        )
+
+        self.assertIsNotNone(result.summary_snapshot)
+        assert result.summary_snapshot is not None
+        self.assertNotIn("tool_findings", result.summary_snapshot)
+        self.assertIn("active_tasks", result.summary_snapshot)
+        self.assertTrue(
+            any("修复 main.js" in item for item in result.summary_snapshot.get("active_tasks", []))
+        )
+
+    def test_run_auto_compact_full_summary_pins_current_focus_goal_and_risk(self) -> None:
+        from app.context_auto_compact import run_auto_compact
+
+        messages = [
+            {"role": "user", "content": "旧主题：整理 vue 项目脚手架下载失败的历史排查记录。 " * 8},
+            {"role": "assistant", "content": "旧结论：run_command 卡住和依赖下载有关。 " * 8},
+            {"role": "user", "content": "当前主问题：分析 79b776e5f34e 为什么 full compact 后会偏题。 " * 10},
+            {"role": "assistant", "content": "当前目标：把三层压缩触发逻辑对齐 MiniCode，并提升摘要保真。 " * 8},
+            {"role": "assistant", "content": "当前风险：full compact 可能把旧 tool 噪音带进新主题，导致主线漂移。 " * 8},
+            {"role": "user", "content": "继续，压缩后也要明确保住当前主问题、当前目标、当前风险。 " * 8},
+        ]
+
+        result = run_auto_compact(
+            messages=messages,
+            usable_budget=320,
+            summary_base=(
+                "结构化压缩记忆\n"
+                "## 关键工具发现（上次压缩延续）\n"
+                "- 旧主题：run_command 卡住和 npm 下载有关\n"
+            ),
+            fixed_overhead_tokens=0,
+            force_full=True,
+        )
+
+        self.assertIsNotNone(result.summary_snapshot)
+        assert result.summary_snapshot is not None
+        self.assertIn("active_tasks", result.summary_snapshot)
+        self.assertIn("open_issues", result.summary_snapshot)
+        self.assertIn("decisions", result.summary_snapshot)
+        self.assertTrue(
+            any("79b776e5f34e" in item for item in result.summary_snapshot.get("active_tasks", []))
+        )
+        self.assertTrue(
+            any("主线漂移" in item or "偏题" in item for item in result.summary_snapshot.get("open_issues", []))
+        )
+        self.assertTrue(
+            any("对齐 MiniCode" in item for item in result.summary_snapshot.get("decisions", []))
+        )
+        self.assertFalse(
+            any("run_command 卡住和 npm 下载有关" in item for item in result.summary_snapshot.get("tool_findings", []))
+        )
+        self.assertIn("当前主问题", result.summary_text)
+        self.assertIn("当前目标", result.summary_text)
+        self.assertIn("当前风险", result.summary_text)
+
+    def test_run_auto_compact_full_summary_prioritizes_tool_findings_aligned_with_current_focus(self) -> None:
+        from app.context_auto_compact import run_auto_compact
+
+        messages = [
+            {"role": "user", "content": "旧主题：整理 Vue 记事本 editingIndex 的历史实现细节。 " * 8},
+            {
+                "role": "tool_result",
+                "tool_name": "read_file",
+                "content": (
+                    "FILE: tmp/vue-note.txt\n"
+                    "OLD_FACT: Vue 记事本 editingIndex 决策 风险 working memory 需要继续验证\n"
+                ),
+            },
+            {"role": "assistant", "content": "旧结论：editingIndex 方案暂时可行。 " * 8},
+            {"role": "user", "content": "当前主问题：压缩后为什么会偏题，并且怎样保住核心语义。 " * 10},
+            {
+                "role": "tool_result",
+                "tool_name": "read_file",
+                "content": (
+                    "FILE: tmp/context.txt\n"
+                    "CURRENT_FACT: full compact 应优先保住当前主问题、当前目标和核心语义\n"
+                ),
+            },
+            {"role": "assistant", "content": "当前目标：让 full compact 的摘要先跟当前主题对齐。 " * 8},
+            {"role": "user", "content": "继续，压缩结果里不要再被旧主题带偏。 " * 8},
+        ]
+
+        result = run_auto_compact(
+            messages=messages,
+            usable_budget=320,
+            summary_base="结构化压缩记忆",
+            fixed_overhead_tokens=0,
+            force_full=True,
+        )
+
+        self.assertTrue(result.summary_text.strip())
+        self.assertIn("当前主问题", result.summary_text)
+        self.assertIn("核心语义", result.summary_text)
+        self.assertNotIn("editingIndex", result.summary_text)
+
+    def test_run_auto_compact_full_summary_prefers_semantic_model_summary_when_available(self) -> None:
+        from app.context_auto_compact import run_auto_compact
+
+        summarizer = _FakeSemanticCompactionSummarizer(
+            summary_text=(
+                "结构化压缩记忆\n"
+                "## 当前任务\n"
+                "- 当前主问题：压缩后为什么会偏题。\n"
+                "## 关键决策\n"
+                "- 当前目标：让 full compact 优先保住核心语义。\n"
+            ),
+            snapshot={
+                "active_tasks": ["当前主问题：压缩后为什么会偏题。"],
+                "decisions": ["当前目标：让 full compact 优先保住核心语义。"],
+            },
+        )
+
+        result = run_auto_compact(
+            messages=[
+                {"role": "user", "content": "当前主问题：压缩后为什么会偏题。 " * 10},
+                {"role": "assistant", "content": "当前目标：让 full compact 优先保住核心语义。 " * 8},
+                {"role": "user", "content": "继续，不要让旧主题把这次摘要带偏。 " * 8},
+            ],
+            usable_budget=220,
+            summary_base="结构化压缩记忆",
+            fixed_overhead_tokens=0,
+            force_full=True,
+            semantic_summarizer=summarizer,
+        )
+
+        self.assertTrue(summarizer.calls)
+        self.assertIn("当前任务", result.summary_text)
+        self.assertIn("核心语义", result.summary_text)
+        self.assertIsNotNone(result.summary_snapshot)
+        assert result.summary_snapshot is not None
+        self.assertTrue(
+            any("压缩后为什么会偏题" in item for item in result.summary_snapshot.get("active_tasks", []))
+        )
+
+    def test_run_auto_compact_full_summary_falls_back_to_rule_summary_when_semantic_model_fails(self) -> None:
+        from app.context_auto_compact import run_auto_compact
+
+        result = run_auto_compact(
+            messages=[
+                {"role": "user", "content": "当前主问题：分析 full compact 为什么会偏题。 " * 10},
+                {"role": "assistant", "content": "当前目标：先保住当前主问题，再保留工具发现。 " * 8},
+                {"role": "user", "content": "继续，摘要里不要丢核心语义。 " * 8},
+            ],
+            usable_budget=220,
+            summary_base="结构化压缩记忆",
+            fixed_overhead_tokens=0,
+            force_full=True,
+            semantic_summarizer=_FailingSemanticCompactionSummarizer(),
+        )
+
+        self.assertTrue(result.summary_text.strip())
+        self.assertIn("当前任务", result.summary_text)
+        self.assertIsNotNone(result.summary_snapshot)
+        assert result.summary_snapshot is not None
+        self.assertTrue(
+            any("分析 full compact 为什么会偏题" in item for item in result.summary_snapshot.get("active_tasks", []))
+        )
+
+    def test_context_pipeline_passes_semantic_summarizer_into_auto_compact(self) -> None:
+        from app.context_compactor_pipeline import ContextCompactorPipeline
+
+        pipeline = ContextCompactorPipeline()
+        summarizer = _FakeSemanticCompactionSummarizer(
+            summary_text="结构化压缩记忆\n## 当前任务\n- 当前任务：继续压缩。\n",
+            snapshot={"active_tasks": ["当前任务：继续压缩。"]},
+        )
+
+        result = pipeline.process_request(
+            messages=[
+                {"role": "user", "content": "当前任务：继续压缩。 " * 12},
+                {"role": "assistant", "content": "需要把更早历史折进摘要。 " * 10},
+                {"role": "user", "content": "保持最近窗口，压掉更早消息。 " * 10},
+            ],
+            summary_source_messages=None,
+            max_recent_tool_results=1,
+            truncate_tool_result_chars=4000,
+            workspace="d:\\MiniCode-ByMyself",
+            usable_budget=220,
+            fixed_overhead_tokens=0,
+            auto_compact_summary="结构化压缩记忆",
+            force_auto_compact=True,
+            semantic_summarizer=summarizer,
+        )
+
+        self.assertTrue(summarizer.calls)
+        self.assertTrue(result.auto_compact_result.summary_text.strip())
 
     def test_run_auto_compact_strips_previous_internal_markers(self) -> None:
         from app.context_auto_compact import run_auto_compact
@@ -2375,7 +2825,7 @@ class AgentLoopContextPolicyTests(unittest.TestCase):
             )
         )
 
-    def test_should_trigger_auto_compact_can_fire_early_for_tool_result_pressure(self) -> None:
+    def test_should_trigger_auto_compact_matches_minicode_high_water_logic(self) -> None:
         from app.context_auto_compact import should_trigger_auto_compact
 
         triggered = should_trigger_auto_compact(
@@ -2385,7 +2835,7 @@ class AgentLoopContextPolicyTests(unittest.TestCase):
             repeated_scan_count=3,
         )
 
-        self.assertTrue(triggered)
+        self.assertFalse(triggered)
 
     def test_normalize_tool_call_pairs_drops_orphan_tool_messages(self) -> None:
         from app.context_message_safety import normalize_tool_call_pairs
@@ -2584,7 +3034,7 @@ class AgentLoopContextPolicyTests(unittest.TestCase):
                 "app.context_runtime.ContextCompactorPipeline.process_request",
                 return_value=mocked_pipeline_result,
             ):
-                prepare_agent_context(
+                prepared = prepare_agent_context(
                     full_history=full_history,
                     session=session,
                     tool_registry=tool_registry,
@@ -2600,6 +3050,10 @@ class AgentLoopContextPolicyTests(unittest.TestCase):
             self.assertTrue(state.compaction_history)
             self.assertEqual(
                 state.compaction_history[-1].get("microcompact_applied"),
+                True,
+            )
+            self.assertEqual(
+                prepared.compaction_history_entry.get("microcompact_applied"),
                 True,
             )
 

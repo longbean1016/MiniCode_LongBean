@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import time
 from dataclasses import dataclass
 
@@ -10,11 +11,13 @@ from app.context_compact_memory import (
     build_active_context_event_snapshot,
     merge_active_context_snapshots,
     parse_active_context_summary,
+    prioritize_snapshot_for_current_focus,
     render_active_context_summary,
     render_full_active_context_summary,
 )
 from app.context_message_safety import is_internal_compaction_marker
 from app.context_manager import estimate_messages_tokens, estimate_tokens
+from app.history_summarizer import OlderHistorySummarizer
 from app.types import ChatMessage
 
 AUTO_COMPACT_TRIGGER_RATIO = 0.92
@@ -127,6 +130,7 @@ class AutoCompactDispatcher:
         summary_source_messages: list[ChatMessage] | None = None,
         fixed_overhead_tokens: int = 0,
         force_full: bool = False,
+        semantic_summarizer: OlderHistorySummarizer | None = None,
     ) -> AutoCompactResult:
         # 在调度器入口统一计算 token 压力与扫描噪声。
         # 这样旧入口和新入口最终都会走同一套触发条件。
@@ -167,6 +171,7 @@ class AutoCompactDispatcher:
                 summary_base=summary_base,
                 summary_snapshot=summary_snapshot,
                 fixed_overhead_tokens=fixed_overhead_tokens,
+                semantic_summarizer=semantic_summarizer,
             )
             if session_result.applied:
                 self._mark_success()
@@ -181,6 +186,7 @@ class AutoCompactDispatcher:
             summary_snapshot=summary_snapshot,
             summary_source_messages=summary_source_messages,
             fixed_overhead_tokens=fixed_overhead_tokens,
+            semantic_summarizer=semantic_summarizer,
         )
         if result.applied:
             self._mark_success()
@@ -206,19 +212,12 @@ def should_trigger_auto_compact(
     tool_result_tokens: int = 0,
     repeated_scan_count: int = 0,
 ) -> bool:
-    """达到高水位时触发自动压缩。"""
+    """Trigger auto compact only on overall context high-water pressure."""
+    _ = tool_result_tokens
+    _ = repeated_scan_count
     if usable_budget <= 0:
         return False
-    # 触发条件拆成三类：
-    # 1. 总 token 接近上限
-    # 2. tool_result 单独占比过高
-    # 3. 扫描型工具重复太多
-    # 这样可以覆盖“总量没爆，但噪声结构已经开始劣化推理质量”的情况。
-    if total_tokens >= int(usable_budget * AUTO_COMPACT_TRIGGER_RATIO):
-        return True
-    if tool_result_tokens >= int(usable_budget * AUTO_COMPACT_TOOL_RESULT_TRIGGER_RATIO):
-        return True
-    return repeated_scan_count >= AUTO_COMPACT_REPEATED_SCAN_TRIGGER_COUNT
+    return total_tokens >= int(usable_budget * AUTO_COMPACT_TRIGGER_RATIO)
 
 
 def run_auto_compact(
@@ -230,6 +229,7 @@ def run_auto_compact(
     summary_source_messages: list[ChatMessage] | None = None,
     fixed_overhead_tokens: int = 0,
     force_full: bool = False,
+    semantic_summarizer: OlderHistorySummarizer | None = None,
 ) -> AutoCompactResult:
     """
     运行类似 minicode 的 Auto Compact 调度。
@@ -246,6 +246,7 @@ def run_auto_compact(
         summary_source_messages=summary_source_messages,
         fixed_overhead_tokens=fixed_overhead_tokens,
         force_full=force_full,
+        semantic_summarizer=semantic_summarizer,
     )
 
 
@@ -256,6 +257,7 @@ def _run_session_memory_compact(
     summary_base: str,
     summary_snapshot: CompactMemorySnapshot | None,
     fixed_overhead_tokens: int,
+    semantic_summarizer: OlderHistorySummarizer | None = None,
 ) -> AutoCompactResult:
     """优先用已有摘要和工作记忆做一次轻量压缩。"""
     # session compact 优先复用已有结构化摘要，不重新发明摘要语义。
@@ -301,6 +303,23 @@ def _run_session_memory_compact(
             tokens_after=fixed_overhead_tokens + estimate_messages_tokens(messages),
         )
 
+    removed_messages = other_messages[:removed_count]
+    if semantic_summarizer is not None:
+        # session compact 优先让模型把“被折进去的较早对话”整理成结构化摘要，
+        # 但模型失败时仍然直接退回当前这份规则基线，不影响压缩主流程。
+        normalized_summary, normalized_snapshot = semantic_summarizer.summarize_active_context_compaction(
+            strategy="session",
+            removed_messages=removed_messages,
+            fallback_summary=normalized_summary,
+            fallback_snapshot=baseline_snapshot,
+            focus_lines=[],
+        )
+        normalized_summary = _limit_summary_text(
+            normalized_summary,
+            AUTO_COMPACT_SESSION_SUMMARY_MAX_CHARS,
+        )
+        baseline_snapshot = normalized_snapshot or baseline_snapshot
+
     compacted, summary_text, tokens_after = _fit_compacted_messages(
         system_messages=system_messages,
         tail_messages=tail_messages,
@@ -335,6 +354,7 @@ def _run_full_compact(
     summary_snapshot: CompactMemorySnapshot | None,
     summary_source_messages: list[ChatMessage] | None,
     fixed_overhead_tokens: int,
+    semantic_summarizer: OlderHistorySummarizer | None = None,
 ) -> AutoCompactResult:
     """当轻量摘要压不下去时，退化到更强的全量压缩。"""
     system_messages, other_messages = _split_system_messages(messages)
@@ -364,10 +384,16 @@ def _run_full_compact(
     _, summary_other_messages = _split_system_messages(summary_source_messages or messages)
     if len(summary_other_messages) >= removed_count:
         removed_messages = summary_other_messages[:removed_count]
+        if removed_count > 0:
+            trailing_source = summary_other_messages[-removed_count:]
+            if trailing_source != removed_messages:
+                removed_messages = [*removed_messages, *trailing_source]
     merged_snapshot, rendered_summary = _build_structured_summary_package(
         removed_messages=removed_messages,
+        focus_source_messages=summary_other_messages or other_messages,
         summary_base=summary_base,
         summary_snapshot=summary_snapshot,
+        semantic_summarizer=semantic_summarizer,
     )
     summary_text = _limit_summary_text(
         rendered_summary,
@@ -643,8 +669,10 @@ def _build_structured_summary(
 def _build_structured_summary_package(
     *,
     removed_messages: list[ChatMessage],
+    focus_source_messages: list[ChatMessage] | None,
     summary_base: str,
     summary_snapshot: CompactMemorySnapshot | None,
+    semantic_summarizer: OlderHistorySummarizer | None = None,
 ) -> tuple[CompactMemorySnapshot, str]:
     """同时返回 full compact 的结构化快照和渲染文本。"""
     # full compact 的关键不是生成一段漂亮 prose，
@@ -663,7 +691,60 @@ def _build_structured_summary_package(
         base_snapshot=base_snapshot,
         overlay_snapshot=event_snapshot,
     )
+    focus_snapshot = _extract_full_compact_focus_snapshot(
+        focus_source_messages or removed_messages
+    )
+    if focus_snapshot:
+        # 明确识别到“当前主问题 / 当前目标 / 当前风险”时，
+        # 要把这些锚点顶到 full compact 摘要前面，避免旧主题继续主导后续推理。
+        merged_snapshot = merge_active_context_snapshots(
+            base_snapshot=merged_snapshot,
+            overlay_snapshot=focus_snapshot,
+        )
+        for section_key in ("active_tasks", "decisions", "open_issues"):
+            pinned_lines = list(focus_snapshot.get(section_key, []))
+            if pinned_lines:
+                merged_snapshot[section_key] = pinned_lines[:1]
+    # full compact 里最容易出的问题不是“没有工具结论”，而是“旧主题工具结论把当前主线带偏”。
+    # 这里先保留 base + event 的合并结果；只有当我们明确识别到当前主问题/目标/风险时，
+    # 才进一步按当前焦点去过滤不对齐的旧 tool_findings。
+    focus_lines = [
+        *focus_snapshot.get("active_tasks", []),
+        *focus_snapshot.get("decisions", []),
+        *focus_snapshot.get("open_issues", []),
+    ]
+    if focus_lines:
+        # 只有 full compact 且存在明确焦点时，才对 tool_findings 做对齐过滤。
+        # 普通 snapshot / cached state 恢复不做这一步，避免把有价值的旧承接误删。
+        merged_snapshot = prioritize_snapshot_for_current_focus(
+            merged_snapshot,
+            focus_lines=focus_lines,
+            drop_unaligned_tool_findings=True,
+        )
+        # 如果当前已经明确切到新主题，而这次被折叠的历史里没有新的工具结论支撑，
+        # 那么保留旧主题 tool_findings 只会继续把后续回答带偏，这里直接清掉。
+        if not event_snapshot.get("tool_findings") and "tool_findings" in merged_snapshot:
+            merged_snapshot.pop("tool_findings", None)
+    elif _has_current_focus_signal(focus_source_messages or removed_messages):
+        # 有“当前任务/当前主问题”等信号，但没抽到标准 focus_snapshot 时，
+        # 也说明用户主线已经切换。此时若没有新的事件型工具结论支撑，
+        # 继续保留旧主题 tool_findings 同样会把摘要带偏。
+        if not event_snapshot.get("tool_findings") and "tool_findings" in merged_snapshot:
+            merged_snapshot.pop("tool_findings", None)
     rendered = render_full_active_context_summary(merged_snapshot).strip()
+    if semantic_summarizer is not None:
+        # full compact 更容易因为历史跨度太大而丢掉主线，
+        # 所以这里先尝试模型补一份结构化摘要，再和规则结果做融合。
+        try:
+            rendered, merged_snapshot = semantic_summarizer.summarize_active_context_compaction(
+                strategy="full",
+                removed_messages=removed_messages,
+                fallback_summary=rendered,
+                fallback_snapshot=merged_snapshot,
+                focus_lines=focus_lines,
+            )
+        except Exception:
+            pass
     if rendered:
         return merged_snapshot, rendered
     normalized_base = summary_base.strip()
@@ -735,6 +816,84 @@ def _truncate_text_to_token_budget(text: str, max_tokens: int, suffix: str) -> s
             continue
         high = middle - 1
     return best
+
+
+def _extract_full_compact_focus_snapshot(
+    messages: list[ChatMessage],
+) -> CompactMemorySnapshot:
+    # full compact 最怕“旧主题还很多，新主题刚刚出现”，
+    # 这时如果只按全局频率抽摘要，旧主题很容易把当前主线盖过去。
+    # 这里专门从最近 user / assistant 文本里抓“当前主问题 / 当前目标 / 当前风险”。
+    captured: dict[str, str] = {}
+    markers = ("当前主问题", "当前目标", "当前风险")
+
+    for message in reversed(messages):
+        role = str(message.get("role", "")).strip()
+        if role not in {"user", "assistant"}:
+            continue
+        content = " ".join(str(message.get("content", "")).split())
+        if not content:
+            continue
+        for marker in markers:
+            if marker in captured:
+                continue
+            candidate = _extract_focus_marker_clause(content, marker, markers)
+            if candidate:
+                captured[marker] = candidate
+        if len(captured) == len(markers):
+            break
+
+    snapshot: CompactMemorySnapshot = {}
+    if "当前主问题" in captured:
+        snapshot["active_tasks"] = [captured["当前主问题"]]
+    if "当前目标" in captured:
+        snapshot["decisions"] = [captured["当前目标"]]
+    if "当前风险" in captured:
+        snapshot["open_issues"] = [captured["当前风险"]]
+    return snapshot
+
+
+def _has_current_focus_signal(messages: list[ChatMessage]) -> bool:
+    """兜底识别“当前任务/当前主问题”等字样，辅助 full compact 清理旧主题工具发现。"""
+    markers = ("当前任务", "当前主问题", "当前目标", "当前风险")
+    for message in reversed(messages):
+        role = str(message.get("role", "")).strip()
+        if role not in {"user", "assistant"}:
+            continue
+        content = " ".join(str(message.get("content", "")).split())
+        if any(marker in content for marker in markers):
+            return True
+    return False
+
+
+def _extract_focus_marker_clause(
+    content: str,
+    marker: str,
+    markers: tuple[str, ...],
+) -> str:
+    # 优先提取“标题: 内容”这种明确声明，拿不到再退回到 marker 起始后的截断片段。
+    # 这样既能保住结构化表达，也能兼容用户自然语言里混着写“当前主问题”的情况。
+    pattern = re.compile(
+        rf"({re.escape(marker)}\s*[：:]\s*.*?(?:[。！？!?]|$))"
+    )
+    match = pattern.search(content)
+    if match:
+        candidate = match.group(1).strip(" -")
+    else:
+        start = content.find(marker)
+        if start < 0:
+            return ""
+        candidate = content[start:].strip(" -")
+        candidate = candidate[:120]
+
+    if not candidate:
+        return ""
+
+    if any(other != marker and other in candidate for other in markers):
+        return ""
+    # 同一句里混进多个 marker 时，通常说明截取边界已经串段，
+    # 直接丢掉比带着混杂语义进入 full compact 更安全。
+    return _limit_summary_text(candidate, 120)
 
 
 def _estimate_tool_result_tokens(messages: list[ChatMessage]) -> int:

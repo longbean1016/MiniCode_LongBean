@@ -22,11 +22,11 @@ from app.context_compactor import (
 )
 from app.context_manager import estimate_messages_tokens
 from app.context_message_safety import normalize_tool_call_pairs
+from app.history_summarizer import OlderHistorySummarizer
 from app.types import ChatMessage
 
-_MICROCOMPACT_MIN_EXCESS_TOOL_RESULTS = 2
-_MICROCOMPACT_MIN_TOOL_RESULT_RATIO = 0.12
-_MICROCOMPACT_INTERVAL_SECONDS = 45 * 60
+_MICROCOMPACT_KEEP_RECENT_TOOL_RESULTS = 5
+_MICROCOMPACT_INTERVAL_SECONDS = 60 * 60
 
 
 @dataclass(slots=True)
@@ -86,6 +86,13 @@ class MicrocompactResult:
     cleared_count: int = 0
     tokens_freed_estimate: int = 0
     last_compact_at: float = 0.0
+    carried_tool_findings: list[str] = field(default_factory=list)
+    carried_open_issues: list[str] = field(default_factory=list)
+    # 记录 microcompact 决策细节，便于日志和 context_state 直接定位原因。
+    reason: str = "not_evaluated"
+    tool_result_count: int = 0
+    keep_recent_tool_results: int = 0
+    cooldown_remaining_seconds: float = 0.0
 
 
 class LightweightContextPhase:
@@ -143,10 +150,19 @@ class MicrocompactEngine:
         usable_budget: int,
     ) -> MicrocompactResult:
         now = time.time()
-        if not self._should_apply(messages=messages, usable_budget=usable_budget, now=now):
+        decision = self._evaluate(
+            messages=messages,
+            usable_budget=usable_budget,
+            now=now,
+        )
+        if not bool(decision["should_apply"]):
             return MicrocompactResult(
                 messages=list(messages),
                 last_compact_at=self._state.last_time_based_compact,
+                reason=str(decision["reason"]),
+                tool_result_count=int(decision["tool_result_count"]),
+                keep_recent_tool_results=int(decision["keep_recent_tool_results"]),
+                cooldown_remaining_seconds=float(decision["cooldown_remaining_seconds"]),
             )
 
         compaction_result = microcompact_old_tool_results(
@@ -158,6 +174,11 @@ class MicrocompactEngine:
             return MicrocompactResult(
                 messages=list(compaction_result.messages),
                 last_compact_at=self._state.last_time_based_compact,
+                carried_tool_findings=list(compaction_result.carried_tool_findings),
+                carried_open_issues=list(compaction_result.carried_open_issues),
+                reason="no_old_tool_results",
+                tool_result_count=int(decision["tool_result_count"]),
+                keep_recent_tool_results=int(decision["keep_recent_tool_results"]),
             )
 
         self._state.last_time_based_compact = now
@@ -168,6 +189,11 @@ class MicrocompactEngine:
             cleared_count=compaction_result.cleared_old_tool_results,
             tokens_freed_estimate=compaction_result.tokens_freed_estimate,
             last_compact_at=now,
+            carried_tool_findings=list(compaction_result.carried_tool_findings),
+            carried_open_issues=list(compaction_result.carried_open_issues),
+            reason="applied",
+            tool_result_count=int(decision["tool_result_count"]),
+            keep_recent_tool_results=int(decision["keep_recent_tool_results"]),
         )
 
     def _should_apply(
@@ -177,7 +203,9 @@ class MicrocompactEngine:
         usable_budget: int,
         now: float,
     ) -> bool:
-        # 先做时间节流，避免旧结果在连续多轮推理里被重复重写。
+        # 先做时间节流。
+        # 这里按 MiniCode 新版的思路：microcompact 不是“只要 tool_result 多就每轮都压”，
+        # 而是压过一次后先冷却 1 小时，避免连续多轮把同一批旧工具结果反复清空。
         if (
             self._state.last_time_based_compact > 0
             and (now - self._state.last_time_based_compact) < self._state.time_based_interval
@@ -187,16 +215,58 @@ class MicrocompactEngine:
         tool_results = [
             message for message in messages if message.get("role") == "tool_result"
         ]
-        excess_results = len(tool_results) - max(0, self._state.keep_recent_tool_results)
-        if excess_results < _MICROCOMPACT_MIN_EXCESS_TOOL_RESULTS:
-            return False
+        # 只要旧 tool_result 数量超过“保留最近 N 条”的阈值，就允许做一次轻量清理。
+        # 这里不看总 token 高水位；microcompact 的职责只是提前削掉旧工具正文噪音。
+        return len(tool_results) > max(0, self._state.keep_recent_tool_results)
 
-        # 没有预算信息时，退化为“数量足够多就清理”。
-        if usable_budget <= 0:
-            return True
 
-        tool_result_tokens = estimate_messages_tokens(tool_results)
-        return tool_result_tokens >= int(usable_budget * _MICROCOMPACT_MIN_TOOL_RESULT_RATIO)
+    def _evaluate(
+        self,
+        *,
+        messages: list[ChatMessage],
+        usable_budget: int,
+        now: float,
+    ) -> dict[str, float | int | str | bool]:
+        tool_results = [
+            message for message in messages if message.get("role") == "tool_result"
+        ]
+        tool_result_count = len(tool_results)
+        keep_recent = max(0, self._state.keep_recent_tool_results)
+
+        # 先做时间节流。microcompact 一旦刚执行过，就冷却 1 小时，避免连续多轮重复清理同一批旧结果。
+        if (
+            self._state.last_time_based_compact > 0
+            and (now - self._state.last_time_based_compact) < self._state.time_based_interval
+        ):
+            return {
+                "should_apply": False,
+                "reason": "cooldown",
+                "tool_result_count": tool_result_count,
+                "keep_recent_tool_results": keep_recent,
+                "cooldown_remaining_seconds": max(
+                    0.0,
+                    self._state.time_based_interval
+                    - (now - self._state.last_time_based_compact),
+                ),
+            }
+
+        # 只有旧 tool_result 数量超过“保留最近 N 条”的阈值时，才允许做 microcompact。
+        if tool_result_count <= keep_recent:
+            return {
+                "should_apply": False,
+                "reason": "below_threshold",
+                "tool_result_count": tool_result_count,
+                "keep_recent_tool_results": keep_recent,
+                "cooldown_remaining_seconds": 0.0,
+            }
+
+        return {
+            "should_apply": True,
+            "reason": "ready",
+            "tool_result_count": tool_result_count,
+            "keep_recent_tool_results": keep_recent,
+            "cooldown_remaining_seconds": 0.0,
+        }
 
 
 class ContextCompactor:
@@ -231,6 +301,7 @@ class ContextCompactor:
         microcompact_state: MicrocompactState,
         auto_compact_failure_count: int = 0,
         auto_compact_suppressed_until: float = 0.0,
+        semantic_summarizer: OlderHistorySummarizer | None = None,
     ) -> ContextPipelineResult:
         auto_compact = AutoCompactDispatcher(
             config=AutoCompactDispatcherConfig(),
@@ -257,6 +328,8 @@ class ContextCompactor:
                 messages=list(microcompact_result.messages),
                 cleared_old_tool_results=microcompact_result.cleared_count,
                 tokens_freed_estimate=microcompact_result.tokens_freed_estimate,
+                carried_tool_findings=list(microcompact_result.carried_tool_findings),
+                carried_open_issues=list(microcompact_result.carried_open_issues),
             )
             _merge_compaction_result(base=compaction_result, overlay=overlay)
             steps_taken.append("microcompact")
@@ -270,6 +343,7 @@ class ContextCompactor:
             summary_source_messages=summary_source_messages or messages,
             fixed_overhead_tokens=fixed_overhead_tokens,
             force_full=force_auto_compact,
+            semantic_summarizer=semantic_summarizer,
         )
         if auto_compact_result.applied:
             steps_taken.append(f"auto_compact:{auto_compact_result.strategy}")
@@ -299,6 +373,12 @@ class ContextCompactor:
                 + auto_compact_result.tokens_freed_estimate
             ),
             "microcompact_applied": microcompact_result.applied,
+            "microcompact_reason": microcompact_result.reason,
+            "microcompact_tool_results": microcompact_result.tool_result_count,
+            "microcompact_keep_recent": microcompact_result.keep_recent_tool_results,
+            "microcompact_cooldown_remaining_seconds": (
+                microcompact_result.cooldown_remaining_seconds
+            ),
             "last_microcompact_at": microcompact_result.last_compact_at,
             "auto_compact_applied": auto_compact_result.applied,
             "auto_compact_strategy": auto_compact_result.strategy,
@@ -348,6 +428,7 @@ class ContextCompactorPipeline:
         last_microcompact_at: float = 0.0,
         auto_compact_failure_count: int = 0,
         auto_compact_suppressed_until: float = 0.0,
+        semantic_summarizer: OlderHistorySummarizer | None = None,
     ) -> ContextPipelineResult:
         return self._compactor.process_request(
             messages=messages,
@@ -365,10 +446,11 @@ class ContextCompactorPipeline:
             pinned_tool_names=pinned_tool_names,
             microcompact_state=MicrocompactState(
                 last_time_based_compact=max(0.0, float(last_microcompact_at or 0.0)),
-                keep_recent_tool_results=max(0, max_recent_tool_results),
+                keep_recent_tool_results=_MICROCOMPACT_KEEP_RECENT_TOOL_RESULTS,
             ),
             auto_compact_failure_count=auto_compact_failure_count,
             auto_compact_suppressed_until=auto_compact_suppressed_until,
+            semantic_summarizer=semantic_summarizer,
         )
 
 
@@ -410,3 +492,5 @@ def _merge_compaction_result(*, base: CompactionResult, overlay: CompactionResul
     base.dropped_progress_messages += overlay.dropped_progress_messages
     base.priority_dropped_messages += overlay.priority_dropped_messages
     base.tokens_freed_estimate += overlay.tokens_freed_estimate
+    base.carried_tool_findings.extend(overlay.carried_tool_findings)
+    base.carried_open_issues.extend(overlay.carried_open_issues)

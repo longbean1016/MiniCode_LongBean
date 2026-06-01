@@ -8,6 +8,7 @@ from app.compaction_policy import build_compaction_policy
 from app.context_compact_memory import (
     CompactMemorySnapshot,
     build_active_context_snapshot,
+    merge_active_context_snapshots,
     render_active_context_summary,
 )
 from app.context_auto_compact import AUTO_COMPACT_TRIGGER_RATIO
@@ -85,6 +86,7 @@ class PreparedAgentContext:
     recent_risks: list[str]
     history_window: HistoryWindow
     compaction_result: CompactionResult
+    compaction_history_entry: dict[str, object]
     pipeline_steps: list[str]
     memory_context: str
     user_profile_context: str
@@ -215,6 +217,7 @@ def prepare_agent_context(
         user_profile_context=user_profile_context,
         # 把缓存状态直接传给压缩流水线，让 microcompact 节流能接上旧轮次。
         cached_state=cached_state,
+        history_summarizer=history_summarizer,
         analysis_mode=analysis_mode,
     )
     active_context_snapshot = (
@@ -252,6 +255,7 @@ def prepare_agent_context(
             # 第二次强制 auto compact 时也继续复用同一个缓存状态，
             # 避免第一次处理刚写下的 microcompact 节流信息丢失。
             cached_state=cached_state,
+            history_summarizer=history_summarizer,
             analysis_mode=analysis_mode,
         )
         active_context_snapshot = (
@@ -297,6 +301,7 @@ def prepare_agent_context(
         recent_risks=recent_risks,
         history_window=history_window,
         compaction_result=pipeline_result.compaction_result,
+        compaction_history_entry=dict(pipeline_result.compaction_history_entry),
         pipeline_steps=list(pipeline_result.steps_taken),
         memory_context=memory_context,
         user_profile_context=user_profile_context,
@@ -568,6 +573,31 @@ def _save_active_context_state(
     save_context_state(session.workspace, state)
 
 
+def _promote_microcompact_carryovers(
+    *,
+    working_memory: WorkingMemory,
+    compaction_result: CompactionResult,
+) -> None:
+    """在 microcompact 清理旧 tool_result 之后，把承接出的关键信息回写到 working memory。"""
+    for finding in compaction_result.carried_tool_findings:
+        if str(finding).strip():
+            # 旧 tool_result 正文会被清掉，但关键工具结论不能跟着丢。
+            # 这里先回写到 working memory，后面再重新合并进 active context 摘要。
+            working_memory.protect(
+                str(finding),
+                entry_type="tool_finding",
+                importance=1.2,
+            )
+    for issue in compaction_result.carried_open_issues:
+        if str(issue).strip():
+            # open issue / recent risk 也要同步承接，否则 microcompact 后风险链路会断。
+            working_memory.protect(
+                str(issue),
+                entry_type="recent_risk",
+                importance=1.1,
+            )
+
+
 def _build_compacted_request(
     *,
     pipeline: ContextCompactorPipeline,
@@ -585,6 +615,7 @@ def _build_compacted_request(
     base_system_prompt: str,
     user_profile_context: str,
     cached_state: ContextStateData | None,
+    history_summarizer: OlderHistorySummarizer | None,
     force_auto_compact: bool = False,
     analysis_mode: bool = False,
 ) -> tuple[ContextPipelineResult, str, ContextStats, list[ChatMessage]]:
@@ -612,6 +643,37 @@ def _build_compacted_request(
         auto_compact_suppressed_until=(
             cached_state.auto_compact_suppressed_until if cached_state is not None else 0.0
         ),
+        # session/full compact 摘要优先尝试模型生成结构化结果，失败再退回规则摘要。
+        semantic_summarizer=history_summarizer,
+    )
+    if (
+        pipeline_result.compaction_result.carried_tool_findings
+        or pipeline_result.compaction_result.carried_open_issues
+    ):
+        _promote_microcompact_carryovers(
+            working_memory=working_memory,
+            compaction_result=pipeline_result.compaction_result,
+        )
+        overlay_snapshot: CompactMemorySnapshot = {}
+        if pipeline_result.compaction_result.carried_tool_findings:
+            overlay_snapshot["tool_findings"] = list(
+                pipeline_result.compaction_result.carried_tool_findings
+            )
+        if pipeline_result.compaction_result.carried_open_issues:
+            overlay_snapshot["open_issues"] = list(
+                pipeline_result.compaction_result.carried_open_issues
+            )
+        pipeline_result.resolved_active_context_snapshot = merge_active_context_snapshots(
+            base_snapshot=(
+                pipeline_result.resolved_active_context_snapshot or active_context_snapshot
+            ),
+            overlay_snapshot=overlay_snapshot,
+        )
+        pipeline_result.resolved_active_context_summary = render_active_context_summary(
+            pipeline_result.resolved_active_context_snapshot
+        )
+    active_context_summary = (
+        pipeline_result.resolved_active_context_summary or active_context_summary
     )
 
     session_snapshot = SessionData(

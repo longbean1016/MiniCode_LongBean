@@ -328,6 +328,9 @@ class MainSmokeTests(unittest.TestCase):
             self.assertIn("我的名字是长豆角", output)
             self.assertIn("默认中文回答，回答尽量直接", output)
             self.assertIn("在tmp目录新建的代码不用帮我测试", output)
+            self.assertIn("[Identity]", output)
+            self.assertIn("[Preferences]", output)
+            self.assertIn("[Custom]", output)
 
             with open(f"{tmpdir}\\USER.md", "r", encoding="utf-8") as handle:
                 user_md = handle.read()

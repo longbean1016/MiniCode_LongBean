@@ -276,12 +276,28 @@ def _run_agent_loop(
         )
 
         # 记录本轮上下文裁剪结果和 token 占用情况，便于观察策略是否生效。
+        microcompact_reason = str(
+            prepared_context.compaction_history_entry.get("microcompact_reason", "")
+        ).strip()
+        microcompact_tool_results = prepared_context.compaction_history_entry.get(
+            "microcompact_tool_results", 0
+        )
+        microcompact_keep_recent = prepared_context.compaction_history_entry.get(
+            "microcompact_keep_recent", 0
+        )
+        microcompact_cooldown_remaining = prepared_context.compaction_history_entry.get(
+            "microcompact_cooldown_remaining_seconds", 0.0
+        )
         log_event(
             f"[session={session_id or '-'}] 第 {step_index + 1} 轮上下文窗口: "
             f"level={prepared_context.policy.level} keep_rounds={prepared_context.policy.keep_rounds} "
             f"older={len(prepared_context.history_window.older_messages)} recent={len(prepared_context.history_window.recent_messages)} "
             f"tool_truncated={prepared_context.compaction_result.truncated_tool_results} "
             f"tool_cleared={prepared_context.compaction_result.cleared_old_tool_results} "
+            f"microcompact_reason={microcompact_reason or 'unknown'} "
+            f"microcompact_tool_results={microcompact_tool_results} "
+            f"microcompact_keep_recent={microcompact_keep_recent} "
+            f"microcompact_cooldown_left={float(microcompact_cooldown_remaining):.0f}s "
             f"steps={','.join(prepared_context.pipeline_steps)}"
         )
         log_event(

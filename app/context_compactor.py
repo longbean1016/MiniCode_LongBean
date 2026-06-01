@@ -6,11 +6,12 @@ import os
 import re
 import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 """上下文压缩执行模块，负责裁剪消息历史并保留关键恢复信息。"""
 
+from app.context_compact_memory import build_active_context_event_snapshot
 from app.context_manager import estimate_messages_tokens
 from app.types import ChatMessage
 
@@ -39,6 +40,10 @@ class CompactionResult:
     dropped_progress_messages: int = 0
     priority_dropped_messages: int = 0
     tokens_freed_estimate: int = 0
+    # microcompact 不再只是“清正文”，还要把旧工具结果里的核心语义承接出来，
+    # 供后面的 working memory / active context 继续续带。
+    carried_tool_findings: list[str] = field(default_factory=list)
+    carried_open_issues: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -192,9 +197,15 @@ def microcompact_old_tool_results(
             if str(tool_name).strip()
         },
     )
+    original_tool_contents = {
+        index: _get_tool_original_content(message)
+        for index, message in enumerate(compacted)
+        if message.get("role") == "tool_result"
+    }
     _microcompact_tool_results(
         compacted=compacted,
         protected_tool_indexes=protected_tool_indexes,
+        original_tool_contents=original_tool_contents,
         result=result,
     )
     result.messages = compacted
@@ -273,6 +284,7 @@ def _microcompact_tool_results(
     *,
     compacted: list[ChatMessage],
     protected_tool_indexes: set[int],
+    original_tool_contents: dict[int, str] | None = None,
     result: CompactionResult,
 ) -> None:
     """对较旧 tool_result 做正文清理，但保留 tool_result 结构供后续恢复。"""
@@ -285,6 +297,20 @@ def _microcompact_tool_results(
             continue
 
         original_content = str(message.get("content", ""))
+        source_content = (
+            original_tool_contents.get(index, original_content)
+            if original_tool_contents is not None
+            else original_content
+        )
+        # 在真正清掉旧 tool_result 正文之前，先把这条结果当成“被移除事件”做一次语义抽取。
+        # 这样后面即使正文被折成占位说明，关键发现和风险仍然能通过承接链路保留下来。
+        carry_snapshot = build_active_context_event_snapshot(
+            removed_messages=[{**message, "content": source_content}]
+        )
+        if carry_snapshot.get("tool_findings"):
+            result.carried_tool_findings.extend(carry_snapshot["tool_findings"])
+        if carry_snapshot.get("open_issues"):
+            result.carried_open_issues.extend(carry_snapshot["open_issues"])
         summary = _build_microcompact_summary(message)
         if not summary or summary == original_content:
             continue

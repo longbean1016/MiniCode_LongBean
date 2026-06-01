@@ -374,12 +374,34 @@ def render_user_profile_summary(workspace: str) -> str:
             "可用命令：/user add <内容>、/user add identity <内容> 或 /user set <key> <value>"
         )
 
-    lines = profile.to_preference_lines()
-    if not lines:
-        lines = ["当前 USER.md 没有可用于上下文注入的偏好项"]
-
     rendered = [f"USER.md 路径: {path} (exists)"]
-    rendered.extend(f"- {line}" for line in lines)
+
+    identity_lines = _dedupe_lines(profile._build_identity_lines())
+    preference_lines = _dedupe_lines(
+        profile._build_structured_preference_lines()
+        + _split_instruction_lines(profile.preference_instructions, limit=12)
+    )
+    custom_lines = _dedupe_lines(_split_instruction_lines(profile.custom_instructions, limit=8))
+
+    if identity_lines:
+        rendered.append("")
+        rendered.append("[Identity]")
+        rendered.extend(f"- {line}" for line in identity_lines)
+
+    if preference_lines:
+        rendered.append("")
+        rendered.append("[Preferences]")
+        rendered.extend(f"- {line}" for line in preference_lines)
+
+    if custom_lines:
+        rendered.append("")
+        rendered.append("[Custom]")
+        rendered.extend(f"- {line}" for line in custom_lines)
+
+    if len(rendered) == 1:
+        rendered.append("")
+        rendered.append("当前 USER.md 没有可用于上下文注入的偏好项")
+
     return "\n".join(rendered)
 
 
@@ -394,7 +416,16 @@ def _split_sections(content: str) -> dict[str, str]:
 
 
 def _extract_loose_manual_text(content: str) -> str:
-    """提取没有落在 `##` section 里的自由文本，兼容用户手动直接编辑 USER.md。"""
+    """提取第一个 `##` section 之前的自由文本，避免 section 内容串到别的类别。"""
+    # 这里不再全文件逐行扫描。
+    # 否则 `## Identity` / `## Custom Instructions` 下面的正文行
+    # 也会被误当成“散落自由文本”重新回灌到 preference_instructions。
+    # 当前策略只接受“第一个二级标题出现之前”的自由文本作为 loose text，
+    # 这样不同 section 的内容边界就是稳定的，不会发生串线。
+    section_match = _SECTION_RE.search(content)
+    if section_match is not None:
+        content = content[: section_match.start()]
+
     lines: list[str] = []
     for raw_line in content.splitlines():
         stripped = raw_line.strip()

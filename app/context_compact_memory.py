@@ -45,6 +45,7 @@ _TITLE_TO_SECTION_KEY = {
     "当前任务": "active_tasks",
     "关键决策": "decisions",
     "未解决问题": "open_issues",
+    "未解决问题（最近风险）": "open_issues",
     "最近风险": "open_issues",
     "关键工具发现": "tool_findings",
     "旧对话摘要": "history_summary",
@@ -70,11 +71,28 @@ _DEFAULT_RENDER_SECTION_SPECS = (
     ("history_summary", 1, 140, 40),
 )
 _FULL_COMPACT_RENDER_SECTION_SPECS = (
-    ("decisions", 4, 160, 240),
-    ("tool_findings", 3, 96, 96),
-    ("open_issues", 2, 92, 54),
+    ("active_tasks", 1, 72, 42),
+    ("open_issues", 2, 90, 72),
+    ("decisions", 2, 96, 84),
+    ("tool_findings", 2, 100, 110),
+    ("stable_constraints", 1, 90, 42),
 )
 _NOISE_PREFIXES = ("│", "├", "└", "dir ", "file ")
+_FOCUS_STOP_TOKENS = {
+    "当前",
+    "继续",
+    "问题",
+    "目标",
+    "风险",
+    "主题",
+    "结论",
+    "分析",
+    "需要",
+    "应该",
+    "优先",
+    "保住",
+    "语义",
+}
 _MARKDOWN_TABLE_RE = re.compile(r"^\|.+\|$")
 _CODE_LIKE_PREFIXES = ("def ", "class ", "return ", "import ", "from ", "if ", "for ", "while ")
 _TOOL_RESULT_META_PREFIXES = (
@@ -109,6 +127,13 @@ _TOOL_RESULT_SKIP_TOKENS = (
     "beta filler",
     "delta filler",
     "gamma filler",
+    "offset=",
+    "limit=",
+    "read_repeat_blocked",
+    "read_policy_blocked",
+    "同一轮里已经读取过相同区间",
+    "目录创建成功",
+    "文件写入成功",
 )
 _SEMANTIC_HINT_TOKENS = (
     "压缩",
@@ -315,6 +340,44 @@ def merge_active_context_snapshots(
     return merged
 
 
+def prioritize_snapshot_for_current_focus(
+    snapshot: CompactMemorySnapshot,
+    *,
+    focus_lines: list[str],
+    drop_unaligned_tool_findings: bool = False,
+) -> CompactMemorySnapshot:
+    """按当前主题重排快照，优先保留与当前主线对齐的决策/风险/工具发现。"""
+    normalized_snapshot = _normalize_snapshot(snapshot)
+    # focus_lines 不是直接拿来展示，而是先拆成可匹配的主题词，
+    # 后面用这些主题词给 decisions / open_issues / tool_findings 重新排序。
+    focus_terms = _extract_focus_terms(focus_lines)
+    if not focus_terms:
+        return normalized_snapshot
+
+    prioritized = dict(normalized_snapshot)
+    for key in ("decisions", "open_issues", "tool_findings"):
+        lines = list(prioritized.get(key, []))
+        if not lines:
+            continue
+        base_priority_fn = _tool_finding_priority if key == "tool_findings" else _generic_focus_priority
+        reranked = _rerank_lines_by_focus(
+            lines,
+            focus_terms=focus_terms,
+            base_priority_fn=base_priority_fn,
+        )
+        if key == "tool_findings" and drop_unaligned_tool_findings:
+            # tool_findings 最容易把旧主题噪音带进下一轮，所以在 full compact 下允许更激进：
+            # 只保留和当前 focus 至少有一点对齐的工具发现。
+            aligned = [
+                line for line in reranked
+                if _focus_alignment_score(line, focus_terms) > 0
+            ]
+            if aligned:
+                reranked = aligned
+        prioritized[key] = reranked
+    return prioritized
+
+
 def build_active_context_event_snapshot(
     *,
     removed_messages: list[ChatMessage],
@@ -360,7 +423,8 @@ def build_active_context_event_snapshot(
                 tool_findings.extend(findings)
             else:
                 preview = _shorten(content, 70)
-                tool_findings.append(f"{tool_name}：{preview}")
+                if not _looks_like_low_value_tool_finding(preview):
+                    tool_findings.append(f"{tool_name}：{preview}")
 
     if active_tasks:
         snapshot["active_tasks"] = _dedupe_lines(active_tasks)[:2]
@@ -599,6 +663,75 @@ def _extract_assistant_decision_points(raw_content: str) -> list[str]:
     return []
 
 
+def _extract_focus_terms(lines: list[str]) -> set[str]:
+    terms: set[str] = set()
+    for raw_line in lines:
+        normalized = " ".join(str(raw_line).strip().lower().split())
+        if not normalized:
+            continue
+        # 英文 token、数字串、中文短语都保留一份。
+        # 中文额外切 2-4 字 ngram，是为了提升“偏题/主线漂移/压缩语义”这种短词的对齐命中率。
+        for token in re.findall(r"[a-z][a-z0-9_.-]{2,}", normalized):
+            if token not in _FOCUS_STOP_TOKENS:
+                terms.add(token)
+        for token in re.findall(r"[a-z0-9_-]{4,}", normalized):
+            if token not in _FOCUS_STOP_TOKENS:
+                terms.add(token)
+        for chunk in re.findall(r"[\u4e00-\u9fff]{2,24}", normalized):
+            compact_chunk = chunk.strip()
+            if len(compact_chunk) < 2:
+                continue
+            if compact_chunk not in _FOCUS_STOP_TOKENS:
+                terms.add(compact_chunk)
+            max_ngram = min(4, len(compact_chunk))
+            for size in range(2, max_ngram + 1):
+                for index in range(0, len(compact_chunk) - size + 1):
+                    gram = compact_chunk[index:index + size]
+                    if gram in _FOCUS_STOP_TOKENS:
+                        continue
+                    terms.add(gram)
+    return terms
+
+
+def _focus_alignment_score(text: str, focus_terms: set[str]) -> int:
+    normalized = " ".join(str(text).strip().lower().split())
+    if not normalized or not focus_terms:
+        return 0
+
+    score = 0
+    matched = 0
+    # 长词优先，避免“问题/目标/风险”这种过泛短词把排序带偏。
+    for term in sorted(focus_terms, key=len, reverse=True):
+        if term not in normalized:
+            continue
+        matched += 1
+        score += 1 if len(term) <= 2 else 2 if len(term) <= 4 else 3
+        if matched >= 8:
+            break
+    return score
+
+
+def _generic_focus_priority(text: str) -> tuple[int, int]:
+    return _semantic_line_score(text), len(text)
+
+
+def _rerank_lines_by_focus(
+    lines: list[str],
+    *,
+    focus_terms: set[str],
+    base_priority_fn,
+) -> list[str]:
+    ranked = sorted(
+        lines,
+        key=lambda line: (
+            _focus_alignment_score(line, focus_terms),
+            *base_priority_fn(line),
+        ),
+        reverse=True,
+    )
+    return _dedupe_lines(ranked)
+
+
 def _extract_tool_result_findings(*, tool_name: str, raw_content: str) -> list[str]:
     """从 tool_result 中优先抽取语义结论，而不是文件头和路径元信息。"""
     candidates: list[tuple[int, str]] = []
@@ -608,6 +741,10 @@ def _extract_tool_result_findings(*, tool_name: str, raw_content: str) -> list[s
         if not normalized:
             continue
         if _looks_like_structured_noise(normalized) or _looks_like_path_only(normalized):
+            continue
+        # 规则压缩里最危险的是把“目录头 / filler / preview 提示”误当成结论继续承接。
+        # 这里先做一层低价值过滤，宁可少带一条，也不要把噪音写进后续基线。
+        if _looks_like_low_value_tool_finding(normalized):
             continue
 
         score = _semantic_line_score(normalized)
@@ -626,6 +763,22 @@ def _extract_tool_result_findings(*, tool_name: str, raw_content: str) -> list[s
         if len(deduped) >= 2:
             break
     return deduped
+
+
+def _looks_like_low_value_tool_finding(text: str) -> bool:
+    """过滤目录头、预览提示和 filler 句，避免它们被误当成核心工具结论。"""
+    normalized = " ".join(str(text).strip().lower().split())
+    if not normalized:
+        return True
+    if normalized.startswith(
+        ("root:", "total_entries:", "returned_entries:", "search_root:", "pattern:")
+    ):
+        return True
+    if any(token in normalized for token in ("filler", "preview", "omitted", "truncated: no")):
+        return True
+    if normalized.endswith("继续拉高上下文压力。") or normalized.endswith("继续拉高上下文压力"):
+        return True
+    return False
 
 
 def _normalize_tool_result_candidate(raw_line: str) -> str:
@@ -945,6 +1098,8 @@ def _looks_like_structured_noise(text: str) -> bool:
         return True
 
     lower_line = normalized.lower()
+    if any(token in lower_line for token in _TOOL_RESULT_SKIP_TOKENS):
+        return True
     if lower_line.startswith(_NOISE_PREFIXES):
         return True
     if _MARKDOWN_TABLE_RE.match(normalized):
