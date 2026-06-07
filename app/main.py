@@ -1,10 +1,13 @@
 ﻿from __future__ import annotations
 
 import argparse
+import copy
+import time
 
 """命令行入口，负责启动会话、组装依赖并驱动整轮交互。"""
 
 from app.agent_loop import continue_agent_from_history, run_agent_once
+from app.background_worker import submit_background, wait_for_background_tasks
 from app.config import load_config
 from app.memory_decay import MemoryDecay
 from app.history_summarizer import OlderHistorySummarizer
@@ -310,6 +313,7 @@ def main() -> None:
         if user_input.lower() in {"quit", "exit"}:
             session.replace_messages(history)
             save_session(session)
+            wait_for_background_tasks()
             print("Bye!")
             break
 
@@ -406,23 +410,43 @@ def main() -> None:
                 continue
 
         if step.type == "assistant":
-            try:
-                # finalize_turn 放在真正得到 assistant 结果之后，
-                # 让长期记忆抽取基于“本轮最终回答 + 真实工具轨迹”收敛，而不是半成品中间态。
-                memory_pipeline.finalize_turn(
-                    task_description=user_input,
-                    final_step=step,
-                    turn_messages=get_last_round_messages(history),
-                    session_id=session.session_id,
-                    working_memory=working_memory,
-                    decay_log_enabled=config.decay_log_enabled,
-                    decay_log_echo=config.decay_log_echo,
-                )
-            except Exception as error:
-                log_event(
-                    f"[session={session.session_id}] 长期记忆写入失败: {error}"
-                )
-                print(f"[memory-reflection-error] {error}")
+            # finalize_turn 可能触发长期记忆抽取、验证和持久化，耗时会直接阻塞
+            # Agent> 输出。这里先拷贝本轮快照，再交给后台顺序执行。
+            finalize_task_description = user_input
+            finalize_step = copy.deepcopy(step)
+            finalize_turn_messages = copy.deepcopy(get_last_round_messages(history))
+            finalize_session_id = session.session_id
+            finalize_working_memory = copy.deepcopy(working_memory)
+            finalize_decay_log_enabled = config.decay_log_enabled
+            finalize_decay_log_echo = config.decay_log_echo
+
+            def _finalize_turn_background() -> None:
+                started_at = time.perf_counter()
+                try:
+                    memory_pipeline.finalize_turn(
+                        task_description=finalize_task_description,
+                        final_step=finalize_step,
+                        turn_messages=finalize_turn_messages,
+                        session_id=finalize_session_id,
+                        working_memory=finalize_working_memory,
+                        decay_log_enabled=finalize_decay_log_enabled,
+                        decay_log_echo=finalize_decay_log_echo,
+                    )
+                    elapsed = time.perf_counter() - started_at
+                    log_event(
+                        f"[session={finalize_session_id}] 长期记忆后台写入完成 耗时={elapsed:.3f}s",
+                        echo=False,
+                    )
+                except Exception as error:
+                    log_event(
+                        f"[session={finalize_session_id}] 长期记忆后台写入失败: {error}",
+                        echo=False,
+                    )
+
+            submit_background(
+                _finalize_turn_background,
+                name="finalize_turn",
+            )
 
         # 每轮末尾都把最新 history 落回 session，再持久化到磁盘。
         # 这样即使下一轮或下次启动中断，也能从最近一次完成态恢复。
