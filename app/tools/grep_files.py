@@ -3,6 +3,7 @@ from __future__ import annotations
 """文本搜索工具，负责在目录或文件范围内查找匹配内容。"""
 
 from pathlib import Path
+import subprocess
 from typing import Any
 
 from app.permissions import PermissionManager
@@ -16,6 +17,15 @@ MAX_MAX_MATCHES = 1_000
 MAX_MATCH_LINE_CHARS = 240
 MAX_OUTPUT_CHARS = 12_000
 _BLOCKED_INTERNAL_DIRS = {".cache", "cache", ".sessions", "sessions", ".context_state", "context_state"}
+_RG_EXCLUDE_GLOBS = (
+    "!.git/**",
+    "!.memory/**",
+    "!.qdrant_storage/**",
+    "!.pytest_cache/**",
+    "!tmp/**",
+    "!__pycache__/**",
+    "!debug.log",
+)
 
 
 def _validate(input_data: Any) -> dict[str, int | str]:
@@ -93,6 +103,135 @@ def _run(validated_input: dict[str, int | str], context: ToolContext) -> ToolRes
             meta={"path": raw_path},
         )
 
+    rg_result = _run_with_rg(
+        pattern=pattern,
+        raw_path=raw_path,
+        target_path=target_path,
+        cwd=context.cwd,
+        max_matches=max_matches,
+    )
+    if rg_result is not None:
+        return rg_result
+
+    return _run_with_python_scan(
+        pattern=pattern,
+        raw_path=raw_path,
+        target_path=target_path,
+        max_matches=max_matches,
+    )
+
+
+def _run_with_rg(
+    *,
+    pattern: str,
+    raw_path: str,
+    target_path: Path,
+    cwd: str,
+    max_matches: int,
+) -> ToolResult | None:
+    """优先使用 ripgrep；不可用或异常时交给 Python 回退实现。"""
+    base_command = [
+        "rg",
+        "--fixed-strings",
+        "--line-number",
+        "--no-heading",
+        "--color",
+        "never",
+        "--no-messages",
+    ]
+    for glob in _RG_EXCLUDE_GLOBS:
+        base_command.extend(["--glob", glob])
+
+    count_command = [*base_command, "--count", "--", pattern, raw_path]
+    try:
+        count_process = subprocess.run(
+            count_command,
+            cwd=cwd,
+            text=True,
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+    # rg: 0=有匹配，1=无匹配，2+=错误。错误时保留旧实现的宽松行为。
+    if count_process.returncode not in {0, 1}:
+        return None
+
+    total_matches = _parse_rg_count_output(count_process.stdout)
+    if total_matches == 0:
+        return _format_search_result(
+            pattern=pattern,
+            raw_path=raw_path,
+            matches=[],
+            total_matches=0,
+            truncated=False,
+            content_clipped=False,
+            output_budget_hit=False,
+            search_engine="rg",
+        )
+
+    search_command = [*base_command, "--", pattern, raw_path]
+    try:
+        search_process = subprocess.run(
+            search_command,
+            cwd=cwd,
+            text=True,
+            capture_output=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+    if search_process.returncode not in {0, 1}:
+        return None
+
+    matches: list[str] = []
+    content_clipped = False
+    output_budget_hit = False
+    current_output_chars = 0
+
+    for raw_line in search_process.stdout.splitlines():
+        rendered_line, line_was_clipped = _normalize_rg_match_line(
+            raw_line,
+            target_path=target_path,
+            cwd=cwd,
+        )
+        projected_chars = current_output_chars + len(rendered_line) + 1
+        if projected_chars > MAX_OUTPUT_CHARS and matches:
+            output_budget_hit = True
+            break
+        if len(matches) >= max_matches:
+            break
+
+        matches.append(rendered_line)
+        current_output_chars = projected_chars
+        if line_was_clipped:
+            content_clipped = True
+
+    truncated = total_matches > len(matches) or output_budget_hit
+    return _format_search_result(
+        pattern=pattern,
+        raw_path=raw_path,
+        matches=matches,
+        total_matches=total_matches,
+        truncated=truncated,
+        content_clipped=content_clipped,
+        output_budget_hit=output_budget_hit,
+        search_engine="rg",
+    )
+
+
+def _run_with_python_scan(
+    *,
+    pattern: str,
+    raw_path: str,
+    target_path: Path,
+    max_matches: int,
+) -> ToolResult:
+    """rg 不可用时保留原来的 Python 扫描兜底。"""
     matches: list[str] = []
     total_matches = 0
     truncated = False
@@ -138,41 +277,54 @@ def _run(validated_input: dict[str, int | str], context: ToolContext) -> ToolRes
             else:
                 truncated = True
 
-    if total_matches == 0:
-        return ToolResult(
-            ok=True,
-            output=(
-                f"PATTERN: {pattern}\n"
-                f"ROOT: {raw_path}\n"
-                "TOTAL_MATCHES: 0\n"
-                "RETURNED_MATCHES: 0\n"
-                "TRUNCATED: no\n"
-                "CONTENT_CLIPPED: no\n"
-                "OUTPUT_BUDGET_HIT: no\n\n"
-                "没有找到匹配的内容。"
-            ),
-            meta={
-                "pattern": pattern,
-                "search_root": raw_path,
-                "total_matches": 0,
-                "returned_matches": 0,
-                "truncated": False,
-                "content_clipped": False,
-                "output_budget_hit": False,
-            },
-        )
+    return _format_search_result(
+        pattern=pattern,
+        raw_path=raw_path,
+        matches=matches,
+        total_matches=total_matches,
+        truncated=truncated,
+        content_clipped=content_clipped,
+        output_budget_hit=output_budget_hit,
+        search_engine="python",
+    )
 
-    header_lines = [
-        f"PATTERN: {pattern}",
-        f"ROOT: {raw_path}",
-        f"TOTAL_MATCHES: {total_matches}",
-        f"RETURNED_MATCHES: {len(matches)}",
-        f"TRUNCATED: {'yes' if truncated else 'no'}",
-        f"CONTENT_CLIPPED: {'yes' if content_clipped else 'no'}",
-        f"OUTPUT_BUDGET_HIT: {'yes' if output_budget_hit else 'no'}",
-        "",
-    ]
-    output = "\n".join(header_lines + matches)
+
+def _format_search_result(
+    *,
+    pattern: str,
+    raw_path: str,
+    matches: list[str],
+    total_matches: int,
+    truncated: bool,
+    content_clipped: bool,
+    output_budget_hit: bool,
+    search_engine: str,
+) -> ToolResult:
+    if total_matches == 0:
+        output = (
+            f"PATTERN: {pattern}\n"
+            f"ROOT: {raw_path}\n"
+            "TOTAL_MATCHES: 0\n"
+            "RETURNED_MATCHES: 0\n"
+            "TRUNCATED: no\n"
+            "CONTENT_CLIPPED: no\n"
+            "OUTPUT_BUDGET_HIT: no\n"
+            f"SEARCH_ENGINE: {search_engine}\n\n"
+            "没有找到匹配的内容。"
+        )
+    else:
+        header_lines = [
+            f"PATTERN: {pattern}",
+            f"ROOT: {raw_path}",
+            f"TOTAL_MATCHES: {total_matches}",
+            f"RETURNED_MATCHES: {len(matches)}",
+            f"TRUNCATED: {'yes' if truncated else 'no'}",
+            f"CONTENT_CLIPPED: {'yes' if content_clipped else 'no'}",
+            f"OUTPUT_BUDGET_HIT: {'yes' if output_budget_hit else 'no'}",
+            f"SEARCH_ENGINE: {search_engine}",
+            "",
+        ]
+        output = "\n".join(header_lines + matches)
 
     return ToolResult(
         ok=True,
@@ -185,8 +337,50 @@ def _run(validated_input: dict[str, int | str], context: ToolContext) -> ToolRes
             "truncated": truncated,
             "content_clipped": content_clipped,
             "output_budget_hit": output_budget_hit,
+            "search_engine": search_engine,
         },
     )
+
+
+def _parse_rg_count_output(output: str) -> int:
+    total = 0
+    for line in output.splitlines():
+        try:
+            total += int(line.rsplit(":", 1)[-1])
+        except ValueError:
+            continue
+    return total
+
+
+def _normalize_rg_match_line(raw_line: str, *, target_path: Path, cwd: str) -> tuple[str, bool]:
+    path_part, line_num, line = _split_rg_match_line(raw_line)
+    display_path = _to_target_relative_rg_path(path_part, target_path=target_path, cwd=cwd)
+    clipped_line, line_was_clipped = _clip_match_line(line)
+    return f"{display_path}:{line_num}: {clipped_line}", line_was_clipped
+
+
+def _split_rg_match_line(raw_line: str) -> tuple[str, str, str]:
+    first_separator = raw_line.find(":")
+    if first_separator < 0:
+        return raw_line, "1", ""
+    second_separator = raw_line.find(":", first_separator + 1)
+    if second_separator < 0:
+        return raw_line[:first_separator], "1", raw_line[first_separator + 1 :]
+    return (
+        raw_line[:first_separator],
+        raw_line[first_separator + 1 : second_separator],
+        raw_line[second_separator + 1 :],
+    )
+
+
+def _to_target_relative_rg_path(path_text: str, *, target_path: Path, cwd: str) -> str:
+    rg_path = Path(path_text)
+    if not rg_path.is_absolute():
+        rg_path = Path(cwd) / rg_path
+    try:
+        return rg_path.resolve().relative_to(target_path.resolve()).as_posix()
+    except ValueError:
+        return path_text.replace("\\", "/")
 
 
 def _to_workspace_relative_path(target_path: Path, cwd: str) -> str:

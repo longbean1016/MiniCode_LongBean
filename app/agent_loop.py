@@ -266,6 +266,7 @@ def _run_agent_loop(
         full_history = list(builder.build())
 
         # 把上下文准备工作委托给专门模块，避免主循环里塞入过多策略细节。
+        context_started_at = time.perf_counter()
         prepared_context = prepare_agent_context(
             full_history=full_history,
             session=session,
@@ -274,6 +275,7 @@ def _run_agent_loop(
             memory_pipeline=memory_pipeline,
             history_summarizer=history_summarizer,
         )
+        context_cost = time.perf_counter() - context_started_at
 
         # 记录本轮上下文裁剪结果和 token 占用情况，便于观察策略是否生效。
         microcompact_reason = str(
@@ -336,7 +338,9 @@ def _run_agent_loop(
             )
 
             # 请求模型给出下一步动作
+            model_started_at = time.perf_counter()
             step = model.next(messages=messages)
+            model_cost = time.perf_counter() - model_started_at
 
             # 记录模型返回类型
             log_event(
@@ -357,6 +361,7 @@ def _run_agent_loop(
                     )
                     try:
                         step = model.next(messages=recovery_result.messages)
+                        model_cost = time.perf_counter() - model_started_at
                         log_event(
                             f"[session={session_id or '-'}] 第 {step_index + 1} 轮恢复后模型返回类型: {step.type}"
                         )
@@ -407,6 +412,7 @@ def _run_agent_loop(
                             step.content = final_content
                             builder.add_assistant(final_content)
 
+                            post_started_at = time.perf_counter()
                             if memory_pipeline is not None:
                                 memory_pipeline.record_assistant_reply(
                                     working_memory,
@@ -432,11 +438,13 @@ def _run_agent_loop(
                                 session=session,
                                 working_memory=working_memory,
                             )
+                            post_cost = time.perf_counter() - post_started_at
                             step_cost = time.perf_counter() - step_started_at
                             total_cost = time.perf_counter() - loop_started_at
                             log_event(
                                 f"[session={session_id or '-'}] 第 {step_index + 1} 轮恢复后直接返回答案 "
-                                f"step耗时={step_cost:.3f}s 总耗时={total_cost:.3f}s"
+                                f"step耗时={step_cost:.3f}s context={context_cost:.3f}s "
+                                f"model={model_cost:.3f}s post={post_cost:.3f}s 总耗时={total_cost:.3f}s"
                             )
                             return step, builder.build()
 
@@ -478,7 +486,7 @@ def _run_agent_loop(
                 step_cost = time.perf_counter() - step_started_at
                 log_event(
                     f"[session={session_id or '-'}] 第 {step_index + 1} 轮收到 progress，继续下一轮 "
-                    f"step耗时={step_cost:.3f}s"
+                    f"step耗时={step_cost:.3f}s context={context_cost:.3f}s model={model_cost:.3f}s"
                 )
                 continue
 
@@ -519,6 +527,7 @@ def _run_agent_loop(
 
             # 从最终 assistant 回复里尝试抽一条关键决策。
             # 这不是为了记录所有回答，而是尽量保留“已经确认的方向或约束”。
+            post_started_at = time.perf_counter()
             if memory_pipeline is not None:
                 memory_pipeline.record_assistant_reply(
                     working_memory,
@@ -544,12 +553,14 @@ def _run_agent_loop(
                 session=session,
                 working_memory=working_memory,
             )
+            post_cost = time.perf_counter() - post_started_at
             # 记录当前 step 和整轮总耗时
             step_cost = time.perf_counter() - step_started_at
             total_cost = time.perf_counter() - loop_started_at
             log_event(
                 f"[session={session_id or '-'}] 第 {step_index + 1} 轮直接返回答案 "
-                f"step耗时={step_cost:.3f}s 总耗时={total_cost:.3f}s"
+                f"step耗时={step_cost:.3f}s context={context_cost:.3f}s "
+                f"model={model_cost:.3f}s post={post_cost:.3f}s 总耗时={total_cost:.3f}s"
             )
             return step, builder.build()
 
@@ -604,6 +615,7 @@ def _run_agent_loop(
 
             # 依次记录、执行并回写每个工具调用结果
             blocked_analysis_tool_call_count = 0
+            tool_total_cost = 0.0
             for call in step.calls:
                 tool_name = call["tool_name"]
                 tool_input = call["input"]
@@ -671,6 +683,7 @@ def _run_agent_loop(
                     )
 
                 tool_cost = time.perf_counter() - tool_started_at
+                tool_total_cost += tool_cost
                 log_event(
                     f"[session={session_id or '-'}] 第 {step_index + 1} 轮工具 {tool_name} "
                     f"返回 ok={result.ok} error={result.error} 耗时={tool_cost:.3f}s"
@@ -780,7 +793,9 @@ def _run_agent_loop(
             # 记录当前工具阶段结束
             step_cost = time.perf_counter() - step_started_at
             log_event(
-                f"[session={session_id or '-'}] 第 {step_index + 1} 轮工具阶段结束 step耗时={step_cost:.3f}s"
+                f"[session={session_id or '-'}] 第 {step_index + 1} 轮工具阶段结束 "
+                f"step耗时={step_cost:.3f}s context={context_cost:.3f}s "
+                f"model={model_cost:.3f}s tools={tool_total_cost:.3f}s"
             )
             continue
 
