@@ -65,7 +65,7 @@ QDRANT_ENABLED=false
 如果要启用长期记忆的语义检索，可以补充：
 
 ```env
-EMBEDDING_MODEL=text-embedding-v3
+EMBEDDING_MODEL=text-embedding-v4
 EMBEDDING_API_KEY=
 EMBEDDING_BASE_URL=
 EMBEDDING_DIMENSIONS=1024
@@ -97,7 +97,7 @@ QDRANT_COLLECTION=project_memories
 
 ## 如何启动
 
-CLI 入口在 [app/main.py](/d:/MiniCode-ByMyself/app/main.py:131)。
+CLI 入口在 [app/main.py]
 
 当前建议使用下面两种方式启动：
 
@@ -175,36 +175,47 @@ python app/main.py --session 81d81acc8c97
 - `project`：项目规则，例如架构约束、代码约定、协作规范
 - 不写作用域时，默认按 `project` 处理
 - `/memory add ...` 当前会写入工作区下的 `.memory/memory.json`
-- 用户偏好请优先使用 `/user add ...`，写入 `USER.md`
-
-另外，`#` 开头的输入也会被识别为手动记忆，默认写入项目记忆：
-
-```text
-# 这个仓库优先保留中文注释
-```
 
 这类输入会直接写入长期记忆，不会继续走一轮普通 Agent 对话。
 
 ## USER.md 命令
 
-如果你想维护工作区级的用户偏好文件，而不是长期记忆 JSON，可以使用 `/user` 命令。
+如果你想维护工作区级的用户偏好文件，而不是长期记忆 JSON，可以使用 `/user` 命令。它会直接读写工作区根目录的 `USER.md`。
 
 常见用法：
 
 ```text
 /user
-/user add 回答尽量直接
-/user set language zh-CN
-/user set verbosity concise
+/user add identity 我的名字是长豆角，我给你取名字为小多
+/user add preferences 默认中文回答，回答尽量直接
+/user add custom 在 tmp 目录新建的代码不用帮我测试
+/user set preferences.language zh-CN
+/user set preferences.verbosity concise
+/user set coding_style.comments 修改代码时加中文注释
 /user paths
+/user reset
 ```
 
 说明：
 
-- `/user add ...` 会把自由偏好追加到工作区根目录的 `USER.md`
+- `/user add <内容>` 兼容旧写法，默认会把内容追加到 `Custom Instructions`
+- `/user add identity <内容>` 会追加到 `## Identity`
+- `/user add preferences <内容>` 会追加到 `## Preference Instructions`
+- `/user add custom <内容>` 会追加到 `## Custom Instructions`
 - `/user set <key> <value>` 会把结构化字段写入 `USER.md`
 - `/user` 可以直接查看当前 `USER.md` 摘要
 - `/user paths` 可以查看当前 `USER.md` 的真实路径
+- `/user reset` 会删除当前工作区的 `USER.md`
+
+当前支持的常用 `set key`：
+
+- `preferences.language`
+- `preferences.verbosity`
+- `preferences.response_style`
+- `coding_style.comments`
+- `identity_instructions`
+- `preference_instructions`
+- `custom_instructions`
 
 当前两类入口的区别：
 
@@ -257,28 +268,10 @@ python app/main.py
 帮我分析一下 app/main.py 的启动链路
 ```
 
-或者先写一条用户偏好记忆：
 
-```text
-/user add 回答尽量直接
-```
 
-## 测试
-
-本地运行测试：
-
-```bash
-pytest
-```
-
-如果没有安装测试依赖，可以先安装：
-
-```bash
-pip install pytest pytest-mock
-```
 
 ## 说明
 
 - 当前项目是本地 CLI Agent，不是 HTTP 服务
 - 启动失败时，优先检查 `.env`、模型接口可达性、`WORKSPACE_ROOT` 是否正确
-- 显式记忆命令的解析入口在 [app/explicit_memory.py](/d:/MiniCode-ByMyself/app/explicit_memory.py:65)

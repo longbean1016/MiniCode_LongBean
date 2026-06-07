@@ -429,7 +429,7 @@ class OlderHistorySummarizer:
             raise
 
         self.circuit_breaker.record_success()
-        return response.choices[0].message.content or ""
+        return response.choices[0].message.content or "" # type: ignore
 
     def _save_session_state(
         self,
