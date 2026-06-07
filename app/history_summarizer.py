@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 
 """历史摘要模块，负责把较早轮次的对话压成可继续使用的摘要。"""
 
@@ -69,6 +70,18 @@ class OlderHistorySummarizer:
         )
         self.circuit_breaker = CircuitBreaker(
             name="history_summarizer",
+            failure_threshold=circuit_failure_threshold,
+            recovery_timeout_seconds=circuit_recovery_timeout_seconds,
+        )
+        # 轻量抽取与 Collapse/历史摘要使用独立熔断器；
+        # 抽取失败只影响 WM 承接，不应该连带阻断真正的压缩摘要。
+        self.microcompact_circuit_breaker = CircuitBreaker(
+            name="microcompact_extractor",
+            failure_threshold=circuit_failure_threshold,
+            recovery_timeout_seconds=circuit_recovery_timeout_seconds,
+        )
+        self.assistant_reply_circuit_breaker = CircuitBreaker(
+            name="assistant_reply_extractor",
             failure_threshold=circuit_failure_threshold,
             recovery_timeout_seconds=circuit_recovery_timeout_seconds,
         )
@@ -265,6 +278,57 @@ class OlderHistorySummarizer:
 
         return rendered or normalized_fallback, merged_snapshot or None
 
+    def extract_microcompact_carryovers(
+        self,
+        *,
+        tool_results: list[dict[str, object]],
+    ) -> dict[str, list[str]]:
+        """从即将被 microcompact 清正文的工具结果中抽取可续带的关键语义。"""
+        if not tool_results:
+            return {"tool_findings": [], "open_issues": [], "key_decisions": []}
+
+        lines: list[str] = []
+        for index, item in enumerate(tool_results[:8], start=1):
+            tool_name = str(item.get("tool_name", "") or "unknown")
+            tool_input = self._shorten(json.dumps(item.get("tool_input", {}), ensure_ascii=False), 400)
+            content = self._shorten(str(item.get("content", "")), 900)
+            lines.append(
+                f"### tool_result {index}\n"
+                f"tool_name: {tool_name}\n"
+                f"tool_input: {tool_input}\n"
+                f"content: {content}"
+            )
+
+        system_prompt = (
+            "你是代码 Agent 的 microcompact 语义承接器。\n"
+            "请只抽取旧 tool_result 正文被清掉后仍必须保留的事实。\n"
+            "输出必须是 JSON 对象，字段固定为 tool_findings、open_issues、key_decisions，值都是字符串数组。\n"
+            "不要输出 markdown，不要解释。"
+        )
+        user_prompt = "请从下面这些工具结果中抽取关键承接信息：\n\n" + "\n\n".join(lines)
+        return self._call_json_extractor(
+            breaker=self.microcompact_circuit_breaker,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            expected_keys=("tool_findings", "open_issues", "key_decisions"),
+        )
+
+    def extract_assistant_reply_memory(self, *, content: str) -> dict[str, list[str]]:
+        """从 assistant 最终回复中抽取 WM 需要的决策、风险、偏好和约束。"""
+        system_prompt = (
+            "你是代码 Agent 的回复记忆抽取器。\n"
+            "请从 assistant 回复中抽取对后续轮次有用的短期记忆。\n"
+            "输出必须是 JSON 对象，字段固定为 key_decisions、recent_risks、preferences、constraints，值都是字符串数组。\n"
+            "只保留明确表达的信息，不要脑补。不要输出 markdown。"
+        )
+        user_prompt = "assistant 回复如下：\n\n" + self._shorten(content, 1200)
+        return self._call_json_extractor(
+            breaker=self.assistant_reply_circuit_breaker,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            expected_keys=("key_decisions", "recent_risks", "preferences", "constraints"),
+        )
+
     def _fingerprint_messages(self, older_messages: list[ChatMessage]) -> str:
         """为旧历史生成稳定指纹。"""
         parts: list[str] = []
@@ -431,6 +495,61 @@ class OlderHistorySummarizer:
         self.circuit_breaker.record_success()
         return response.choices[0].message.content or "" # type: ignore
 
+    def _call_json_extractor(
+        self,
+        *,
+        breaker: CircuitBreaker,
+        system_prompt: str,
+        user_prompt: str,
+        expected_keys: tuple[str, ...],
+    ) -> dict[str, list[str]]:
+        """调用轻量抽取模型并解析 JSON；解析失败交给调用方回退。"""
+        if not breaker.allow_request():
+            raise RuntimeError(f"{breaker.name} 熔断中")
+
+        def _request_model() -> object:
+            return self.client.chat.completions.create(
+                model=self.model_name,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                extra_body={"thinking": {"type": "disabled"}},
+            )
+
+        try:
+            response = run_with_retry(
+                _request_model,
+                policy=self.retry_policy,
+                should_retry=should_retry_model_error,
+                on_retry=lambda attempt, error, delay: log_event(
+                    (
+                        f"轻量记忆抽取模型调用失败，准备第 {attempt + 1} 次尝试："
+                        f"{type(error).__name__}: {error}，等待 {delay:.1f}s"
+                    ),
+                    echo=False,
+                ),
+            )
+            content = response.choices[0].message.content or ""  # type: ignore[attr-defined]
+            parsed = _parse_json_object(content)
+        except Exception as error:
+            breaker.record_failure(error)
+            raise
+
+        normalized: dict[str, list[str]] = {}
+        for key in expected_keys:
+            raw_lines = parsed.get(key, [])
+            if not isinstance(raw_lines, list):
+                normalized[key] = []
+                continue
+            normalized[key] = [
+                " ".join(str(item).strip().split())
+                for item in raw_lines
+                if str(item).strip()
+            ]
+        breaker.record_success()
+        return normalized
+
     def _save_session_state(
         self,
         *,
@@ -472,3 +591,21 @@ class OlderHistorySummarizer:
         if len(cleaned) <= max_chars:
             return cleaned
         return cleaned[:max_chars].rstrip() + "..."
+
+
+def _parse_json_object(content: str) -> dict[str, object]:
+    """从模型输出中解析 JSON 对象，兼容偶发的前后缀说明文本。"""
+    text = str(content).strip()
+    if not text:
+        return {}
+    try:
+        value = json.loads(text)
+    except json.JSONDecodeError:
+        start = text.find("{")
+        end = text.rfind("}")
+        if start < 0 or end <= start:
+            raise
+        value = json.loads(text[start:end + 1])
+    if not isinstance(value, dict):
+        return {}
+    return value

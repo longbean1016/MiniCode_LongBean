@@ -4,14 +4,12 @@ import hashlib
 import json
 import os
 import re
-import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
 """上下文压缩执行模块，负责裁剪消息历史并保留关键恢复信息。"""
 
-from app.context_compact_memory import build_active_context_event_snapshot
 from app.context_manager import estimate_messages_tokens
 from app.types import ChatMessage
 
@@ -23,9 +21,20 @@ _PREVIEW_HEAD_LINES = 8
 _PREVIEW_TAIL_LINES = 3
 _PREVIEW_LINE_CHAR_LIMIT = 160
 _READ_FILE_PATH_PATTERN = re.compile(r"^FILE:\s*(.+)$", re.MULTILINE)
-_HEADER_PATTERN = re.compile(r"^([A-Z_]+):\s*(.+)$")
-_SUMMARY_LINE_CHAR_LIMIT = 120
 _MICROCOMPACT_MARKER_PREFIX = "[旧 tool_result 内容已由 microcompact 清理]"
+_EMPTY_SUCCESS_TOOL_RESULT_MARKER = "[工具执行成功，内容无额外信息]"
+_EMPTY_SUCCESS_PATTERNS = (
+    "文件写入成功",
+    "目录创建成功",
+    "命令执行成功",
+    "工具执行成功",
+    "执行成功",
+    "保存成功",
+    "创建成功",
+    "写入成功",
+    "success",
+    "ok",
+)
 
 
 @dataclass(slots=True)
@@ -37,13 +46,16 @@ class CompactionResult:
     cleared_old_tool_results: int = 0
     deduped_read_results: int = 0
     semantic_compacted_pairs: int = 0
+    filtered_empty_tool_results: int = 0
+    deduped_assistant_messages: int = 0
     dropped_progress_messages: int = 0
     priority_dropped_messages: int = 0
     tokens_freed_estimate: int = 0
-    # microcompact 不再只是“清正文”，还要把旧工具结果里的核心语义承接出来，
-    # 供后面的 working memory / active context 继续续带。
+    # microcompact 清正文之前会尝试用轻量模型承接关键语义，
+    # 这里按 working memory 的槽位拆开，避免后续再靠规则猜测含义。
     carried_tool_findings: list[str] = field(default_factory=list)
     carried_open_issues: list[str] = field(default_factory=list)
+    carried_key_decisions: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -76,8 +88,9 @@ def compact_recent_messages(
     1. 删除 assistant_progress
     2. 对超大 tool_result 落盘并替换成首尾预览
     3. 对重复读取结果做语义去重
-    4. 把过旧的 tool_call + tool_result 折叠成 assistant 摘要
-    5. 如果仍超预算，再做一次“保护最近消息”的优先裁剪
+    4. 过滤纯确认类 tool_result
+    5. 去掉连续重复 assistant 回复
+    6. 如果仍超预算，再做一次“保护最近消息”的优先裁剪
     """
     # 第一步先去掉 progress 类消息。
     # 这类消息只对“流式展示过程”有用，对下一次推理几乎没有事实价值，
@@ -121,36 +134,15 @@ def compact_recent_messages(
         workspace_path=workspace_path,
         result=result,
     )
-    current_tokens = estimate_messages_tokens(compacted)
-    if _is_within_target(current_tokens=current_tokens, target_tokens=target_tokens):
-        result.messages = compacted
-        return result
 
     _dedupe_tool_results(
         compacted=compacted,
         original_tool_contents=original_tool_contents,
         result=result,
     )
-    current_tokens = estimate_messages_tokens(compacted)
-    if _is_within_target(current_tokens=current_tokens, target_tokens=target_tokens):
-        result.messages = compacted
-        return result
-
-    # 进入语义压缩前，先挑出“绝不能折”的最近工具结果。
-    # recent window 的核心目标不是尽可能短，而是尽量让模型下一步还能继续引用最近证据。
-    protected_tool_indexes = _collect_protected_tool_indexes(
+    _filter_empty_success_tool_results(compacted=compacted, result=result)
+    compacted = _dedupe_consecutive_assistant_messages(
         compacted=compacted,
-        max_recent_tool_results=max_recent_tool_results,
-        pinned_tools=pinned_tools,
-    )
-    protected_pair_indexes = _expand_protected_pair_indexes(
-        compacted=compacted,
-        protected_tool_indexes=protected_tool_indexes,
-    )
-    compacted = _semantic_compact_old_tool_interactions(
-        compacted=compacted,
-        original_tool_contents=original_tool_contents,
-        protected_indexes=protected_pair_indexes,
         result=result,
     )
     current_tokens = estimate_messages_tokens(compacted)
@@ -173,6 +165,7 @@ def microcompact_old_tool_results(
     *,
     keep_recent_tool_results: int,
     pinned_tool_names: set[str] | None = None,
+    semantic_summarizer: object | None = None,
 ) -> CompactionResult:
     """
     轻量清理较旧 tool_result 的正文，保留协议结构和最近证据。
@@ -206,6 +199,7 @@ def microcompact_old_tool_results(
         compacted=compacted,
         protected_tool_indexes=protected_tool_indexes,
         original_tool_contents=original_tool_contents,
+        semantic_summarizer=semantic_summarizer,
         result=result,
     )
     result.messages = compacted
@@ -285,9 +279,55 @@ def _microcompact_tool_results(
     compacted: list[ChatMessage],
     protected_tool_indexes: set[int],
     original_tool_contents: dict[int, str] | None = None,
+    semantic_summarizer: object | None = None,
     result: CompactionResult,
 ) -> None:
     """对较旧 tool_result 做正文清理，但保留 tool_result 结构供后续恢复。"""
+    extraction_candidates: list[dict[str, object]] = []
+    tool_call_input_by_id = _build_tool_call_input_by_id(compacted)
+    for index, message in enumerate(compacted):
+        if message.get("role") != "tool_result":
+            continue
+        if index in protected_tool_indexes:
+            continue
+        if _is_already_microcompacted_tool_result(message):
+            continue
+        original_content = str(message.get("content", ""))
+        source_content = (
+            original_tool_contents.get(index, original_content)
+            if original_tool_contents is not None
+            else original_content
+        )
+        extraction_candidates.append(
+            {
+                "tool_name": str(message.get("tool_name", "") or "unknown"),
+                "tool_input": tool_call_input_by_id.get(
+                    str(message.get("tool_use_id", "")).strip(),
+                    {},
+                ),
+                "content": source_content,
+            }
+        )
+
+    if extraction_candidates and semantic_summarizer is not None:
+        try:
+            extracted = semantic_summarizer.extract_microcompact_carryovers(
+                tool_results=extraction_candidates
+            )
+        except Exception:
+            extracted = {}
+        # 轻量模型抽取成功时，直接按结构化槽位写入结果；
+        # 失败则保持“只清正文、不写 WM”的文档约定。
+        result.carried_tool_findings.extend(
+            _normalize_extracted_lines(extracted, "tool_findings")
+        )
+        result.carried_open_issues.extend(
+            _normalize_extracted_lines(extracted, "open_issues")
+        )
+        result.carried_key_decisions.extend(
+            _normalize_extracted_lines(extracted, "key_decisions")
+        )
+
     for index, message in enumerate(compacted):
         if message.get("role") != "tool_result":
             continue
@@ -302,15 +342,6 @@ def _microcompact_tool_results(
             if original_tool_contents is not None
             else original_content
         )
-        # 在真正清掉旧 tool_result 正文之前，先把这条结果当成“被移除事件”做一次语义抽取。
-        # 这样后面即使正文被折成占位说明，关键发现和风险仍然能通过承接链路保留下来。
-        carry_snapshot = build_active_context_event_snapshot(
-            removed_messages=[{**message, "content": source_content}]
-        )
-        if carry_snapshot.get("tool_findings"):
-            result.carried_tool_findings.extend(carry_snapshot["tool_findings"])
-        if carry_snapshot.get("open_issues"):
-            result.carried_open_issues.extend(carry_snapshot["open_issues"])
         summary = _build_microcompact_summary(message)
         if not summary or summary == original_content:
             continue
@@ -319,6 +350,97 @@ def _microcompact_tool_results(
         compacted[index]["_microcompacted"] = True
         result.cleared_old_tool_results += 1
         result.tokens_freed_estimate += max(0, len(original_content) - len(summary)) // 4
+
+
+def _filter_empty_success_tool_results(
+    *,
+    compacted: list[ChatMessage],
+    result: CompactionResult,
+) -> None:
+    """把纯成功确认类 tool_result 改成固定占位，避免无信息日志占 prompt。"""
+    for message in compacted:
+        if message.get("role") != "tool_result":
+            continue
+        content = str(message.get("content", "")).strip()
+        if not _is_empty_success_tool_result(content):
+            continue
+        if content == _EMPTY_SUCCESS_TOOL_RESULT_MARKER:
+            continue
+        message["content"] = _EMPTY_SUCCESS_TOOL_RESULT_MARKER
+        message["_empty_success_tool_result"] = True
+        result.filtered_empty_tool_results += 1
+        result.tokens_freed_estimate += max(0, len(content) - len(_EMPTY_SUCCESS_TOOL_RESULT_MARKER)) // 4
+
+
+def _is_empty_success_tool_result(content: str) -> bool:
+    """识别没有额外事实的成功确认，避免误删包含路径、diff、错误详情的结果。"""
+    normalized = " ".join(content.strip().split()).lower()
+    if not normalized:
+        return False
+    if len(normalized) > 80:
+        return False
+    return any(normalized == pattern.lower() for pattern in _EMPTY_SUCCESS_PATTERNS)
+
+
+def _dedupe_consecutive_assistant_messages(
+    *,
+    compacted: list[ChatMessage],
+    result: CompactionResult,
+) -> list[ChatMessage]:
+    """连续 assistant 内容完全一致时保留最新一条，减少恢复后重复答复噪声。"""
+    output: list[ChatMessage] = []
+    index = 0
+    while index < len(compacted):
+        message = compacted[index]
+        if message.get("role") != "assistant":
+            output.append(dict(message))
+            index += 1
+            continue
+
+        duplicate_end = index
+        content = str(message.get("content", ""))
+        while (
+            duplicate_end + 1 < len(compacted)
+            and compacted[duplicate_end + 1].get("role") == "assistant"
+            and str(compacted[duplicate_end + 1].get("content", "")) == content
+        ):
+            duplicate_end += 1
+
+        output.append(dict(compacted[duplicate_end]))
+        result.deduped_assistant_messages += duplicate_end - index
+        index = duplicate_end + 1
+    return output
+
+
+def _build_tool_call_input_by_id(compacted: list[ChatMessage]) -> dict[str, object]:
+    """按 tool_use_id 找回原始 tool_call input，供 microcompact 模型理解工具上下文。"""
+    mapping: dict[str, object] = {}
+    for message in compacted:
+        if message.get("role") != "assistant_tool_call":
+            continue
+        tool_use_id = str(message.get("tool_use_id", "")).strip()
+        if not tool_use_id:
+            continue
+        mapping[tool_use_id] = message.get("input", {})
+    return mapping
+
+
+def _normalize_extracted_lines(raw_value: object, key: str) -> list[str]:
+    """清洗轻量模型返回的结构化数组，保证后续 WM 写入只处理非空短文本。"""
+    if not isinstance(raw_value, dict):
+        return []
+    raw_lines = raw_value.get(key, [])
+    if not isinstance(raw_lines, list):
+        return []
+    lines: list[str] = []
+    seen: set[str] = set()
+    for item in raw_lines:
+        line = " ".join(str(item).strip().split())
+        if not line or line in seen:
+            continue
+        seen.add(line)
+        lines.append(line)
+    return lines
 
 
 def _is_already_microcompacted_tool_result(message: ChatMessage) -> bool:
@@ -425,7 +547,8 @@ def _collect_protected_tool_indexes(
         for index, message in enumerate(compacted)
         if message.get("role") == "tool_result"
     ]
-    keep_indexes = set(tool_result_indexes[-max_recent_tool_results:])
+    keep_count = max(0, int(max_recent_tool_results))
+    keep_indexes = set(tool_result_indexes[-keep_count:]) if keep_count else set()
 
     if pinned_tools:
         pending = set(pinned_tools)
@@ -441,115 +564,6 @@ def _collect_protected_tool_indexes(
                 break
 
     return keep_indexes
-
-
-def _expand_protected_pair_indexes(
-    *,
-    compacted: list[ChatMessage],
-    protected_tool_indexes: set[int],
-) -> set[int]:
-    """
-    保护最近 tool_result 时，同步保护其对应 assistant_tool_call。
-
-    否则后续 normalize_tool_call_pairs 会把孤立的 tool_result 丢掉，
-    等于我们自己先压坏了协议结构。
-    """
-    protected_indexes = set(protected_tool_indexes)
-    call_index_by_id: dict[str, int] = {}
-    for index, message in enumerate(compacted):
-        if message.get("role") != "assistant_tool_call":
-            continue
-        tool_use_id = str(message.get("tool_use_id", "")).strip()
-        if tool_use_id:
-            call_index_by_id[tool_use_id] = index
-
-    for tool_index in protected_tool_indexes:
-        tool_use_id = str(compacted[tool_index].get("tool_use_id", "")).strip()
-        if tool_use_id and tool_use_id in call_index_by_id:
-            protected_indexes.add(call_index_by_id[tool_use_id])
-    return protected_indexes
-
-
-def _semantic_compact_old_tool_interactions(
-    *,
-    compacted: list[ChatMessage],
-    original_tool_contents: dict[int, str],
-    protected_indexes: set[int],
-    result: CompactionResult,
-) -> list[ChatMessage]:
-    """
-    把过旧工具轮次压成 assistant 语义摘要。
-
-    这一步比“直接把旧 tool_result 改成已省略占位”更安全：
-    - 模型还能看到“调用了什么、产出了什么”
-    - 旧 pair 会被压扁为普通消息，不再依赖 tool_call/tool_result 协议
-    - 最近和被 pin 的结果仍保留原始结构，继续支持精确引用
-    """
-    # 先把 tool_use_id 建立成索引，后面才能按“完整 pair”做折叠。
-    # 这里的核心不是压某一条消息，而是把一次旧工具交互整体沉淀成语义摘要。
-    call_index_by_id: dict[str, int] = {}
-    tool_index_by_id: dict[str, int] = {}
-    for index, message in enumerate(compacted):
-        tool_use_id = str(message.get("tool_use_id", "")).strip()
-        if not tool_use_id:
-            continue
-        if message.get("role") == "assistant_tool_call":
-            call_index_by_id[tool_use_id] = index
-        elif message.get("role") == "tool_result":
-            tool_index_by_id[tool_use_id] = index
-
-    indexes_to_drop: set[int] = set()
-    rewritten_messages: list[ChatMessage] = []
-    for index, message in enumerate(compacted):
-        if index in indexes_to_drop:
-            continue
-
-        role = message.get("role")
-        if role == "assistant_tool_call":
-            tool_use_id = str(message.get("tool_use_id", "")).strip()
-            pair_index = tool_index_by_id.get(tool_use_id, -1)
-            if index in protected_indexes or pair_index in protected_indexes:
-                rewritten_messages.append(dict(message))
-                continue
-
-            # 老的 tool_call 由后面的 tool_result 摘要统一承接，这里直接丢掉。
-            indexes_to_drop.add(index)
-            continue
-
-        if role == "tool_result":
-            if index in protected_indexes:
-                rewritten_messages.append(dict(message))
-                continue
-
-            tool_use_id = str(message.get("tool_use_id", "")).strip()
-            call_index = call_index_by_id.get(tool_use_id, -1)
-            if call_index >= 0:
-                indexes_to_drop.add(call_index)
-
-            # 只有在确定这条 tool_result 已经不需要保留结构协议时，
-            # 才把它压成 assistant 文本。这样压完之后，模型看到的是一条普通语义事实，
-            # 不再误以为还存在一个待继续衔接的 tool_call/tool_result 协议对。
-            summary = _build_semantic_tool_summary(
-                tool_result=message,
-                tool_call=compacted[call_index] if call_index >= 0 else None,
-                original_content=original_tool_contents.get(index, str(message.get("content", ""))),
-            )
-            current_content = str(message.get("content", ""))
-            rewritten_messages.append(
-                {
-                    "role": "assistant",
-                    "content": summary,
-                    "_semantic_tool_summary": True,
-                }
-            )
-            result.semantic_compacted_pairs += 1
-            result.cleared_old_tool_results += 1
-            result.tokens_freed_estimate += max(0, len(current_content) - len(summary)) // 4
-            continue
-
-        rewritten_messages.append(dict(message))
-
-    return rewritten_messages
 
 
 def _drop_low_priority_old_messages(
@@ -637,140 +651,6 @@ def _drop_priority(message: ChatMessage) -> int:
     if role == "user":
         return 1
     return 0
-
-
-def _build_semantic_tool_summary(
-    *,
-    tool_result: ChatMessage,
-    tool_call: ChatMessage | None,
-    original_content: str,
-) -> str:
-    """把一对旧工具消息压成一条尽量保住事实的语义摘要。"""
-    tool_name = str(tool_result.get("tool_name", "") or "unknown")
-    is_error = bool(tool_result.get("is_error"))
-    if is_error:
-        error_line = _extract_first_meaningful_line(original_content)
-        error_text = _shorten_text(error_line or "工具执行失败")
-        return f"[旧工具结果摘要] {tool_name} 失败：{error_text}"
-
-    if tool_name == "read_file":
-        return _build_read_file_summary(tool_result=tool_result, original_content=original_content)
-    if tool_name in _COLLECTION_TOOLS:
-        return _build_collection_summary(tool_name=tool_name, original_content=original_content)
-
-    input_summary = _summarize_tool_input(tool_call.get("input") if tool_call else None)
-    result_summary = _extract_first_meaningful_line(original_content)
-    if input_summary and result_summary:
-        return f"[旧工具结果摘要] {tool_name}({input_summary}) -> {_shorten_text(result_summary)}"
-    if result_summary:
-        return f"[旧工具结果摘要] {tool_name} -> {_shorten_text(result_summary)}"
-    if input_summary:
-        return f"[旧工具结果摘要] {tool_name}({input_summary}) 已执行"
-    return f"[旧工具结果摘要] {tool_name} 已执行"
-
-
-def _build_read_file_summary(*, tool_result: ChatMessage, original_content: str) -> str:
-    """优先保留 read_file 的文件路径与覆盖范围。"""
-    meta = tool_result.get("meta", {})
-    file_path = ""
-    if isinstance(meta, dict):
-        raw_path = meta.get("path")
-        if isinstance(raw_path, str):
-            file_path = raw_path.strip()
-    if not file_path:
-        file_path = _extract_read_file_path(tool_result, original_content) or "unknown"
-
-    headers = _parse_key_value_headers(original_content)
-    offset = headers.get("OFFSET", "?")
-    end = headers.get("END", "?")
-    total_chars = headers.get("TOTAL_CHARS", "?")
-    truncated = headers.get("TRUNCATED", "?")
-    return (
-        f"[旧工具结果摘要] read_file -> {file_path} "
-        f"(offset={offset}, end={end}, total_chars={total_chars}, truncated={truncated})"
-    )
-
-
-def _build_collection_summary(*, tool_name: str, original_content: str) -> str:
-    """优先保留 list/grep 这类集合工具的头部统计字段。"""
-    headers = _parse_key_value_headers(original_content)
-    if tool_name == "list_files":
-        root = headers.get("ROOT", "?")
-        total_entries = headers.get("TOTAL_ENTRIES", "?")
-        returned_entries = headers.get("RETURNED_ENTRIES", "?")
-        truncated = headers.get("TRUNCATED", "?")
-        return (
-            f"[旧工具结果摘要] list_files -> root={root}, "
-            f"total_entries={total_entries}, returned_entries={returned_entries}, truncated={truncated}"
-        )
-
-    pattern = headers.get("PATTERN", "?")
-    total_matches = headers.get("TOTAL_MATCHES", headers.get("MATCHES", "?"))
-    returned_matches = headers.get("RETURNED_MATCHES", headers.get("RETURNED", "?"))
-    truncated = headers.get("TRUNCATED", "?")
-    return (
-        f"[旧工具结果摘要] grep_files -> pattern={pattern}, "
-        f"total_matches={total_matches}, returned_matches={returned_matches}, truncated={truncated}"
-    )
-
-
-def _summarize_tool_input(raw_input: object) -> str:
-    """把工具入参压成一段短文本，避免摘要反过来膨胀。"""
-    if raw_input is None:
-        return ""
-    if isinstance(raw_input, dict):
-        preferred_keys = ("path", "pattern", "root", "symbol", "query", "command")
-        parts: list[str] = []
-        for key in preferred_keys:
-            value = raw_input.get(key)
-            if value is None:
-                continue
-            text = str(value).strip()
-            if text:
-                parts.append(f"{key}={_shorten_text(text, limit=36)}")
-        if parts:
-            return ", ".join(parts[:3])
-        try:
-            return _shorten_text(json.dumps(raw_input, ensure_ascii=False), limit=48)
-        except TypeError:
-            return _shorten_text(str(raw_input), limit=48)
-    return _shorten_text(str(raw_input), limit=48)
-
-
-def _extract_first_meaningful_line(text: str) -> str:
-    """提取第一条适合放进摘要的有效文本，跳过结构头和空行。"""
-    for raw_line in text.splitlines():
-        line = raw_line.strip()
-        if not line:
-            continue
-        if _HEADER_PATTERN.match(line):
-            continue
-        return line
-    return ""
-
-
-def _parse_key_value_headers(text: str) -> dict[str, str]:
-    """解析 read_file / list_files / grep_files 常见的 KEY: VALUE 头部。"""
-    parsed: dict[str, str] = {}
-    for raw_line in text.splitlines():
-        line = raw_line.strip()
-        if not line:
-            break
-        match = _HEADER_PATTERN.match(line)
-        if not match:
-            continue
-        parsed[match.group(1)] = match.group(2).strip()
-    return parsed
-
-
-def _shorten_text(text: str, *, limit: int = _SUMMARY_LINE_CHAR_LIMIT) -> str:
-    """把摘要单行限制到较短长度，避免微压缩摘要再次撑大上下文。"""
-    normalized = " ".join(text.split())
-    if len(normalized) <= limit:
-        return normalized
-    return f"{normalized[:limit].rstrip()}..."
-
-
 def _get_tool_original_content(message: ChatMessage) -> str:
     """从消息里优先取 raw_output，没有时再退回当前 content。"""
     meta = message.get("meta", {})
@@ -802,27 +682,50 @@ def _persist_tool_result(
         "timestamp": time.time(),
     }
     header = json.dumps(meta, ensure_ascii=False) + "\n---CONTENT---\n"
-
-    # 先写临时文件再原子替换，避免中途异常时留下半截文件，
-    # 也避免并发读到不完整内容。
-    temp_fd, temp_path = tempfile.mkstemp(
-        dir=str(cache_dir),
-        prefix=".tool_result_",
-        suffix=".tmp",
+    return _write_persisted_tool_result(
+        preferred_path=persisted_path,
+        fallback_dir=cache_dir.parent / "tmp" / "context_cache",
+        safe_tool_name=safe_tool_name,
+        message_index=message_index,
+        content=header + content,
     )
-    try:
-        with os.fdopen(temp_fd, "w", encoding="utf-8") as handle:
-            handle.write(header)
-            handle.write(content)
-        os.replace(temp_path, persisted_path)
-    except BaseException:
-        try:
-            os.unlink(temp_path)
-        except OSError:
-            pass
-        raise
 
-    return persisted_path
+
+def _write_persisted_tool_result(
+    *,
+    preferred_path: Path,
+    fallback_dir: Path,
+    safe_tool_name: str,
+    message_index: int,
+    content: str,
+) -> Path:
+    """优先写 .cache；遇到权限问题时退到 workspace/tmp/context_cache。"""
+    # 先写同名临时文件再原子替换，避免中途异常时留下半截文件。
+    # 这里不用 tempfile.mkstemp：在部分 Windows 环境中随机临时名探测会异常变慢；
+    # 目标文件名已经包含毫秒时间戳和消息索引，直接派生 .tmp 路径足够稳定。
+    for target_path in (
+        preferred_path,
+        fallback_dir / preferred_path.name,
+    ):
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = target_path.parent / (
+            f".tmp_{safe_tool_name}_{message_index}_{os.getpid()}_"
+            f"{int(time.time() * 1000)}.tmp"
+        )
+        try:
+            temp_path.write_text(content, encoding="utf-8")
+            os.replace(temp_path, target_path)
+            return target_path
+        except PermissionError:
+            try:
+                if temp_path.exists():
+                    os.unlink(temp_path)
+            except OSError:
+                pass
+            continue
+
+    # 两个位置都不可写时才抛错；调用方会暴露真实环境问题。
+    raise PermissionError(f"无法写入工具结果缓存: {preferred_path}")
 
 
 def _generate_tool_result_preview(

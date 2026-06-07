@@ -75,6 +75,14 @@ _PROMPT_SECTION_TITLES = {
     "open_issues": "未解决问题",
     "tool_findings": "关键工具发现",
 }
+_TOPIC_SHIFT_KEEP_ENTRY_TYPES = {"user_preference", "project_constraint", "user_intent"}
+_TOPIC_SHIFT_TRANSIENT_ENTRY_TYPES = {
+    "active_task",
+    "key_decision",
+    "recent_risk",
+    "error_context",
+    "tool_finding",
+}
 
 
 @dataclass(slots=True)
@@ -179,6 +187,29 @@ class WorkingMemory:
             if entry.entry_type == "user_intent":
                 return entry.content
         return ""
+
+    def clear_transient_entries_on_topic_shift(self, next_user_intent: str) -> int:
+        """
+        新用户意图和上一轮几乎无交集时，清理旧话题的短期工作记忆。
+
+        用户偏好和项目约束是跨话题稳定信息，不能因为当前任务切换就删除；
+        active_task / key_decision / risk / tool_finding 则默认只服务旧话题。
+        """
+        previous_intent = self.get_primary_user_intent()
+        if not previous_intent:
+            return 0
+        if not _is_topic_shift(previous_intent, next_user_intent):
+            return 0
+
+        before = len(self.get_entries())
+        self.entries = [
+            entry for entry in self.get_entries()
+            if (
+                entry.entry_type in _TOPIC_SHIFT_KEEP_ENTRY_TYPES
+                or entry.entry_type not in _TOPIC_SHIFT_TRANSIENT_ENTRY_TYPES
+            )
+        ]
+        return before - len(self.entries)
 
     def get_entries_by_type(self, entry_type: str) -> list[WorkingMemoryEntry]:
         """按 `entry_type` 过滤并返回对应条目。"""
@@ -304,3 +335,30 @@ class WorkingMemory:
                 self.entries[index].created_at,
             ),
         )
+
+
+def _is_topic_shift(previous_intent: str, next_intent: str) -> bool:
+    """用中文友好的 2-4 字 ngram 粗判话题切换，避免旧任务 WM 残留。"""
+    previous_tokens = _topic_ngrams(previous_intent)
+    next_tokens = _topic_ngrams(next_intent)
+    if not previous_tokens or not next_tokens:
+        return False
+    return len(previous_tokens & next_tokens) <= 1
+
+
+def _topic_ngrams(text: str) -> set[str]:
+    """提取 2-4 字连续片段；对中英文都先移除空白和常见标点。"""
+    normalized = "".join(
+        char.lower()
+        for char in str(text)
+        if not char.isspace() and char not in "，。！？；：,.!?;:()（）[]【】{}<>《》\"'"
+    )
+    if len(normalized) < 2:
+        return set()
+    tokens: set[str] = set()
+    for size in (2, 3, 4):
+        if len(normalized) < size:
+            continue
+        for index in range(0, len(normalized) - size + 1):
+            tokens.add(normalized[index:index + size])
+    return tokens

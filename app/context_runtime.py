@@ -31,6 +31,7 @@ from app.context_state import (
     build_history_fingerprint,
     build_token_stats_snapshot,
     load_context_state,
+    merge_context_state_snapshot,
     save_context_state,
 )
 from app.history_summarizer import OlderHistorySummarizer
@@ -573,6 +574,27 @@ def _save_active_context_state(
     save_context_state(session.workspace, state)
 
 
+def persist_post_response_working_memory_state(
+    *,
+    session: SessionData,
+    working_memory: WorkingMemory,
+) -> None:
+    """
+    保存点 B：模型回复写入 WM 后，立即把增量快照合并进 context_state。
+
+    保存点 A 负责请求前完整基线；这里只补当轮新产生的决策、风险、约束等 WM 增量，
+    降低进程在两轮之间退出时丢失最新语义的概率。
+    """
+    protected_snapshot = working_memory.build_protected_snapshot()
+    if not protected_snapshot:
+        return
+    merge_context_state_snapshot(
+        session.workspace,
+        session.session_id,
+        protected_snapshot,
+    )
+
+
 def _promote_microcompact_carryovers(
     *,
     working_memory: WorkingMemory,
@@ -595,6 +617,15 @@ def _promote_microcompact_carryovers(
                 str(issue),
                 entry_type="recent_risk",
                 importance=1.1,
+            )
+    for decision in compaction_result.carried_key_decisions:
+        if str(decision).strip():
+            # microcompact 模型抽到的关键决策需要进入 WM，
+            # 否则旧工具正文清掉后，后续轮次只能看到占位符而看不到结论。
+            working_memory.protect(
+                str(decision),
+                entry_type="key_decision",
+                importance=1.15,
             )
 
 
@@ -649,6 +680,7 @@ def _build_compacted_request(
     if (
         pipeline_result.compaction_result.carried_tool_findings
         or pipeline_result.compaction_result.carried_open_issues
+        or pipeline_result.compaction_result.carried_key_decisions
     ):
         _promote_microcompact_carryovers(
             working_memory=working_memory,
@@ -662,6 +694,10 @@ def _build_compacted_request(
         if pipeline_result.compaction_result.carried_open_issues:
             overlay_snapshot["open_issues"] = list(
                 pipeline_result.compaction_result.carried_open_issues
+            )
+        if pipeline_result.compaction_result.carried_key_decisions:
+            overlay_snapshot["decisions"] = list(
+                pipeline_result.compaction_result.carried_key_decisions
             )
         pipeline_result.resolved_active_context_snapshot = merge_active_context_snapshots(
             base_snapshot=(

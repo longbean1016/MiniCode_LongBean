@@ -1037,7 +1037,7 @@ class ContextCompactorTests(unittest.TestCase):
             )
         )
 
-    def test_compactor_truncates_large_tool_results_and_semantically_compacts_old_ones(self) -> None:
+    def test_compactor_truncates_large_tool_results_without_semantic_tool_pair_folding(self) -> None:
         from app.context_compactor import compact_recent_messages
 
         messages = [
@@ -1057,19 +1057,13 @@ class ContextCompactorTests(unittest.TestCase):
         )
 
         self.assertGreaterEqual(result.truncated_tool_results, 1)
-        self.assertGreaterEqual(result.cleared_old_tool_results, 1)
-        self.assertGreaterEqual(result.semantic_compacted_pairs, 1)
-        self.assertTrue(
-            any(
-                message.get("role") == "assistant"
-                and "旧工具结果摘要" in str(message.get("content", ""))
-                for message in result.messages
-            )
-        )
+        self.assertEqual(result.cleared_old_tool_results, 0)
+        self.assertEqual(result.semantic_compacted_pairs, 0)
+        self.assertFalse(any(message.get("_semantic_tool_summary") for message in result.messages))
         recent_tool_results = [
             message for message in result.messages if message.get("role") == "tool_result"
         ]
-        self.assertEqual(len(recent_tool_results), 2)
+        self.assertEqual(len(recent_tool_results), 3)
         self.assertEqual(recent_tool_results[-1]["meta"]["path"], "app/d.py")
 
     def test_compactor_keeps_recent_tool_call_pair_for_protected_tool_result(self) -> None:
@@ -1102,13 +1096,8 @@ class ContextCompactorTests(unittest.TestCase):
                 for message in result.messages
             )
         )
-        self.assertTrue(
-            any(
-                message.get("role") == "assistant"
-                and "app/old.py" in str(message.get("content", ""))
-                for message in result.messages
-            )
-        )
+        self.assertEqual(result.semantic_compacted_pairs, 0)
+        self.assertFalse(any(message.get("_semantic_tool_summary") for message in result.messages))
 
     def test_compactor_drops_assistant_progress_before_model_call(self) -> None:
         from app.context_compactor import compact_recent_messages
@@ -1291,6 +1280,29 @@ class ContextCompactorTests(unittest.TestCase):
         self.assertIn("扫描结果已去重", result.messages[0]["content"])
         self.assertEqual(result.messages[1]["content"], list_output)
 
+    def test_compactor_filters_empty_success_tool_results_and_duplicate_assistant_replies(self) -> None:
+        from app.context_compactor import compact_recent_messages
+
+        messages = [
+            {"role": "tool_result", "tool_name": "write_file", "content": "文件写入成功"},
+            {"role": "assistant", "content": "下一步检查上下文状态。"},
+            {"role": "assistant", "content": "下一步检查上下文状态。"},
+        ]
+
+        result = compact_recent_messages(
+            messages,
+            max_recent_tool_results=4,
+            truncate_tool_result_chars=10_000,
+        )
+
+        assistant_messages = [
+            message for message in result.messages if message.get("role") == "assistant"
+        ]
+        self.assertEqual(result.filtered_empty_tool_results, 1)
+        self.assertEqual(result.deduped_assistant_messages, 1)
+        self.assertEqual(result.messages[0]["content"], "[工具执行成功，内容无额外信息]")
+        self.assertEqual(len(assistant_messages), 1)
+
     def test_compactor_drops_old_low_priority_messages_when_still_over_target(self) -> None:
         from app.context_compactor import compact_recent_messages
 
@@ -1313,7 +1325,7 @@ class ContextCompactorTests(unittest.TestCase):
             protected_recent_messages=2,
         )
 
-        self.assertGreaterEqual(result.semantic_compacted_pairs, 1)
+        self.assertEqual(result.semantic_compacted_pairs, 0)
         self.assertGreaterEqual(result.priority_dropped_messages, 1)
         self.assertTrue(
             any(
@@ -1447,16 +1459,53 @@ class ContextCompactorTests(unittest.TestCase):
             last_microcompact_at=time.time(),
         )
 
-        self.assertNotIn("microcompact", result.steps_taken)
-        self.assertEqual(result.compaction_result.cleared_old_tool_results, 0)
-        self.assertEqual(
-            result.compaction_history_entry.get("microcompact_reason"),
-            "cooldown",
+    def test_microcompact_uses_lightweight_model_to_carry_removed_tool_findings(self) -> None:
+        from app.context_compactor_pipeline import ContextCompactorPipeline
+
+        class _FakeSummarizer:
+            def __init__(self) -> None:
+                self.received_batches: list[list[dict[str, object]]] = []
+
+            def extract_microcompact_carryovers(self, *, tool_results: list[dict[str, object]]) -> dict[str, list[str]]:
+                self.received_batches.append(tool_results)
+                return {
+                    "tool_findings": ["已确认 app/a.py 包含压缩入口"],
+                    "open_issues": ["还需要验证保存点 B 是否落盘"],
+                    "key_decisions": ["microcompact 只清正文，不折叠工具协议"],
+                }
+
+        summarizer = _FakeSummarizer()
+        messages = [
+            {"role": "user", "content": "分析调用链"},
+            {"role": "assistant_tool_call", "tool_use_id": "call-1", "tool_name": "read_file", "input": {"path": "app/a.py"}},
+            {"role": "tool_result", "tool_use_id": "call-1", "tool_name": "read_file", "content": "FILE: app/a.py\n\n入口在 prepare_agent_context。" + ("A" * 1000)},
+            {"role": "assistant_tool_call", "tool_use_id": "call-2", "tool_name": "read_file", "input": {"path": "app/b.py"}},
+            {"role": "tool_result", "tool_use_id": "call-2", "tool_name": "read_file", "content": "FILE: app/b.py\n\n" + ("B" * 1000)},
+            {"role": "assistant_tool_call", "tool_use_id": "call-3", "tool_name": "read_file", "input": {"path": "app/c.py"}},
+            {"role": "tool_result", "tool_use_id": "call-3", "tool_name": "read_file", "content": "FILE: app/c.py\n\n" + ("C" * 1000)},
+            {"role": "assistant_tool_call", "tool_use_id": "call-4", "tool_name": "read_file", "input": {"path": "app/d.py"}},
+            {"role": "tool_result", "tool_use_id": "call-4", "tool_name": "read_file", "content": "FILE: app/d.py\n\n" + ("D" * 1000)},
+            {"role": "assistant_tool_call", "tool_use_id": "call-5", "tool_name": "read_file", "input": {"path": "app/e.py"}},
+            {"role": "tool_result", "tool_use_id": "call-5", "tool_name": "read_file", "content": "FILE: app/e.py\n\n" + ("E" * 1000)},
+            {"role": "assistant_tool_call", "tool_use_id": "call-6", "tool_name": "read_file", "input": {"path": "app/f.py"}},
+            {"role": "tool_result", "tool_use_id": "call-6", "tool_name": "read_file", "content": "FILE: app/f.py\n\n" + ("F" * 1000)},
+        ]
+
+        result = ContextCompactorPipeline().process_request(
+            messages=messages,
+            max_recent_tool_results=1,
+            truncate_tool_result_chars=10_000,
+            workspace="d:\\MiniCode-ByMyself",
+            usable_budget=10_000,
+            fixed_overhead_tokens=0,
+            auto_compact_summary="",
+            semantic_summarizer=summarizer,  # type: ignore[arg-type]
         )
-        self.assertEqual(
-            result.compaction_history_entry.get("microcompact_tool_results"),
-            7,
-        )
+
+        self.assertTrue(summarizer.received_batches)
+        self.assertIn("已确认 app/a.py 包含压缩入口", result.compaction_result.carried_tool_findings)
+        self.assertIn("还需要验证保存点 B 是否落盘", result.compaction_result.carried_open_issues)
+        self.assertIn("microcompact 只清正文，不折叠工具协议", result.compaction_result.carried_key_decisions)
 
     def test_context_pipeline_microcompact_reports_below_threshold_reason(self) -> None:
         from app.context_compactor_pipeline import ContextCompactorPipeline
@@ -1556,6 +1605,17 @@ class ContextCompactorTests(unittest.TestCase):
     def test_prepare_agent_context_promotes_microcompacted_tool_findings_into_working_memory(self) -> None:
         from app.context_runtime import prepare_agent_context
 
+        class _FakeSummarizer:
+            def summarize(self, **_: object) -> str:
+                return ""
+
+            def extract_microcompact_carryovers(self, *, tool_results: list[dict[str, object]]) -> dict[str, list[str]]:
+                return {
+                    "tool_findings": ["重复扫描的 tool_result 会挤占 recent window"],
+                    "open_issues": [],
+                    "key_decisions": [],
+                }
+
         with tempfile.TemporaryDirectory() as tmpdir:
             tool_registry = _FakeToolRegistry()
             session = create_new_session(tmpdir)
@@ -1594,7 +1654,7 @@ class ContextCompactorTests(unittest.TestCase):
                 tool_registry=tool_registry,
                 working_memory=working_memory,
                 memory_pipeline=None,
-                history_summarizer=None,
+                history_summarizer=_FakeSummarizer(),  # type: ignore[arg-type]
             )
 
             self.assertIn("microcompact", prepared.pipeline_steps)
@@ -2177,6 +2237,26 @@ class AgentLoopContextPolicyTests(unittest.TestCase):
 
         self.assertIn("当前任务：继续清理上下文压缩链路", snapshot["active_tasks"])
         self.assertNotIn("用户意图：帮我分析压缩和长期记忆注入", snapshot["active_tasks"])
+
+    def test_working_memory_clears_transient_entries_when_user_intent_switches_topic(self) -> None:
+        working_memory = WorkingMemory(max_entries=20, max_tokens=400)
+        working_memory.protect("默认使用中文回答", entry_type="user_preference", importance=1.0)
+        working_memory.protect("项目约束：新增上下文代码要加中文注释", entry_type="project_constraint", importance=1.0)
+        working_memory.protect("帮我分析上下文压缩链路", entry_type="user_intent", importance=1.0)
+        working_memory.protect("当前任务：梳理 context_compactor.py", entry_type="active_task", importance=0.9)
+        working_memory.protect("关键决策：保留 Collapse AI 不动", entry_type="key_decision", importance=0.9)
+        working_memory.protect("最近风险：tool_result 可能撑爆上下文", entry_type="recent_risk", importance=0.9)
+        working_memory.protect("工具发现：context_runtime.py 会保存 context_state", entry_type="tool_finding", importance=0.9)
+
+        cleared = working_memory.clear_transient_entries_on_topic_shift("写一个贪吃蛇小游戏")
+
+        self.assertGreaterEqual(cleared, 4)
+        self.assertTrue(working_memory.get_entries_by_type("user_preference"))
+        self.assertTrue(working_memory.get_entries_by_type("project_constraint"))
+        self.assertFalse(working_memory.get_entries_by_type("active_task"))
+        self.assertFalse(working_memory.get_entries_by_type("key_decision"))
+        self.assertFalse(working_memory.get_entries_by_type("recent_risk"))
+        self.assertFalse(working_memory.get_entries_by_type("tool_finding"))
 
     def test_resolve_recent_risks_filters_directory_tree_markdown_and_file_body_noise(self) -> None:
         from app.context_signal_resolver import resolve_recent_risks
@@ -2994,6 +3074,46 @@ class AgentLoopContextPolicyTests(unittest.TestCase):
         self.assertNotIn("compact_memory_snapshot", serialized)
         self.assertIn("active_context_summary", serialized)
         self.assertIn("active_context_snapshot", serialized)
+
+    def test_context_state_incrementally_merges_working_memory_snapshot_after_response(self) -> None:
+        from app.context_state import (
+            ContextStateData,
+            merge_context_state_snapshot,
+            save_context_state,
+            load_context_state,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            save_context_state(
+                tmpdir,
+                ContextStateData(
+                    session_id="sess-merge",
+                    source_message_count=2,
+                    source_history_fingerprint="base",
+                    active_context_snapshot={
+                        "decisions": ["旧决策：保留 Snip Compact"],
+                        "tool_findings": ["旧发现：context_state 已存在"],
+                    },
+                    active_context_summary="旧摘要",
+                ),
+            )
+
+            merge_context_state_snapshot(
+                tmpdir,
+                "sess-merge",
+                {
+                    "decisions": ["新决策：保存点 B 写入当轮 WM"],
+                    "open_issues": ["新风险：模型抽取失败时走规则回退"],
+                },
+            )
+
+            state = load_context_state(tmpdir, "sess-merge")
+            self.assertIsNotNone(state)
+            assert state is not None
+            self.assertEqual(state.active_context_snapshot["decisions"], ["新决策：保存点 B 写入当轮 WM"])
+            self.assertEqual(state.active_context_snapshot["tool_findings"], ["旧发现：context_state 已存在"])
+            self.assertEqual(state.active_context_snapshot["open_issues"], ["新风险：模型抽取失败时走规则回退"])
+            self.assertIn("新决策：保存点 B 写入当轮 WM", state.active_context_summary)
 
     def test_prepare_agent_context_persists_last_microcompact_at_from_pipeline(self) -> None:
         from app.context_auto_compact import AutoCompactResult

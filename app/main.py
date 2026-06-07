@@ -280,6 +280,9 @@ def main() -> None:
         circuit_failure_threshold=config.aux_model_circuit_failure_threshold,
         circuit_recovery_timeout_seconds=config.aux_model_circuit_recovery_timeout_seconds,
     )
+    # assistant 回复和 microcompact 的轻量语义抽取复用同一个摘要器配置，
+    # 因此会使用当前运行时配置的 flash / 辅助模型，而不是在写链路里写死模型名。
+    memory_pipeline.write_pipeline.history_summarizer = history_summarizer
 
     # 所有基础设施都就绪后再恢复/创建会话，
     # 这样一进主循环就能直接处理 explicit memory 命令、工具调用和长期记忆读写。

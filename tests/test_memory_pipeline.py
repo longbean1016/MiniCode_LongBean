@@ -166,6 +166,43 @@ class MemoryPipelineTests(unittest.TestCase):
             )
             self.assertTrue(error_entries)
 
+    def test_write_pipeline_uses_lightweight_model_for_assistant_reply_memory(self) -> None:
+        class _FakeSummarizer:
+            def __init__(self) -> None:
+                self.received_content = ""
+
+            def extract_assistant_reply_memory(self, *, content: str) -> dict[str, list[str]]:
+                self.received_content = content
+                return {
+                    "key_decisions": ["关键决策：assistant 回复抽取交给轻量模型"],
+                    "recent_risks": ["最近风险：模型失败时必须回退规则抽取"],
+                    "preferences": ["用户偏好：默认中文回答"],
+                    "constraints": ["项目约束：新增逻辑补中文注释"],
+                }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            summarizer = _FakeSummarizer()
+            pipeline = MemoryWritePipeline(
+                memory_store=JsonMemoryStore(tmpdir),
+                memory_extractor=_FakeExtractor([]),
+                memory_verifier=_FakeVerifier(),
+                memory_curator=_FakeCurator(),
+                memory_decay=_FakeDecay(),
+                history_summarizer=summarizer,  # type: ignore[arg-type]
+            )
+            working_memory = WorkingMemory()
+
+            pipeline.record_assistant_reply(
+                working_memory,
+                content="这段回复用自然语言确认了实现方案，但没有包含旧规则关键词。",
+            )
+
+            self.assertIn("自然语言确认", summarizer.received_content)
+            self.assertTrue(working_memory.get_entries_by_type("key_decision"))
+            self.assertTrue(working_memory.get_entries_by_type("recent_risk"))
+            self.assertTrue(working_memory.get_entries_by_type("user_preference"))
+            self.assertTrue(working_memory.get_entries_by_type("project_constraint"))
+
     def test_parse_manual_user_memory_is_not_treated_as_explicit_long_term_memory(self) -> None:
         intent = parse_manual_memory_input("/memory add user: Prefer concise answers")
 

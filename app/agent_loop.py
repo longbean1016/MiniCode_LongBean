@@ -26,7 +26,7 @@ from app.context_reactive_compact import (
     is_context_overflow_error,
     recover_from_context_overflow,
 )
-from app.context_runtime import prepare_agent_context
+from app.context_runtime import prepare_agent_context, persist_post_response_working_memory_state
 from app.history_summarizer import OlderHistorySummarizer
 from app.logger import log_event
 from app.memory_pipeline import MemoryPipeline
@@ -428,6 +428,10 @@ def _run_agent_loop(
                                         importance=0.95,
                                     )
 
+                            persist_post_response_working_memory_state(
+                                session=session,
+                                working_memory=working_memory,
+                            )
                             step_cost = time.perf_counter() - step_started_at
                             total_cost = time.perf_counter() - loop_started_at
                             log_event(
@@ -536,6 +540,10 @@ def _run_agent_loop(
                         importance=0.95,
                     )
 
+            persist_post_response_working_memory_state(
+                session=session,
+                working_memory=working_memory,
+            )
             # 记录当前 step 和整轮总耗时
             step_cost = time.perf_counter() - step_started_at
             total_cost = time.perf_counter() - loop_started_at

@@ -88,6 +88,7 @@ class MicrocompactResult:
     last_compact_at: float = 0.0
     carried_tool_findings: list[str] = field(default_factory=list)
     carried_open_issues: list[str] = field(default_factory=list)
+    carried_key_decisions: list[str] = field(default_factory=list)
     # 记录 microcompact 决策细节，便于日志和 context_state 直接定位原因。
     reason: str = "not_evaluated"
     tool_result_count: int = 0
@@ -148,6 +149,7 @@ class MicrocompactEngine:
         messages: list[ChatMessage],
         pinned_tool_names: set[str] | None,
         usable_budget: int,
+        semantic_summarizer: OlderHistorySummarizer | None = None,
     ) -> MicrocompactResult:
         now = time.time()
         decision = self._evaluate(
@@ -169,6 +171,7 @@ class MicrocompactEngine:
             messages,
             keep_recent_tool_results=self._state.keep_recent_tool_results,
             pinned_tool_names=pinned_tool_names,
+            semantic_summarizer=semantic_summarizer,
         )
         if compaction_result.cleared_old_tool_results <= 0:
             return MicrocompactResult(
@@ -176,6 +179,7 @@ class MicrocompactEngine:
                 last_compact_at=self._state.last_time_based_compact,
                 carried_tool_findings=list(compaction_result.carried_tool_findings),
                 carried_open_issues=list(compaction_result.carried_open_issues),
+                carried_key_decisions=list(compaction_result.carried_key_decisions),
                 reason="no_old_tool_results",
                 tool_result_count=int(decision["tool_result_count"]),
                 keep_recent_tool_results=int(decision["keep_recent_tool_results"]),
@@ -191,6 +195,7 @@ class MicrocompactEngine:
             last_compact_at=now,
             carried_tool_findings=list(compaction_result.carried_tool_findings),
             carried_open_issues=list(compaction_result.carried_open_issues),
+            carried_key_decisions=list(compaction_result.carried_key_decisions),
             reason="applied",
             tool_result_count=int(decision["tool_result_count"]),
             keep_recent_tool_results=int(decision["keep_recent_tool_results"]),
@@ -322,6 +327,7 @@ class ContextCompactor:
             messages=compaction_result.messages,
             pinned_tool_names=pinned_tool_names,
             usable_budget=usable_budget,
+            semantic_summarizer=semantic_summarizer,
         )
         if microcompact_result.applied:
             overlay = CompactionResult(
@@ -330,6 +336,7 @@ class ContextCompactor:
                 tokens_freed_estimate=microcompact_result.tokens_freed_estimate,
                 carried_tool_findings=list(microcompact_result.carried_tool_findings),
                 carried_open_issues=list(microcompact_result.carried_open_issues),
+                carried_key_decisions=list(microcompact_result.carried_key_decisions),
             )
             _merge_compaction_result(base=compaction_result, overlay=overlay)
             steps_taken.append("microcompact")
@@ -494,3 +501,4 @@ def _merge_compaction_result(*, base: CompactionResult, overlay: CompactionResul
     base.tokens_freed_estimate += overlay.tokens_freed_estimate
     base.carried_tool_findings.extend(overlay.carried_tool_findings)
     base.carried_open_issues.extend(overlay.carried_open_issues)
+    base.carried_key_decisions.extend(overlay.carried_key_decisions)

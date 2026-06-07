@@ -30,6 +30,21 @@ from app.working_memory_updater import (
 # 写入链路负责显式记忆入口、回合反思、去重验证和写后整理。
 
 
+def _normalize_extracted_lines(raw_lines: object) -> list[str]:
+    """清洗轻量模型返回的数组，避免空字符串和重复项进入工作记忆。"""
+    if not isinstance(raw_lines, list):
+        return []
+    lines: list[str] = []
+    seen: set[str] = set()
+    for item in raw_lines:
+        line = " ".join(str(item).strip().split())
+        if not line or line in seen:
+            continue
+        seen.add(line)
+        lines.append(line)
+    return lines
+
+
 class MemoryWritePipeline:
     _BLOCKED_REFLECTION_PREFIXES = (
         "模型调用失败:",
@@ -46,6 +61,7 @@ class MemoryWritePipeline:
         memory_curator: MemoryCuratorLike,
         memory_decay: MemoryDecayLike,
         memory_guard: MemoryWriteGuard | None = None,
+        history_summarizer: object | None = None,
     ) -> None:
         self.memory_store = memory_store
         self.memory_extractor = memory_extractor
@@ -53,6 +69,9 @@ class MemoryWritePipeline:
         self.memory_curator = memory_curator
         self.memory_decay = memory_decay
         self.memory_guard = memory_guard or MemoryWriteGuard()
+        # 轻量语义抽取复用历史摘要器的客户端和模型配置；
+        # 没有传入时保持旧规则路径，避免测试和无模型环境被迫联网。
+        self.history_summarizer = history_summarizer
 
     def reset_turn_runtime(self, working_memory: WorkingMemory) -> None:
         # 这些条目只服务当前回合结束时的反思，不能跨轮保留。
@@ -63,6 +82,7 @@ class MemoryWritePipeline:
         )
 
     def remember_user_intent(self, working_memory: WorkingMemory, user_input: str) -> None:
+        working_memory.clear_transient_entries_on_topic_shift(user_input)
         # 用户当轮要求先进入 working memory 立即生效，
         # 是否进入长期记忆要等显式命令或反思再决定。
         working_memory.protect(
@@ -146,6 +166,14 @@ class MemoryWritePipeline:
     ) -> None:
         # assistant 输出里的关键决策和风险，也要先放进 working memory，
         # 否则同一回合后续步骤可能就丢了。
+        extracted = self._extract_assistant_reply_memory(content)
+        if extracted is not None:
+            self._record_assistant_reply_extraction(
+                working_memory=working_memory,
+                extracted=extracted,
+            )
+            return
+
         for preference in extract_user_preferences(content):
             working_memory.protect(
                 preference,
@@ -173,6 +201,68 @@ class MemoryWritePipeline:
             return
 
         for decision in decisions:
+            working_memory.protect(
+                decision,
+                entry_type="key_decision",
+                ttl_seconds=3600,
+                importance=0.95,
+            )
+            working_memory.protect(
+                decision,
+                entry_type="reflection_decision",
+                ttl_seconds=3600,
+                importance=0.95,
+            )
+
+    def _extract_assistant_reply_memory(self, content: str) -> dict[str, list[str]] | None:
+        """优先用轻量模型抽取 assistant 回复里的决策、风险、偏好和约束。"""
+        if self.history_summarizer is None:
+            return None
+        extractor = getattr(self.history_summarizer, "extract_assistant_reply_memory", None)
+        if extractor is None:
+            return None
+        try:
+            extracted = extractor(content=str(content)[:1200])
+        except Exception:
+            return None
+        if not isinstance(extracted, dict):
+            return None
+        return {
+            "key_decisions": _normalize_extracted_lines(extracted.get("key_decisions", [])),
+            "recent_risks": _normalize_extracted_lines(extracted.get("recent_risks", [])),
+            "preferences": _normalize_extracted_lines(extracted.get("preferences", [])),
+            "constraints": _normalize_extracted_lines(extracted.get("constraints", [])),
+        }
+
+    def _record_assistant_reply_extraction(
+        self,
+        *,
+        working_memory: WorkingMemory,
+        extracted: dict[str, list[str]],
+    ) -> None:
+        """把轻量模型结构化结果写入 working memory 的对应槽位。"""
+        for preference in extracted.get("preferences", []):
+            working_memory.protect(
+                preference,
+                entry_type="user_preference",
+                ttl_seconds=7200,
+                importance=0.9,
+            )
+        for constraint in extracted.get("constraints", []):
+            working_memory.protect(
+                constraint,
+                entry_type="project_constraint",
+                ttl_seconds=5400,
+                importance=0.92,
+            )
+        for risk in extracted.get("recent_risks", []):
+            working_memory.protect(
+                risk,
+                entry_type="recent_risk",
+                ttl_seconds=3600,
+                importance=0.93,
+            )
+        for decision in extracted.get("key_decisions", []):
             working_memory.protect(
                 decision,
                 entry_type="key_decision",

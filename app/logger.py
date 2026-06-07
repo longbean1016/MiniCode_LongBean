@@ -33,5 +33,9 @@ def log_event(
         print(line)
 
     path = Path(log_file)
-    with path.open("a", encoding="utf-8") as file:
-        file.write(line + "\n")
+    try:
+        with path.open("a", encoding="utf-8") as file:
+            file.write(line + "\n")
+    except OSError:
+        # 日志是旁路诊断信息，不能因为 debug.log 权限或锁定问题阻断主流程。
+        return

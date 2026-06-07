@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from app.context_manager import ContextStats
+from app.context_compact_memory import render_active_context_summary
 from app.types import ChatMessage
 
 CONTEXT_STATE_DIR_NAME = ".context_state"
@@ -151,6 +152,34 @@ def load_context_state(workspace: str, session_id: str) -> ContextStateData | No
         return ContextStateData.from_dict(raw_data)
     except (OSError, json.JSONDecodeError, KeyError, TypeError, ValueError):
         return None
+
+
+def merge_context_state_snapshot(
+    workspace: str,
+    session_id: str,
+    overlay_snapshot: dict[str, list[str]],
+) -> Path | None:
+    """
+    保存点 B：把模型返回后产生的 WM 快照增量合并进 context_state。
+
+    同 key 用新快照覆盖旧快照，未涉及的 key 原样保留；
+    这样当轮 key_decision/risk/constraint 不必等下一次请求前保存点 A 才落盘。
+    """
+    state = load_context_state(workspace, session_id)
+    if state is None:
+        return None
+
+    normalized_overlay = _normalize_snapshot(overlay_snapshot)
+    if not normalized_overlay:
+        return None
+
+    merged_snapshot = _normalize_snapshot(state.active_context_snapshot)
+    for key, lines in normalized_overlay.items():
+        merged_snapshot[key] = list(lines)
+
+    state.active_context_snapshot = merged_snapshot
+    state.active_context_summary = render_active_context_summary(merged_snapshot)
+    return save_context_state(workspace, state)
 
 
 def build_history_fingerprint(messages: list[ChatMessage]) -> str:

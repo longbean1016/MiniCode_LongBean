@@ -762,7 +762,7 @@ def _has_sufficient_analysis_evidence(tracker: dict[str, object]) -> bool:
 def _all_calls_are_exploration(
     calls: list[dict[str, object]],
     *,
-    is_exploration_tool,
+    is_exploration_tool=lambda _tool_name: True,
 ) -> bool:
     return bool(calls) and all(is_exploration_tool(str(call.get("tool_name", ""))) for call in calls)
 
@@ -773,7 +773,7 @@ def _should_block_redundant_analysis_calls(
     calls: list[dict[str, object]],
     step_index: int,
     max_steps: int,
-    is_exploration_tool,
+    is_exploration_tool=lambda _tool_name: True,
 ) -> bool:
     """证据够了之后，拦掉明显重复的探索工具调用，逼模型进入答案收敛。"""
     if not _has_sufficient_analysis_evidence(tracker):
