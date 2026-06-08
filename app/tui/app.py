@@ -287,14 +287,15 @@ class MiniCodeApp(App):
 
         if answer == "y" and self._pending_approval is not None:
             approval = self._pending_approval
+            # 先把 action_key 加入已批准集合，再执行工具。
+            # 否则工具在执行时还会命中权限检查，返回 PERMISSION_REQUIRED。
+            self._tool_context.approved_actions.add(approval.action_key)
             # 执行已批准的工具
             result = self._tool_registry.execute_tool(
                 tool_name=approval.tool_name,
                 input_data=approval.input_data,
                 context=self._tool_context,
             )
-            # 记录到已批准集合，同一会话内后续同类型操作直接放行
-            self._tool_context.approved_actions.add(approval.action_key)
 
             self.conversation.add_tool_result(
                 name=approval.tool_name,

@@ -889,7 +889,9 @@ def stream_agent(
     # 用 MessageBuilder 统一管理本轮消息
     builder = MessageBuilder()
     builder.extend(history)
-    builder.add_user(user_input)
+    # 审批后继续执行时 user_input 为空，不应追加空的 user 消息
+    if user_input and user_input.strip():
+        builder.add_user(user_input)
 
     loop_started_at = time.perf_counter()
     pending_user_nudge: str | None = None
