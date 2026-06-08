@@ -1,6 +1,6 @@
 ﻿from __future__ import annotations
 
-from app.context.history_window import split_history_rounds
+from app.context.history_summarizer import split_history_rounds
 from app.types import ChatMessage
 
 

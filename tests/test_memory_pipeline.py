@@ -9,8 +9,7 @@ from app.memory.explicit import parse_manual_memory_input
 from app.memory.guard import MemoryWriteGuard
 from app.memory.reflection import ReflectionMemoryCandidate, TaskMemoryReflectionEngine
 from app.memory.decay import DecayRunResult
-from app.memory.feedback import MemoryFeedbackStore
-from app.memory.pipeline import MemoryPipeline
+from app.memory.pipeline import MemoryFeedbackStore, MemoryPipeline
 from app.memory.read_pipeline import MemoryReadPipeline
 from app.memory.store import JsonMemoryStore, MemoryEntry, create_memory_entry
 from app.memory.write_pipeline import MemoryWritePipeline

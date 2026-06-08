@@ -12,7 +12,7 @@ from app.context.history_summarizer import OlderHistorySummarizer
 from app.logger import log_event
 from app.memory.curator import MemoryCurator
 from app.memory.extractor import LongTermMemoryExtractor
-from app.memory.feedback import MemoryFeedbackStore
+from app.memory.pipeline import MemoryFeedbackStore
 from app.memory.guard import MemoryWriteGuard
 from app.memory.pipeline import MemoryPipeline
 from app.memory.read_pipeline import MemoryReadPipeline

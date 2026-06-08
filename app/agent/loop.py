@@ -22,7 +22,7 @@ from app.agent.analysis_guard import (
     _should_block_redundant_analysis_calls,
     _should_redirect_analysis_to_structure_first,
 )
-from app.context.reactive_compact import (
+from app.context.auto_compact import (
     is_context_overflow_error,
     recover_from_context_overflow,
 )
@@ -864,7 +864,7 @@ def stream_agent(
     """
     import json
 
-    from app.context.reactive_compact import (
+    from app.context.auto_compact import (
         is_context_overflow_error,
         recover_from_context_overflow,
     )

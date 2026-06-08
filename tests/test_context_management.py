@@ -1343,7 +1343,7 @@ class ContextCompactorTests(unittest.TestCase):
         )
 
     def test_context_pipeline_runs_lightweight_tool_budget_before_threshold(self) -> None:
-        from app.context.compactor_pipeline import ContextCompactorPipeline
+        from app.context.runtime import ContextCompactorPipeline
 
         with tempfile.TemporaryDirectory() as tmpdir:
             pipeline = ContextCompactorPipeline()
@@ -1370,7 +1370,7 @@ class ContextCompactorTests(unittest.TestCase):
             )
 
     def test_context_pipeline_microcompacts_old_tool_results_without_breaking_recent_pair(self) -> None:
-        from app.context.compactor_pipeline import ContextCompactorPipeline
+        from app.context.runtime import ContextCompactorPipeline
 
         pipeline = ContextCompactorPipeline()
         messages = [
@@ -1427,7 +1427,7 @@ class ContextCompactorTests(unittest.TestCase):
         )
 
     def test_context_pipeline_microcompact_respects_time_cooldown(self) -> None:
-        from app.context.compactor_pipeline import ContextCompactorPipeline
+        from app.context.runtime import ContextCompactorPipeline
 
         pipeline = ContextCompactorPipeline()
         messages = [
@@ -1460,7 +1460,7 @@ class ContextCompactorTests(unittest.TestCase):
         )
 
     def test_microcompact_uses_lightweight_model_to_carry_removed_tool_findings(self) -> None:
-        from app.context.compactor_pipeline import ContextCompactorPipeline
+        from app.context.runtime import ContextCompactorPipeline
 
         class _FakeSummarizer:
             def __init__(self) -> None:
@@ -1508,7 +1508,7 @@ class ContextCompactorTests(unittest.TestCase):
         self.assertIn("microcompact 只清正文，不折叠工具协议", result.compaction_result.carried_key_decisions)
 
     def test_context_pipeline_microcompact_reports_below_threshold_reason(self) -> None:
-        from app.context.compactor_pipeline import ContextCompactorPipeline
+        from app.context.runtime import ContextCompactorPipeline
 
         pipeline = ContextCompactorPipeline()
         messages = [{"role": "user", "content": "继续分析"}]
@@ -1557,7 +1557,7 @@ class ContextCompactorTests(unittest.TestCase):
         )
 
     def test_context_pipeline_microcompact_matches_minicode_time_based_policy(self) -> None:
-        from app.context.compactor_pipeline import ContextCompactorPipeline
+        from app.context.runtime import ContextCompactorPipeline
 
         pipeline = ContextCompactorPipeline()
         messages = [{"role": "user", "content": "继续分析最近读取结果"}]
@@ -2273,7 +2273,7 @@ class AgentLoopContextPolicyTests(unittest.TestCase):
 
     def test_resolve_project_constraints_prefers_long_term_constraints_and_filters_transient_runtime_noise(self) -> None:
         from app.context.signal_resolver import resolve_project_constraints
-        from app.memory.feedback import MemoryFeedbackStore
+        from app.memory.pipeline import MemoryFeedbackStore
         from app.memory.pipeline import MemoryPipeline
         from app.memory.read_pipeline import MemoryReadPipeline
         from app.memory.store import JsonMemoryStore, create_memory_entry
@@ -2845,7 +2845,7 @@ class AgentLoopContextPolicyTests(unittest.TestCase):
         )
 
     def test_context_pipeline_passes_semantic_summarizer_into_auto_compact(self) -> None:
-        from app.context.compactor_pipeline import ContextCompactorPipeline
+        from app.context.runtime import ContextCompactorPipeline
 
         pipeline = ContextCompactorPipeline()
         summarizer = _FakeSemanticCompactionSummarizer(
@@ -2943,7 +2943,7 @@ class AgentLoopContextPolicyTests(unittest.TestCase):
 
     def test_reactive_tail_recover_strips_old_compaction_markers_before_retry(self) -> None:
         from app.context.manager import estimate_messages_tokens
-        from app.context.reactive_compact import _aggressive_tail_recover
+        from app.context.auto_compact import _aggressive_tail_recover
 
         messages = [
             {"role": "system", "content": "基础 system prompt\n" + ("规则说明" * 80)},
@@ -3118,7 +3118,7 @@ class AgentLoopContextPolicyTests(unittest.TestCase):
     def test_prepare_agent_context_persists_last_microcompact_at_from_pipeline(self) -> None:
         from app.context.auto_compact import AutoCompactResult
         from app.context.compactor import CompactionResult
-        from app.context.compactor_pipeline import ContextPipelineResult
+        from app.context.runtime import ContextPipelineResult
         from app.context.runtime import prepare_agent_context
         from app.context.state import load_context_state
 
