@@ -17,7 +17,7 @@ def log_event(
     message: str,
     log_file: str = DEFAULT_LOG_FILE,
     *,
-    echo: bool = True,
+    echo: bool = False,  # 改为默认 False，内部日志只写 debug.log，终端由 TUI 独占
 ) -> None:
     """
     记录一条日志。

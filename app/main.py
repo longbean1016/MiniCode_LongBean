@@ -1,13 +1,11 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import argparse
-import copy
-import time
 
 """命令行入口，负责启动会话、组装依赖并驱动整轮交互。"""
 
 from app.agent_loop import continue_agent_from_history, run_agent_once
-from app.background_worker import submit_background, wait_for_background_tasks
+from app.background_worker import wait_for_background_tasks
 from app.config import load_config
 from app.memory_decay import MemoryDecay
 from app.history_summarizer import OlderHistorySummarizer
@@ -32,8 +30,8 @@ from app.session import (
     load_session,
     save_session,
 )
-from app.turn_history import get_last_round_messages
 from app.tools import build_tool_registry
+from app.tui.app import MiniCodeApp
 from app.types import AgentStep, ChatMessage, ToolContext
 from app.working_memory import WorkingMemory
 
@@ -70,7 +68,7 @@ def _load_or_create_session(workspace: str, session_id: str, resume: str) -> Ses
     # 1. 显式指定 session_id
     # 2. --resume latest
     # 3. 新建
-    # 这样命令行行为始终可预测，不会因为“最近会话存在”就偷偷覆盖用户显式选择。
+    # 这样命令行行为始终可预测，不会因为"最近会话存在"就偷偷覆盖用户显式选择。
     if session_id:
         session = load_session(workspace, session_id)
         if session is None:
@@ -93,59 +91,13 @@ def _load_or_create_session(workspace: str, session_id: str, resume: str) -> Ses
     return session
 
 
-def _replace_pending_tool_result(
-    history: list[ChatMessage],
-    tool_use_id: str,
-    tool_name: str,
-    content: str,
-    is_error: bool,
-) -> list[ChatMessage]:
-    """按 tool_use_id 精确替换待授权的占位 tool_result。"""
-    updated_history: list[ChatMessage] = []
-    replaced = False
-
-    for msg in history:
-        # 只替换第一条匹配占位，避免历史里若存在重复残留时把多条结果一起污染。
-        if (
-            msg.get("role") == "tool_result"
-            and msg.get("tool_use_id") == tool_use_id
-            and not replaced
-        ):
-            updated_history.append(
-                {
-                    "role": "tool_result",
-                    "tool_use_id": tool_use_id,
-                    "tool_name": tool_name,
-                    "content": content,
-                    "is_error": is_error,
-                }
-            )
-            replaced = True
-            continue
-
-        updated_history.append(msg)
-
-    # 极端情况下没找到占位结果时，补一条真实结果，避免历史断链
-    if not replaced:
-        updated_history.append(
-            {
-                "role": "tool_result",
-                "tool_use_id": tool_use_id,
-                "tool_name": tool_name,
-                "content": content,
-                "is_error": is_error,
-            }
-        )
-
-    return updated_history
-
 def main() -> None:
-    """程序入口：加载配置、恢复会话、启动命令行对话循环。"""
+    """程序入口：加载配置、恢复会话、启动 TUI 终端交互。"""
     parser = _build_arg_parser()
     args = parser.parse_args()
 
     # 配置先加载，再组装所有依赖。
-    # main 的职责不是执行业务逻辑，而是把“模型 / 工具 / 记忆 / 会话”这些基础设施接起来。
+    # main 的职责不是执行业务逻辑，而是把"模型 / 工具 / 记忆 / 会话"这些基础设施接起来。
     config = load_config()
 
     if args.resume == "list":
@@ -170,7 +122,7 @@ def main() -> None:
         circuit_recovery_timeout_seconds=config.model_circuit_recovery_timeout_seconds,
     )  # type: ignore[arg-type]
 
-    # ToolContext 保存的是“工具运行时共享状态”，
+    # ToolContext 保存的是"工具运行时共享状态"，
     # 例如当前工作目录、已批准动作；它不是一次性参数，而是整场会话的执行上下文。
     tool_context = ToolContext(
         cwd=config.workspace_root,
@@ -218,7 +170,7 @@ def main() -> None:
                 f"[session=startup] 向量索引初始化收敛失败，已降级继续运行: {error}"
             )
 
-    # WorkingMemory 只承担“本次会话里近期要持续遵守/记住的事实”，
+    # WorkingMemory 只承担"本次会话里近期要持续遵守/记住的事实"，
     # 长期知识仍然交给 memory store / memory pipeline。
     working_memory = WorkingMemory()
 
@@ -297,163 +249,25 @@ def main() -> None:
 
     history: list[ChatMessage] = list(session.messages)
 
-    print("LongBean MiniCode Agent 已启动，输入 quit 或 exit 退出。")
+    # ---- TUI 模式：用 MiniCodeApp 接管终端 ----
+    # 所有业务依赖已在上方组装完成，直接注入 App 即可。
+    # MiniCodeApp.run() 会接管终端、渲染三区布局，
+    # 用户输入通过 InputArea Widget 驱动 stream_agent() 流式执行。
+    tui_app = MiniCodeApp(
+        model=model,
+        tool_registry=tool_registry,
+        tool_context=tool_context,
+        session=session,
+        working_memory=working_memory,
+        memory_pipeline=memory_pipeline,
+        history_summarizer=history_summarizer,
+    )
 
-    while True:
-        user_input = input("You> ").strip()
+    tui_app.run()
 
-        if not user_input:
-            continue
-
-        # 每轮开始先清空“只属于上一轮”的运行时痕迹，再写入本轮用户意图。
-        # 否则反思链路、失败上下文、短期任务状态会在多轮后互相污染。
-        memory_pipeline.reset_turn_runtime(working_memory)
-        memory_pipeline.remember_user_intent(working_memory, user_input)
-
-        if user_input.lower() in {"quit", "exit"}:
-            session.replace_messages(history)
-            save_session(session)
-            wait_for_background_tasks()
-            print("Bye!")
-            break
-
-        # 先处理显式命令型输入，如 /memory add。
-        # 这类输入本质上不是“问模型”，而是直接操作本地记忆系统，应该短路主 agent loop。
-        explicit_result = memory_pipeline.handle_explicit_input(
-            user_input=user_input,
-            session_id=session.session_id,
-            history=history,
-            decay_log_enabled=config.decay_log_enabled,
-            decay_log_echo=config.decay_log_echo,
-        )
-        if explicit_result.handled:
-            history = explicit_result.history
-            session.replace_messages(history)
-            save_session(session)
-            print(f"Agent> {explicit_result.assistant_text}")
-            continue
-
-        # 常规自然语言输入才进入主 agent loop。
-        # run_agent_once 会负责拼装 prompt、调用模型、执行低风险工具，并返回新的 history。
-        step, history = run_agent_once(
-            user_input=user_input,
-            model=model,
-            tool_registry=tool_registry,
-            tool_context=tool_context,
-            session=session,
-            working_memory=working_memory,
-            memory_pipeline=memory_pipeline,
-            history_summarizer=history_summarizer,
-            history=history,
-            session_id=session.session_id,
-        )
-
-        if step.type == "approval" and step.approval is not None:
-            # 高风险工具不会直接执行，而是先把“待批准占位结果”写进历史，交给用户确认。
-            print(step.approval.message)
-            answer = input("是否允许本次执行？(y/n)> ").strip().lower()
-
-            if answer == "y":
-                # 同一会话里同一条高风险动作后续可直接放行
-                tool_context.approved_actions.add(step.approval.action_key)
-
-                # 批准后直接执行待授权工具，不重新问模型。
-                # 否则模型可能在批准前后生成不同 tool_call，导致用户批准的并不是最终执行的那次动作。
-                result = tool_registry.execute_tool(
-                    tool_name=step.approval.tool_name,
-                    input_data=step.approval.input_data,
-                    context=tool_context,
-                )
-
-                memory_pipeline.record_tool_call(
-                    working_memory,
-                    tool_name=step.approval.tool_name,
-                    tool_input=step.approval.input_data,
-                )
-                if not result.ok:
-                    memory_pipeline.record_tool_failure(
-                        working_memory,
-                        tool_name=step.approval.tool_name,
-                        result=result,
-                    )
-
-                approved_history = _replace_pending_tool_result(
-                    history=history,
-                    tool_use_id=step.approval.tool_use_id,
-                    tool_name=step.approval.tool_name,
-                    content=result.output,
-                    is_error=not result.ok,
-                )
-
-                # 把真实 tool_result 写回历史后，再继续主循环。
-                # 这样模型下一步看到的是“已经执行完的事实”，而不是一条脱节的批准结果。
-                step, history = continue_agent_from_history(
-                    history=approved_history,
-                    model=model,
-                    tool_registry=tool_registry,
-                    tool_context=tool_context,
-                    session=session,
-                    working_memory=working_memory,
-                    memory_pipeline=memory_pipeline,
-                    history_summarizer=history_summarizer,
-                    session_id=session.session_id,
-                )
-            else:
-                # 记录一次授权拒绝，提醒后续模型不要默认继续危险操作
-                working_memory.protect(
-                    "用户拒绝了高风险操作授权",
-                    entry_type="error_context",
-                    ttl_seconds=1800,
-                    importance=0.9,
-                )
-                print("Agent> 用户已拒绝此次高风险操作。")
-                continue
-
-        if step.type == "assistant":
-            # finalize_turn 可能触发长期记忆抽取、验证和持久化，耗时会直接阻塞
-            # Agent> 输出。这里先拷贝本轮快照，再交给后台顺序执行。
-            finalize_task_description = user_input
-            finalize_step = copy.deepcopy(step)
-            finalize_turn_messages = copy.deepcopy(get_last_round_messages(history))
-            finalize_session_id = session.session_id
-            finalize_working_memory = copy.deepcopy(working_memory)
-            finalize_decay_log_enabled = config.decay_log_enabled
-            finalize_decay_log_echo = config.decay_log_echo
-
-            def _finalize_turn_background() -> None:
-                started_at = time.perf_counter()
-                try:
-                    memory_pipeline.finalize_turn(
-                        task_description=finalize_task_description,
-                        final_step=finalize_step,
-                        turn_messages=finalize_turn_messages,
-                        session_id=finalize_session_id,
-                        working_memory=finalize_working_memory,
-                        decay_log_enabled=finalize_decay_log_enabled,
-                        decay_log_echo=finalize_decay_log_echo,
-                    )
-                    elapsed = time.perf_counter() - started_at
-                    log_event(
-                        f"[session={finalize_session_id}] 长期记忆后台写入完成 耗时={elapsed:.3f}s",
-                        echo=False,
-                    )
-                except Exception as error:
-                    log_event(
-                        f"[session={finalize_session_id}] 长期记忆后台写入失败: {error}",
-                        echo=False,
-                    )
-
-            submit_background(
-                _finalize_turn_background,
-                name="finalize_turn",
-            )
-
-        # 每轮末尾都把最新 history 落回 session，再持久化到磁盘。
-        # 这样即使下一轮或下次启动中断，也能从最近一次完成态恢复。
-        session.replace_messages(history)
-        save_session(session)
-
-        print(f"Agent> {step.content}")
+    # TUI 退出后会回到这里（exit/quit 命令或 Ctrl+C）
+    wait_for_background_tasks()
+    print("Bye!")
 
 
 if __name__ == "__main__":

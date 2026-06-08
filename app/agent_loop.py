@@ -34,6 +34,17 @@ from app.message_builder import MessageBuilder
 from app.session import SessionData
 from app.tooling import ToolRegistry
 from app.types import AgentStep, ApprovalRequest, ChatMessage, ModelAdapter, ToolContext, ToolResult
+from app.tui.events import (
+    AgentEvent,
+    ApprovalEvent,
+    DoneEvent,
+    ErrorEvent,
+    TextEvent,
+    ThinkingEvent,
+    ToolCallEvent,
+    ToolResultEvent,
+    ToolRunningEvent,
+)
 from app.working_memory import WorkingMemory
 from app.working_memory_updater import (
     extract_active_paths,
@@ -820,3 +831,384 @@ def _run_agent_loop(
     )
     builder.add_assistant(fallback.content)
     return fallback, builder.build()
+
+
+def stream_agent(
+    user_input: str,
+    model: object,  # OpenAIModelAdapter，避免循环依赖不写类型注解
+    tool_registry: object,  # ToolRegistry
+    tool_context: object,  # ToolContext
+    session: object,  # SessionData
+    working_memory: object,  # WorkingMemory
+    memory_pipeline: object | None,  # MemoryPipeline | None
+    history_summarizer: object | None,  # OlderHistorySummarizer | None
+    history: list | None,  # list[ChatMessage] | None
+    max_steps: int = 20,  # 最大循环步数，防止死循环
+    session_id: str = "",  # 当前会话 ID
+) -> object:  # Generator[AgentEvent, None, None]
+    """流式执行一轮 Agent 请求。
+
+    与 run_agent_once 使用相同的底层逻辑（prepare_agent_context、工具执行），
+    但通过 stream_chat 把模型输出拆成流式 AgentEvent 逐条 yield，
+    而不是等所有步骤完成后一次性返回。
+
+    调用方用 for event in stream_agent(...) 消费事件流：
+        for event in stream_agent(...):
+            if isinstance(event, ThinkingEvent): ...
+            elif isinstance(event, TextEvent): ...
+            ...
+
+    中文注释：这个函数是 TUI 改造的核心——把原来阻塞式的
+    "调模型 → 等全部结果 → print" 流程改为
+    "调模型 → 边出边 yield → TUI 边收边渲染" 的流式流水线。
+    """
+    import json
+
+    from app.context_reactive_compact import (
+        is_context_overflow_error,
+        recover_from_context_overflow,
+    )
+    from app.context_runtime import (
+        prepare_agent_context,
+        persist_post_response_working_memory_state,
+    )
+    from app.message_builder import MessageBuilder
+    from app.model_registry import OpenAIModelAdapter
+    from app.types import (
+        AgentStep,
+        ApprovalRequest,
+        ChatMessage,
+        ToolContext,
+        ToolResult,
+    )
+
+    # 没有历史时用空列表兜底
+    if history is None:
+        history = []
+
+    # 用 MessageBuilder 统一管理本轮消息
+    builder = MessageBuilder()
+    builder.extend(history)
+    builder.add_user(user_input)
+
+    loop_started_at = time.perf_counter()
+    pending_user_nudge: str | None = None
+
+    log_event(
+        f"[session={session_id or '-'}] 开始一轮 Agent 流式请求",
+        echo=False,
+    )
+
+    # 主循环：每轮 = 准备上下文 → 流式调模型 → 处理工具调用
+    for step_index in range(max_steps):
+        step_started_at = time.perf_counter()
+
+        log_event(
+            f"[session={session_id or '-'}] 第 {step_index + 1} 轮循环开始",
+            echo=False,
+        )
+
+        # ---- 第一步：准备上下文窗口 ----
+        yield ThinkingEvent("正在分析请求并准备上下文...")
+
+        context_started_at = time.perf_counter()
+        prepared_context = prepare_agent_context(
+            full_history=list(builder.build()),
+            session=session,
+            tool_registry=tool_registry,
+            working_memory=working_memory,
+            memory_pipeline=memory_pipeline,
+            history_summarizer=history_summarizer,
+        )
+        context_cost = time.perf_counter() - context_started_at
+
+        # 上下文统计日志只写文件，不在终端显示
+        log_event(
+            f"[session={session_id or '-'}] 第 {step_index + 1} 轮 token统计: "
+            f"total={prepared_context.stats.total_tokens} "
+            f"usage={prepared_context.stats.usage_ratio:.1%} "
+            f"budget={prepared_context.stats.usable_budget} "
+            f"recent={prepared_context.stats.recent_tokens}",
+            echo=False,
+        )
+
+        messages = _append_transient_user_nudge(
+            prepared_context.messages,
+            pending_user_nudge,
+        )
+        if pending_user_nudge:
+            pending_user_nudge = None
+
+        # ---- 第二步：流式调模型 ----
+        yield ThinkingEvent("正在等待模型响应...")
+
+        # 收集流式结果的缓冲区
+        collected_text = ""  # 累积的文本回答
+        tool_calls_buf: dict[int, dict] = {}  # tool_index → {id, name, args_str}
+
+        model_started_at = time.perf_counter()
+        try:
+            # 逐 chunk 消费模型的流式输出
+            for chunk in model.stream_chat(messages=messages):
+                if chunk.type == "text":
+                    # 文本片段 → 累积到 collected_text 并实时 yield
+                    collected_text += chunk.text
+                    yield TextEvent(text=chunk.text)
+
+                elif chunk.type == "tool_call_name":
+                    # 工具调用第一块：包含 id 和函数名
+                    idx = chunk.tool_index
+                    if idx not in tool_calls_buf:
+                        tool_calls_buf[idx] = {"id": "", "name": "", "args_str": ""}
+                    tool_calls_buf[idx]["id"] = chunk.tool_id
+                    tool_calls_buf[idx]["name"] = chunk.text
+                    # 解析出工具名时立即通知 UI
+                    yield ToolCallEvent(name=chunk.text, args={})
+
+                elif chunk.type == "tool_call_args":
+                    # 工具调用后续块：arguments JSON 增量片段
+                    idx = chunk.tool_index
+                    if idx not in tool_calls_buf:
+                        tool_calls_buf[idx] = {"id": "", "name": "", "args_str": ""}
+                    tool_calls_buf[idx]["args_str"] += chunk.text
+
+            model_cost = time.perf_counter() - model_started_at
+
+        except Exception as error:
+            # 模型调用失败
+            if is_context_overflow_error(error):
+                # 尝试上下文溢出恢复
+                recovery_result = recover_from_context_overflow(
+                    messages=messages,
+                    usable_budget=prepared_context.stats.usable_budget,
+                )
+                if recovery_result.recovered:
+                    log_event(
+                        f"[session={session_id or '-'}] 第 {step_index + 1} 轮触发上下文溢出自动恢复",
+                        echo=False,
+                    )
+                    yield ErrorEvent(
+                        message="上下文溢出，已自动压缩后重试。"
+                    )
+                    continue
+
+            log_event(
+                f"[session={session_id or '-'}] 第 {step_index + 1} 轮模型调用异常: {error}",
+                echo=False,
+            )
+            yield ErrorEvent(message=f"模型调用失败: {error}")
+            # 兜底：返回错误信息
+            fallback = AgentStep(
+                type="assistant",
+                content=f"模型调用失败: {error}",
+                kind="final",
+            )
+            builder.add_assistant(fallback.content)
+            yield DoneEvent(step=fallback, history=builder.build())
+            return
+
+        # ---- 第三步：处理工具调用 ----
+        if tool_calls_buf:
+            # 把收集到的流式工具调用片段组装成完整 ToolCall
+            calls = []
+            for idx in sorted(tool_calls_buf.keys()):
+                info = tool_calls_buf[idx]
+                tool_name = info["name"]
+                tool_use_id = info["id"]
+                args_str = info["args_str"]
+
+                # 安全解析 JSON 参数
+                try:
+                    parsed_input = json.loads(args_str) if args_str.strip() else {}
+                except json.JSONDecodeError:
+                    parsed_input = {}
+
+                calls.append({
+                    "tool_name": tool_name,
+                    "input": parsed_input,
+                    "id": tool_use_id,
+                })
+
+            # 逐个执行工具
+            for call in calls:
+                tool_name = call["tool_name"]
+                tool_input = call["input"]
+                tool_use_id = call["id"]
+
+                # 通知 UI：工具开始执行
+                yield ToolRunningEvent(name=tool_name)
+
+                # 记录到短期工作记忆
+                if memory_pipeline is not None:
+                    memory_pipeline.record_tool_call(
+                        working_memory,
+                        tool_name=tool_name,
+                        tool_input=tool_input,
+                    )
+
+                # 把工具调用请求写入消息历史
+                builder.add_tool_call(
+                    tool_use_id=tool_use_id,
+                    tool_name=tool_name,
+                    input_data=tool_input,
+                )
+
+                # 执行工具
+                tool_started_at = time.perf_counter()
+                try:
+                    result = tool_registry.execute_tool(
+                        tool_name=tool_name,
+                        input_data=tool_input,
+                        context=tool_context,
+                    )
+                except Exception as tool_error:
+                    tool_cost = time.perf_counter() - tool_started_at
+                    log_event(
+                        f"[session={session_id or '-'}] 工具 {tool_name} 执行异常: {tool_error} "
+                        f"耗时={tool_cost:.3f}s",
+                        echo=False,
+                    )
+                    result = ToolResult(
+                        ok=False,
+                        output=f"工具调用发生未捕获异常: {tool_error}",
+                        error="UNCAUGHT_TOOL_ERROR",
+                        meta={"tool_name": tool_name},
+                    )
+
+                tool_cost = time.perf_counter() - tool_started_at
+                log_event(
+                    f"[session={session_id or '-'}] 工具 {tool_name} "
+                    f"返回 ok={result.ok} error={result.error} 耗时={tool_cost:.3f}s",
+                    echo=False,
+                )
+
+                # 构造工具结果摘要，通知 UI
+                output_len = len(str(result.output))
+                status_text = "完成" if result.ok else "失败"
+                summary = f"{status_text} ({output_len} 字符)"
+                if result.error:
+                    summary += f" — {result.error}"
+
+                yield ToolResultEvent(
+                    name=tool_name,
+                    summary=summary,
+                    ok=result.ok,
+                )
+
+                # ---- 权限检查：高风险操作需要用户授权 ----
+                if result.error == "PERMISSION_REQUIRED":
+                    command = str(result.meta.get("command", ""))
+                    reason = str(result.meta.get("reason", ""))
+                    action_key = str(result.meta.get("action_key", ""))
+
+                    # 写入占位 tool_result，保证消息协议完整
+                    builder.add_tool_result(
+                        tool_use_id=tool_use_id,
+                        tool_name=tool_name,
+                        content="该操作需要用户授权，当前尚未执行。",
+                        is_error=True,
+                        meta=dict(result.meta),
+                    )
+
+                    approval_message = (
+                        "该操作需要用户授权。\n"
+                        f"工具: {tool_name}\n"
+                        f"命令: {command}\n"
+                        f"原因: {reason}"
+                    )
+
+                    approval_step = AgentStep(
+                        type="approval",
+                        content=approval_message,
+                        approval=ApprovalRequest(
+                            tool_name=tool_name,
+                            tool_use_id=tool_use_id,
+                            action_key=action_key,
+                            message=approval_message,
+                            input_data=tool_input,
+                        ),
+                    )
+                    # 把审批请求推送给 UI，暂停等待用户确认
+                    yield ApprovalEvent(approval=approval_step.approval)
+                    yield DoneEvent(step=approval_step, history=builder.build())
+                    return
+
+                # 正常情况：把工具结果写回消息历史
+                context_output = result.meta.get("context_output", result.output)
+                if not isinstance(context_output, str) or not context_output.strip():
+                    context_output = result.output
+                builder.add_tool_result(
+                    tool_use_id=tool_use_id,
+                    tool_name=tool_name,
+                    content=context_output,
+                    is_error=not result.ok,
+                    meta=dict(result.meta),
+                )
+
+                # 工具失败时记录到短期工作记忆
+                if not result.ok:
+                    if memory_pipeline is not None:
+                        memory_pipeline.record_tool_failure(
+                            working_memory,
+                            tool_name=tool_name,
+                            result=result,
+                        )
+
+            # 工具阶段结束，继续下一轮循环
+            step_cost = time.perf_counter() - step_started_at
+            log_event(
+                f"[session={session_id or '-'}] 第 {step_index + 1} 轮工具阶段结束 "
+                f"step耗时={step_cost:.3f}s context={context_cost:.3f}s "
+                f"model={model_cost:.3f}s",
+                echo=False,
+            )
+            continue
+
+        # ---- 第四步：返回最终回答 ----
+        if collected_text.strip():
+            # 把流式收集到的文本写入历史
+            builder.add_assistant(collected_text)
+
+            # 记录到工作记忆
+            if memory_pipeline is not None:
+                memory_pipeline.record_assistant_reply(
+                    working_memory,
+                    content=collected_text,
+                )
+
+            # 持久化工作记忆状态
+            persist_post_response_working_memory_state(
+                session=session,
+                working_memory=working_memory,
+            )
+
+        step = AgentStep(
+            type="assistant",
+            content=collected_text,
+            kind="final",
+        )
+        step_cost = time.perf_counter() - step_started_at
+        total_cost = time.perf_counter() - loop_started_at
+        log_event(
+            f"[session={session_id or '-'}] 第 {step_index + 1} 轮流式回答完成 "
+            f"step耗时={step_cost:.3f}s context={context_cost:.3f}s "
+            f"model={model_cost:.3f}s 总耗时={total_cost:.3f}s",
+            echo=False,
+        )
+        yield DoneEvent(step=step, history=builder.build())
+        return
+
+    # 达到最大步数时停止，防止死循环
+    total_cost = time.perf_counter() - loop_started_at
+    log_event(
+        f"[session={session_id or '-'}] 达到最大循环步数 {max_steps} "
+        f"总耗时={total_cost:.3f}s",
+        echo=False,
+    )
+    fallback = AgentStep(
+        type="assistant",
+        content="已达到最大循环步数，本轮已停止。",
+        kind="final",
+    )
+    builder.add_assistant(fallback.content)
+    yield DoneEvent(step=fallback, history=builder.build())
