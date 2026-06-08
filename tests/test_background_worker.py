@@ -1,9 +1,9 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import threading
 import unittest
 
-from app.background_worker import submit_background, wait_for_background_tasks
+from app.infra.background_worker import submit_background, wait_for_background_tasks
 
 
 class BackgroundWorkerTests(unittest.TestCase):

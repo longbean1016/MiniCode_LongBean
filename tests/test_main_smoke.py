@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import io
 import sys
@@ -8,9 +8,9 @@ from contextlib import redirect_stdout
 from unittest.mock import patch
 
 import app.main as main_module
-from app.memory_decay import DecayRunResult
-from app.memory_store import JsonMemoryStore, MemoryEntry, create_memory_entry
-from app.memory_write_pipeline import MemoryWritePipeline
+from app.memory.decay import DecayRunResult
+from app.memory.store import JsonMemoryStore, MemoryEntry, create_memory_entry
+from app.memory.write_pipeline import MemoryWritePipeline
 from app.types import AgentStep, AppConfig, ToolResult
 
 

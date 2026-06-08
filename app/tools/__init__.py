@@ -1,6 +1,6 @@
-"""工具装配入口，负责把各个内置工具注册到统一注册表。"""
+﻿"""工具装配入口，负责把各个内置工具注册到统一注册表。"""
 
-from app.tooling import ToolRegistry
+from app.agent.tooling import ToolRegistry
 from app.tools.codebase_map import codebase_map_tool
 from app.tools.edit_file import edit_file_tool
 from app.tools.file_overview import file_overview_tool

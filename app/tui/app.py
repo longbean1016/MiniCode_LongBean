@@ -1,4 +1,4 @@
-"""MiniCode TUI 主 App — 组装 Widget、连接 Agent 事件流、管理工作线程。
+﻿"""MiniCode TUI 主 App — 组装 Widget、连接 Agent 事件流、管理工作线程。
 
 MiniCodeApp 是三部分的中枢：
 1. compose() 组装 Header / Conversation / InputArea 三个 Widget
@@ -17,7 +17,7 @@ import time
 
 from textual.app import App, ComposeResult
 
-from app.agent_loop import stream_agent
+from app.agent.loop import stream_agent
 from app.tui.events import (
     ApprovalEvent,
     DoneEvent,
@@ -204,12 +204,12 @@ class MiniCodeApp(App):
         2. 持久化到磁盘
         3. 等待后台任务完成
         """
-        from app.session import save_session
+        from app.state.session import save_session
 
         if self._session is not None:
             self._session.replace_messages(self._history)
             save_session(self._session)
-        from app.background_worker import wait_for_background_tasks
+        from app.infra.background_worker import wait_for_background_tasks
 
         wait_for_background_tasks()
         self.exit()
@@ -329,12 +329,12 @@ class MiniCodeApp(App):
         3. 等待后台任务（长期记忆写入等）完成
         4. 调用 self.exit() 退出 Textual App
         """
-        from app.session import save_session
+        from app.state.session import save_session
 
         if self._session is not None:
             self._session.replace_messages(self._history)
             save_session(self._session)
-        from app.background_worker import wait_for_background_tasks
+        from app.infra.background_worker import wait_for_background_tasks
 
         wait_for_background_tasks()
         self.exit()
@@ -486,7 +486,7 @@ class MiniCodeApp(App):
 
                         # 更新 Header token 显示
                         try:
-                            from app.context_manager import (
+                            from app.context.manager import (
                                 DEFAULT_USABLE_CONTEXT_BUDGET,
                                 estimate_messages_tokens,
                             )
@@ -517,8 +517,8 @@ class MiniCodeApp(App):
                 self.call_from_thread(self.input_area.enable_input)
 
                 # ---- 后台写入长期记忆 ----
-                from app.background_worker import submit_background
-                from app.turn_history import get_last_round_messages
+                from app.infra.background_worker import submit_background
+                from app.state.turn_history import get_last_round_messages
 
                 finalize_task_description = user_input or ""
                 finalize_session_id = (
@@ -562,7 +562,7 @@ class MiniCodeApp(App):
                 submit_background(_finalize_turn_background, name="finalize_turn")
 
                 # ---- 持久化会话 ----
-                from app.session import save_session
+                from app.state.session import save_session
                 if self._session is not None:
                     self._session.replace_messages(self._history)
                     save_session(self._session)

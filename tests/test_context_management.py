@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import tempfile
 import time
@@ -6,14 +6,14 @@ import unittest
 from dataclasses import dataclass
 from unittest.mock import patch
 
-import app.agent_loop as agent_loop_module
-import app.context_manager as context_manager_module
-from app.context_compactor import compact_recent_messages
-from app.agent_loop import run_agent_once
-from app.memory_models import MemoryContextResult
-from app.session import create_new_session
+import app.agent.loop as agent_loop_module
+import app.context.manager as context_manager_module
+from app.context.compactor import compact_recent_messages
+from app.agent.loop import run_agent_once
+from app.memory.models import MemoryContextResult
+from app.state.session import create_new_session
 from app.types import AgentStep, ToolContext, ToolResult
-from app.working_memory import WorkingMemory
+from app.state.working_memory import WorkingMemory
 
 
 class ContextManagerTests(unittest.TestCase):
@@ -790,19 +790,19 @@ class ContextManagerTests(unittest.TestCase):
             )
 
     def test_default_usable_context_budget_matches_minicode_style_default(self) -> None:
-        from app.context_manager import DEFAULT_USABLE_CONTEXT_BUDGET
+        from app.context.manager import DEFAULT_USABLE_CONTEXT_BUDGET
 
         self.assertEqual(DEFAULT_USABLE_CONTEXT_BUDGET, 128_000)
 
     def test_estimate_tokens_uses_minicode_style_chinese_and_english_rules(self) -> None:
-        from app.context_manager import estimate_tokens
+        from app.context.manager import estimate_tokens
 
         self.assertEqual(estimate_tokens("你好"), 1)
         self.assertEqual(estimate_tokens("hello"), 1)
         self.assertEqual(estimate_tokens("你好hello"), 2)
 
     def test_collect_context_stats_reports_total_and_usage_ratio(self) -> None:
-        from app.context_manager import collect_context_stats
+        from app.context.manager import collect_context_stats
 
         stats = collect_context_stats(
             system_prompt="系统提示",
@@ -820,7 +820,7 @@ class ContextManagerTests(unittest.TestCase):
         self.assertEqual(stats.message_count, 3)
 
     def test_decide_context_policy_shrinks_budget_when_usage_ratio_is_high(self) -> None:
-        from app.context_manager import ContextStats, decide_context_policy
+        from app.context.manager import ContextStats, decide_context_policy
 
         stats = ContextStats(
             usable_budget=100,
@@ -842,7 +842,7 @@ class ContextManagerTests(unittest.TestCase):
         self.assertLessEqual(policy.memory_item_chars, 80)
 
     def test_user_profile_loader_parses_user_md_into_resolved_preferences(self) -> None:
-        from app.user_profile import load_user_profile
+        from app.state.user_profile import load_user_profile
 
         with tempfile.TemporaryDirectory() as tmpdir:
             user_md_path = f"{tmpdir}\\USER.md"
@@ -869,7 +869,7 @@ class ContextManagerTests(unittest.TestCase):
             self.assertIn("尽量最小改动", profile.to_preference_lines())
 
     def test_user_profile_loader_parses_identity_and_preference_instruction_sections(self) -> None:
-        from app.user_profile import load_user_profile
+        from app.state.user_profile import load_user_profile
 
         with tempfile.TemporaryDirectory() as tmpdir:
             user_md_path = f"{tmpdir}\\USER.md"
@@ -902,7 +902,7 @@ class ContextManagerTests(unittest.TestCase):
             self.assertNotIn("我给你取名字为小多", policy.global_preferences)
 
     def test_user_profile_loader_accepts_loose_manual_text_in_user_md(self) -> None:
-        from app.user_profile import load_user_profile
+        from app.state.user_profile import load_user_profile
 
         with tempfile.TemporaryDirectory() as tmpdir:
             user_md_path = f"{tmpdir}\\USER.md"
@@ -922,7 +922,7 @@ class ContextManagerTests(unittest.TestCase):
             self.assertIn("修改代码时加中文注释", profile.to_preference_lines())
 
     def test_user_profile_loader_builds_structured_policy_from_loose_manual_text(self) -> None:
-        from app.user_profile import load_user_profile
+        from app.state.user_profile import load_user_profile
 
         with tempfile.TemporaryDirectory() as tmpdir:
             user_md_path = f"{tmpdir}\\USER.md"
@@ -953,7 +953,7 @@ class ContextManagerTests(unittest.TestCase):
             )
 
     def test_user_profile_loader_keeps_section_content_isolated(self) -> None:
-        from app.user_profile import load_user_profile
+        from app.state.user_profile import load_user_profile
 
         with tempfile.TemporaryDirectory() as tmpdir:
             user_md_path = f"{tmpdir}\\USER.md"
@@ -983,7 +983,7 @@ class ContextManagerTests(unittest.TestCase):
             self.assertNotIn("在tmp目录新建的代码不用帮我测试", profile.preference_instructions)
 
     def test_split_instruction_lines_uses_different_limits_for_different_categories(self) -> None:
-        from app.user_profile import UserProfileSnapshot
+        from app.state.user_profile import UserProfileSnapshot
 
         profile = UserProfileSnapshot(
             identity_instructions="\n".join(f"- 身份{i}" for i in range(1, 10)),
@@ -1005,7 +1005,7 @@ class ContextManagerTests(unittest.TestCase):
 
 class ContextCompactorTests(unittest.TestCase):
     def test_compactor_keeps_raw_tool_evidence_when_budget_already_safe(self) -> None:
-        from app.context_compactor import compact_recent_messages
+        from app.context.compactor import compact_recent_messages
 
         messages = [
             {"role": "assistant_tool_call", "tool_use_id": "call-1", "tool_name": "read_file", "input": {"path": "app/old.py"}},
@@ -1038,7 +1038,7 @@ class ContextCompactorTests(unittest.TestCase):
         )
 
     def test_compactor_truncates_large_tool_results_without_semantic_tool_pair_folding(self) -> None:
-        from app.context_compactor import compact_recent_messages
+        from app.context.compactor import compact_recent_messages
 
         messages = [
             {"role": "user", "content": "开始任务"},
@@ -1067,7 +1067,7 @@ class ContextCompactorTests(unittest.TestCase):
         self.assertEqual(recent_tool_results[-1]["meta"]["path"], "app/d.py")
 
     def test_compactor_keeps_recent_tool_call_pair_for_protected_tool_result(self) -> None:
-        from app.context_compactor import compact_recent_messages
+        from app.context.compactor import compact_recent_messages
 
         messages = [
             {"role": "assistant_tool_call", "tool_use_id": "call-1", "tool_name": "read_file", "input": {"path": "app/old.py"}},
@@ -1100,7 +1100,7 @@ class ContextCompactorTests(unittest.TestCase):
         self.assertFalse(any(message.get("_semantic_tool_summary") for message in result.messages))
 
     def test_compactor_drops_assistant_progress_before_model_call(self) -> None:
-        from app.context_compactor import compact_recent_messages
+        from app.context.compactor import compact_recent_messages
 
         messages = [
             {"role": "user", "content": "分析 main.py"},
@@ -1119,7 +1119,7 @@ class ContextCompactorTests(unittest.TestCase):
         self.assertFalse(any(message.get("role") == "assistant_progress" for message in result.messages))
 
     def test_compactor_persists_large_tool_result_and_replaces_with_line_preview(self) -> None:
-        from app.context_compactor import compact_recent_messages
+        from app.context.compactor import compact_recent_messages
 
         with tempfile.TemporaryDirectory() as tmpdir:
             content_lines = [f"line-{index}" for index in range(1, 21)]
@@ -1157,7 +1157,7 @@ class ContextCompactorTests(unittest.TestCase):
             self.assertIn(tool_content, persisted_text)
 
     def test_compactor_prefers_raw_output_when_persisting_tool_result(self) -> None:
-        from app.context_compactor import compact_recent_messages
+        from app.context.compactor import compact_recent_messages
 
         with tempfile.TemporaryDirectory() as tmpdir:
             raw_output = "\n".join(f"raw-line-{index}" for index in range(1, 30))
@@ -1185,7 +1185,7 @@ class ContextCompactorTests(unittest.TestCase):
             self.assertNotIn("summary only", persisted_text.split("---CONTENT---", 1)[1])
 
     def test_compactor_dedups_same_read_file_when_path_and_content_hash_match(self) -> None:
-        from app.context_compactor import compact_recent_messages
+        from app.context.compactor import compact_recent_messages
 
         shared_content = "\n".join(
             [
@@ -1224,7 +1224,7 @@ class ContextCompactorTests(unittest.TestCase):
         self.assertEqual(result.messages[1]["content"], shared_content)
 
     def test_compactor_keeps_read_file_when_same_path_but_content_changed(self) -> None:
-        from app.context_compactor import compact_recent_messages
+        from app.context.compactor import compact_recent_messages
 
         messages = [
             {
@@ -1252,7 +1252,7 @@ class ContextCompactorTests(unittest.TestCase):
         self.assertEqual(result.messages[1]["content"], messages[1]["content"])
 
     def test_compactor_dedups_semantically_equivalent_list_files_results(self) -> None:
-        from app.context_compactor import compact_recent_messages
+        from app.context.compactor import compact_recent_messages
 
         list_output = (
             "ROOT: app\n"
@@ -1281,7 +1281,7 @@ class ContextCompactorTests(unittest.TestCase):
         self.assertEqual(result.messages[1]["content"], list_output)
 
     def test_compactor_filters_empty_success_tool_results_and_duplicate_assistant_replies(self) -> None:
-        from app.context_compactor import compact_recent_messages
+        from app.context.compactor import compact_recent_messages
 
         messages = [
             {"role": "tool_result", "tool_name": "write_file", "content": "文件写入成功"},
@@ -1304,7 +1304,7 @@ class ContextCompactorTests(unittest.TestCase):
         self.assertEqual(len(assistant_messages), 1)
 
     def test_compactor_drops_old_low_priority_messages_when_still_over_target(self) -> None:
-        from app.context_compactor import compact_recent_messages
+        from app.context.compactor import compact_recent_messages
 
         messages = [
             {"role": "user", "content": "分析 main.py 串联链路"},
@@ -1343,7 +1343,7 @@ class ContextCompactorTests(unittest.TestCase):
         )
 
     def test_context_pipeline_runs_lightweight_tool_budget_before_threshold(self) -> None:
-        from app.context_compactor_pipeline import ContextCompactorPipeline
+        from app.context.compactor_pipeline import ContextCompactorPipeline
 
         with tempfile.TemporaryDirectory() as tmpdir:
             pipeline = ContextCompactorPipeline()
@@ -1370,7 +1370,7 @@ class ContextCompactorTests(unittest.TestCase):
             )
 
     def test_context_pipeline_microcompacts_old_tool_results_without_breaking_recent_pair(self) -> None:
-        from app.context_compactor_pipeline import ContextCompactorPipeline
+        from app.context.compactor_pipeline import ContextCompactorPipeline
 
         pipeline = ContextCompactorPipeline()
         messages = [
@@ -1427,7 +1427,7 @@ class ContextCompactorTests(unittest.TestCase):
         )
 
     def test_context_pipeline_microcompact_respects_time_cooldown(self) -> None:
-        from app.context_compactor_pipeline import ContextCompactorPipeline
+        from app.context.compactor_pipeline import ContextCompactorPipeline
 
         pipeline = ContextCompactorPipeline()
         messages = [
@@ -1460,7 +1460,7 @@ class ContextCompactorTests(unittest.TestCase):
         )
 
     def test_microcompact_uses_lightweight_model_to_carry_removed_tool_findings(self) -> None:
-        from app.context_compactor_pipeline import ContextCompactorPipeline
+        from app.context.compactor_pipeline import ContextCompactorPipeline
 
         class _FakeSummarizer:
             def __init__(self) -> None:
@@ -1508,7 +1508,7 @@ class ContextCompactorTests(unittest.TestCase):
         self.assertIn("microcompact 只清正文，不折叠工具协议", result.compaction_result.carried_key_decisions)
 
     def test_context_pipeline_microcompact_reports_below_threshold_reason(self) -> None:
-        from app.context_compactor_pipeline import ContextCompactorPipeline
+        from app.context.compactor_pipeline import ContextCompactorPipeline
 
         pipeline = ContextCompactorPipeline()
         messages = [{"role": "user", "content": "继续分析"}]
@@ -1557,7 +1557,7 @@ class ContextCompactorTests(unittest.TestCase):
         )
 
     def test_context_pipeline_microcompact_matches_minicode_time_based_policy(self) -> None:
-        from app.context_compactor_pipeline import ContextCompactorPipeline
+        from app.context.compactor_pipeline import ContextCompactorPipeline
 
         pipeline = ContextCompactorPipeline()
         messages = [{"role": "user", "content": "继续分析最近读取结果"}]
@@ -1603,7 +1603,7 @@ class ContextCompactorTests(unittest.TestCase):
         )
 
     def test_prepare_agent_context_promotes_microcompacted_tool_findings_into_working_memory(self) -> None:
-        from app.context_runtime import prepare_agent_context
+        from app.context.runtime import prepare_agent_context
 
         class _FakeSummarizer:
             def summarize(self, **_: object) -> str:
@@ -1779,7 +1779,7 @@ class AgentLoopContextPolicyTests(unittest.TestCase):
                 {"role": "tool_result", "tool_name": "read_file", "content": long_tool_result},
             ]
 
-            with patch("app.agent_loop.log_event") as mock_log_event:
+            with patch("app.agent.loop.log_event") as mock_log_event:
                 step, next_history = run_agent_once(
                     user_input="继续分析并总结",
                     model=model,
@@ -1839,8 +1839,8 @@ class AgentLoopContextPolicyTests(unittest.TestCase):
             self.assertEqual(session.extra["compaction_level"], 3)
 
     def test_prepare_agent_context_persists_active_context_state(self) -> None:
-        from app.context_runtime import prepare_agent_context
-        from app.context_state import load_context_state
+        from app.context.runtime import prepare_agent_context
+        from app.context.state import load_context_state
 
         with tempfile.TemporaryDirectory() as tmpdir:
             with open(f"{tmpdir}\\USER.md", "w", encoding="utf-8") as handle:
@@ -1883,12 +1883,12 @@ class AgentLoopContextPolicyTests(unittest.TestCase):
             self.assertIn("默认使用中文回答", state.resolved_user_preferences)
 
     def test_prepare_agent_context_resolves_project_constraints_from_project_memory(self) -> None:
-        from app.context_runtime import prepare_agent_context
-        from app.context_state import load_context_state
-        from app.memory_read_pipeline import MemoryReadPipeline
-        from app.memory_store import JsonMemoryStore, create_memory_entry
-        from app.memory_write_pipeline import MemoryWritePipeline
-        from app.memory_pipeline import MemoryPipeline
+        from app.context.runtime import prepare_agent_context
+        from app.context.state import load_context_state
+        from app.memory.read_pipeline import MemoryReadPipeline
+        from app.memory.store import JsonMemoryStore, create_memory_entry
+        from app.memory.write_pipeline import MemoryWritePipeline
+        from app.memory.pipeline import MemoryPipeline
 
         with tempfile.TemporaryDirectory() as tmpdir:
             with open(f"{tmpdir}\\USER.md", "w", encoding="utf-8") as handle:
@@ -1955,12 +1955,12 @@ class AgentLoopContextPolicyTests(unittest.TestCase):
             self.assertIn("项目约束", prepared.active_context_summary)
 
     def test_prepare_agent_context_filters_transient_execution_constraints_from_state(self) -> None:
-        from app.context_runtime import prepare_agent_context
-        from app.context_state import load_context_state
-        from app.memory_pipeline import MemoryPipeline
-        from app.memory_read_pipeline import MemoryReadPipeline
-        from app.memory_store import JsonMemoryStore, create_memory_entry
-        from app.memory_write_pipeline import MemoryWritePipeline
+        from app.context.runtime import prepare_agent_context
+        from app.context.state import load_context_state
+        from app.memory.pipeline import MemoryPipeline
+        from app.memory.read_pipeline import MemoryReadPipeline
+        from app.memory.store import JsonMemoryStore, create_memory_entry
+        from app.memory.write_pipeline import MemoryWritePipeline
 
         with tempfile.TemporaryDirectory() as tmpdir:
             memory_store = JsonMemoryStore(tmpdir)
@@ -2027,7 +2027,7 @@ class AgentLoopContextPolicyTests(unittest.TestCase):
             )
 
     def test_prepare_agent_context_resolves_active_user_rules_for_current_task(self) -> None:
-        from app.context_runtime import prepare_agent_context
+        from app.context.runtime import prepare_agent_context
 
         with tempfile.TemporaryDirectory() as tmpdir:
             with open(f"{tmpdir}\\USER.md", "w", encoding="utf-8") as handle:
@@ -2063,7 +2063,7 @@ class AgentLoopContextPolicyTests(unittest.TestCase):
             self.assertNotIn("保留中文标题", str(prepared.messages[0].get("content", "")))
 
     def test_build_active_context_summary_merges_summary_and_working_memory(self) -> None:
-        from app.context_compact_memory import build_active_context_summary
+        from app.context.compact_memory import build_active_context_summary
 
         working_memory = WorkingMemory()
         working_memory.protect("用户偏好：回答时优先用中文", entry_type="user_preference")
@@ -2082,7 +2082,7 @@ class AgentLoopContextPolicyTests(unittest.TestCase):
         self.assertIn("最近风险", active_context_summary)
 
     def test_build_active_context_summary_prioritizes_preferences_constraints_and_risks(self) -> None:
-        from app.context_compact_memory import build_active_context_summary
+        from app.context.compact_memory import build_active_context_summary
 
         working_memory = WorkingMemory()
         working_memory.protect("默认使用中文回答，并尽量把结论放在前面。", entry_type="user_preference", importance=1.0)
@@ -2108,7 +2108,7 @@ class AgentLoopContextPolicyTests(unittest.TestCase):
         self.assertIn("tool_result", active_context_summary)
 
     def test_build_active_context_summary_skips_transient_carry_over_sections(self) -> None:
-        from app.context_compact_memory import build_active_context_summary
+        from app.context.compact_memory import build_active_context_summary
 
         active_context_summary = build_active_context_summary(
             older_history_summary="",
@@ -2133,7 +2133,7 @@ class AgentLoopContextPolicyTests(unittest.TestCase):
         self.assertNotIn("tmp/real_chain_outputs", active_context_summary)
 
     def test_build_active_context_snapshot_uses_structured_sections_instead_of_free_text_carry_over(self) -> None:
-        from app.context_compact_memory import build_active_context_snapshot, render_active_context_summary
+        from app.context.compact_memory import build_active_context_snapshot, render_active_context_summary
 
         working_memory = WorkingMemory()
         working_memory.protect("当前活跃任务：重构上下文压缩链路", entry_type="active_task", importance=0.9)
@@ -2168,7 +2168,7 @@ class AgentLoopContextPolicyTests(unittest.TestCase):
         self.assertIn("关键工具发现", rendered)
 
     def test_parse_active_context_summary_recovers_stable_facts_into_tool_findings(self) -> None:
-        from app.context_compact_memory import parse_active_context_summary
+        from app.context.compact_memory import parse_active_context_summary
 
         snapshot = parse_active_context_summary(
             "压缩记忆基线\n"
@@ -2182,7 +2182,7 @@ class AgentLoopContextPolicyTests(unittest.TestCase):
         )
 
     def test_build_preview_memory_context_keeps_active_context_summary_before_working_memory(self) -> None:
-        from app.context_runtime import _build_preview_memory_context
+        from app.context.runtime import _build_preview_memory_context
 
         working_memory = WorkingMemory()
         working_memory.protect("继续整理 session 压缩链路", entry_type="active_task", importance=0.9)
@@ -2259,7 +2259,7 @@ class AgentLoopContextPolicyTests(unittest.TestCase):
         self.assertFalse(working_memory.get_entries_by_type("tool_finding"))
 
     def test_resolve_recent_risks_filters_directory_tree_markdown_and_file_body_noise(self) -> None:
-        from app.context_signal_resolver import resolve_recent_risks
+        from app.context.signal_resolver import resolve_recent_risks
 
         working_memory = WorkingMemory()
         working_memory.protect("│ ├── context_compactor.py ← 压缩器主模块", entry_type="recent_risk")
@@ -2272,12 +2272,12 @@ class AgentLoopContextPolicyTests(unittest.TestCase):
         self.assertEqual(risks, ["真正风险：大 tool_result 会挤占 recent window"])
 
     def test_resolve_project_constraints_prefers_long_term_constraints_and_filters_transient_runtime_noise(self) -> None:
-        from app.context_signal_resolver import resolve_project_constraints
-        from app.memory_feedback import MemoryFeedbackStore
-        from app.memory_pipeline import MemoryPipeline
-        from app.memory_read_pipeline import MemoryReadPipeline
-        from app.memory_store import JsonMemoryStore, create_memory_entry
-        from app.memory_write_pipeline import MemoryWritePipeline
+        from app.context.signal_resolver import resolve_project_constraints
+        from app.memory.feedback import MemoryFeedbackStore
+        from app.memory.pipeline import MemoryPipeline
+        from app.memory.read_pipeline import MemoryReadPipeline
+        from app.memory.store import JsonMemoryStore, create_memory_entry
+        from app.memory.write_pipeline import MemoryWritePipeline
 
         with tempfile.TemporaryDirectory() as tmpdir:
             memory_store = JsonMemoryStore(tmpdir)
@@ -2336,8 +2336,8 @@ class AgentLoopContextPolicyTests(unittest.TestCase):
             self.assertNotIn("本轮完成后立刻停止，不要继续探索。", constraints)
 
     def test_prepare_agent_context_records_auto_compact_history_when_pressure_remains_high(self) -> None:
-        from app.context_runtime import prepare_agent_context
-        from app.context_state import load_context_state
+        from app.context.runtime import prepare_agent_context
+        from app.context.state import load_context_state
 
         with tempfile.TemporaryDirectory() as tmpdir:
             tool_registry = _FakeToolRegistry()
@@ -2381,7 +2381,7 @@ class AgentLoopContextPolicyTests(unittest.TestCase):
             )
 
     def test_run_auto_compact_uses_active_context_summary_in_summary_base(self) -> None:
-        from app.context_auto_compact import _run_session_memory_compact
+        from app.context.auto_compact import _run_session_memory_compact
 
         messages = [
             {"role": "user", "content": "第0条消息：当前要验证 session memory compact 优先使用压缩记忆基线。" * 8},
@@ -2404,7 +2404,7 @@ class AgentLoopContextPolicyTests(unittest.TestCase):
         self.assertIn("MEMORY_BASELINE_TOKEN", str(result.messages[0]["content"]))
 
     def test_build_system_prompt_includes_user_profile_context(self) -> None:
-        from app.prompt import build_system_prompt
+        from app.agent.prompt import build_system_prompt
 
         prompt = build_system_prompt(
             tool_registry=_FakeToolRegistry(),
@@ -2421,7 +2421,7 @@ class AgentLoopContextPolicyTests(unittest.TestCase):
         self.assertIn("不需要帮我测试", prompt)
 
     def test_build_system_prompt_explains_memory_context_layering(self) -> None:
-        from app.prompt import build_system_prompt
+        from app.agent.prompt import build_system_prompt
 
         prompt = build_system_prompt(
             tool_registry=_FakeToolRegistry(),
@@ -2445,7 +2445,7 @@ class AgentLoopContextPolicyTests(unittest.TestCase):
         self.assertIn("只作为本轮短期辅助", prompt)
 
     def test_run_auto_compact_full_summary_uses_event_sections(self) -> None:
-        from app.context_auto_compact import run_auto_compact
+        from app.context.auto_compact import run_auto_compact
 
         messages = [
             {"role": "user", "content": "目标：确认压缩前为什么 recent window 会被重复扫描撑爆。" * 6},
@@ -2485,7 +2485,7 @@ class AgentLoopContextPolicyTests(unittest.TestCase):
         self.assertNotIn("ROOT: .", marker)
 
     def test_limit_summary_text_can_use_token_budget_for_full_compact(self) -> None:
-        from app.context_auto_compact import _limit_summary_text
+        from app.context.auto_compact import _limit_summary_text
 
         summary_text = "\n".join(
             [
@@ -2515,7 +2515,7 @@ class AgentLoopContextPolicyTests(unittest.TestCase):
         self.assertIn("[摘要已截断]", char_limited)
 
     def test_run_auto_compact_full_summary_can_fold_old_tool_rounds_into_summary(self) -> None:
-        from app.context_auto_compact import run_auto_compact
+        from app.context.auto_compact import run_auto_compact
 
         messages = [
             {"role": "user", "content": "先读取 alpha 并保留其核心结论。" * 8},
@@ -2569,7 +2569,7 @@ class AgentLoopContextPolicyTests(unittest.TestCase):
         self.assertNotIn("FILLER_HEADER", marker)
 
     def test_build_active_context_event_snapshot_prefers_semantic_tool_findings(self) -> None:
-        from app.context_compact_memory import build_active_context_event_snapshot
+        from app.context.compact_memory import build_active_context_event_snapshot
 
         snapshot = build_active_context_event_snapshot(
             removed_messages=[
@@ -2615,7 +2615,7 @@ class AgentLoopContextPolicyTests(unittest.TestCase):
         self.assertGreaterEqual(len(snapshot["tool_findings"]), 4)
 
     def test_run_auto_compact_full_summary_exposes_summary_snapshot(self) -> None:
-        from app.context_auto_compact import run_auto_compact
+        from app.context.auto_compact import run_auto_compact
 
         messages = [
             {"role": "user", "content": "目标：确认压缩后仍能保留核心语义。" * 12},
@@ -2666,7 +2666,7 @@ class AgentLoopContextPolicyTests(unittest.TestCase):
         self.assertTrue(result.summary_text.strip())
 
     def test_run_auto_compact_full_summary_drops_stale_tool_findings_from_base_snapshot(self) -> None:
-        from app.context_auto_compact import run_auto_compact
+        from app.context.auto_compact import run_auto_compact
 
         messages = [
             {"role": "user", "content": "当前任务：修复 main.js 里的挂载错误，并解释为什么压缩后会偏题。" * 8},
@@ -2697,7 +2697,7 @@ class AgentLoopContextPolicyTests(unittest.TestCase):
         )
 
     def test_run_auto_compact_full_summary_pins_current_focus_goal_and_risk(self) -> None:
-        from app.context_auto_compact import run_auto_compact
+        from app.context.auto_compact import run_auto_compact
 
         messages = [
             {"role": "user", "content": "旧主题：整理 vue 项目脚手架下载失败的历史排查记录。 " * 8},
@@ -2742,7 +2742,7 @@ class AgentLoopContextPolicyTests(unittest.TestCase):
         self.assertIn("当前风险", result.summary_text)
 
     def test_run_auto_compact_full_summary_prioritizes_tool_findings_aligned_with_current_focus(self) -> None:
-        from app.context_auto_compact import run_auto_compact
+        from app.context.auto_compact import run_auto_compact
 
         messages = [
             {"role": "user", "content": "旧主题：整理 Vue 记事本 editingIndex 的历史实现细节。 " * 8},
@@ -2782,7 +2782,7 @@ class AgentLoopContextPolicyTests(unittest.TestCase):
         self.assertNotIn("editingIndex", result.summary_text)
 
     def test_run_auto_compact_full_summary_prefers_semantic_model_summary_when_available(self) -> None:
-        from app.context_auto_compact import run_auto_compact
+        from app.context.auto_compact import run_auto_compact
 
         summarizer = _FakeSemanticCompactionSummarizer(
             summary_text=(
@@ -2821,7 +2821,7 @@ class AgentLoopContextPolicyTests(unittest.TestCase):
         )
 
     def test_run_auto_compact_full_summary_falls_back_to_rule_summary_when_semantic_model_fails(self) -> None:
-        from app.context_auto_compact import run_auto_compact
+        from app.context.auto_compact import run_auto_compact
 
         result = run_auto_compact(
             messages=[
@@ -2845,7 +2845,7 @@ class AgentLoopContextPolicyTests(unittest.TestCase):
         )
 
     def test_context_pipeline_passes_semantic_summarizer_into_auto_compact(self) -> None:
-        from app.context_compactor_pipeline import ContextCompactorPipeline
+        from app.context.compactor_pipeline import ContextCompactorPipeline
 
         pipeline = ContextCompactorPipeline()
         summarizer = _FakeSemanticCompactionSummarizer(
@@ -2874,7 +2874,7 @@ class AgentLoopContextPolicyTests(unittest.TestCase):
         self.assertTrue(result.auto_compact_result.summary_text.strip())
 
     def test_run_auto_compact_strips_previous_internal_markers(self) -> None:
-        from app.context_auto_compact import run_auto_compact
+        from app.context.auto_compact import run_auto_compact
 
         messages = [
             {"role": "system", "content": "[全量压缩]\n旧 marker A"},
@@ -2906,7 +2906,7 @@ class AgentLoopContextPolicyTests(unittest.TestCase):
         )
 
     def test_should_trigger_auto_compact_matches_minicode_high_water_logic(self) -> None:
-        from app.context_auto_compact import should_trigger_auto_compact
+        from app.context.auto_compact import should_trigger_auto_compact
 
         triggered = should_trigger_auto_compact(
             total_tokens=720,
@@ -2918,7 +2918,7 @@ class AgentLoopContextPolicyTests(unittest.TestCase):
         self.assertFalse(triggered)
 
     def test_normalize_tool_call_pairs_drops_orphan_tool_messages(self) -> None:
-        from app.context_message_safety import normalize_tool_call_pairs
+        from app.context.message_safety import normalize_tool_call_pairs
 
         messages = [
             {"role": "assistant_tool_call", "tool_use_id": "call-1", "tool_name": "read_file", "input": {"path": "a.py"}},
@@ -2942,8 +2942,8 @@ class AgentLoopContextPolicyTests(unittest.TestCase):
         )
 
     def test_reactive_tail_recover_strips_old_compaction_markers_before_retry(self) -> None:
-        from app.context_manager import estimate_messages_tokens
-        from app.context_reactive_compact import _aggressive_tail_recover
+        from app.context.manager import estimate_messages_tokens
+        from app.context.reactive_compact import _aggressive_tail_recover
 
         messages = [
             {"role": "system", "content": "基础 system prompt\n" + ("规则说明" * 80)},
@@ -2983,8 +2983,8 @@ class AgentLoopContextPolicyTests(unittest.TestCase):
         )
 
     def test_prepare_agent_context_restores_active_context_from_cached_state(self) -> None:
-        from app.context_runtime import prepare_agent_context
-        from app.context_state import ContextStateData, build_history_fingerprint, load_context_state, save_context_state
+        from app.context.runtime import prepare_agent_context
+        from app.context.state import ContextStateData, build_history_fingerprint, load_context_state, save_context_state
 
         with tempfile.TemporaryDirectory() as tmpdir:
             tool_registry = _FakeToolRegistry()
@@ -3049,7 +3049,7 @@ class AgentLoopContextPolicyTests(unittest.TestCase):
             self.assertIn("preview_total", state.last_token_stats)
 
     def test_context_state_reads_legacy_compact_memory_fields_but_does_not_write_them_back(self) -> None:
-        from app.context_state import ContextStateData
+        from app.context.state import ContextStateData
 
         state = ContextStateData.from_dict(
             {
@@ -3076,7 +3076,7 @@ class AgentLoopContextPolicyTests(unittest.TestCase):
         self.assertIn("active_context_snapshot", serialized)
 
     def test_context_state_incrementally_merges_working_memory_snapshot_after_response(self) -> None:
-        from app.context_state import (
+        from app.context.state import (
             ContextStateData,
             merge_context_state_snapshot,
             save_context_state,
@@ -3116,11 +3116,11 @@ class AgentLoopContextPolicyTests(unittest.TestCase):
             self.assertIn("新决策：保存点 B 写入当轮 WM", state.active_context_summary)
 
     def test_prepare_agent_context_persists_last_microcompact_at_from_pipeline(self) -> None:
-        from app.context_auto_compact import AutoCompactResult
-        from app.context_compactor import CompactionResult
-        from app.context_compactor_pipeline import ContextPipelineResult
-        from app.context_runtime import prepare_agent_context
-        from app.context_state import load_context_state
+        from app.context.auto_compact import AutoCompactResult
+        from app.context.compactor import CompactionResult
+        from app.context.compactor_pipeline import ContextPipelineResult
+        from app.context.runtime import prepare_agent_context
+        from app.context.state import load_context_state
 
         with tempfile.TemporaryDirectory() as tmpdir:
             tool_registry = _FakeToolRegistry()
@@ -3151,7 +3151,7 @@ class AgentLoopContextPolicyTests(unittest.TestCase):
             )
 
             with patch(
-                "app.context_runtime.ContextCompactorPipeline.process_request",
+                "app.context.runtime.ContextCompactorPipeline.process_request",
                 return_value=mocked_pipeline_result,
             ):
                 prepared = prepare_agent_context(
@@ -3178,8 +3178,8 @@ class AgentLoopContextPolicyTests(unittest.TestCase):
             )
 
     def test_prepare_agent_context_persists_full_compact_semantic_snapshot(self) -> None:
-        from app.context_runtime import prepare_agent_context
-        from app.context_state import load_context_state
+        from app.context.runtime import prepare_agent_context
+        from app.context.state import load_context_state
 
         with tempfile.TemporaryDirectory() as tmpdir:
             tool_registry = _FakeToolRegistry()
@@ -3226,8 +3226,8 @@ class AgentLoopContextPolicyTests(unittest.TestCase):
             self.assertIn("重复扫描的 tool_result", prepared.active_context_summary)
 
     def test_prepare_agent_context_auto_compact_handles_large_text_history(self) -> None:
-        from app.context_runtime import prepare_agent_context
-        from app.context_state import load_context_state
+        from app.context.runtime import prepare_agent_context
+        from app.context.state import load_context_state
 
         with tempfile.TemporaryDirectory() as tmpdir:
             tool_registry = _FakeToolRegistry()

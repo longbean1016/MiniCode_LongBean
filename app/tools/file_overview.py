@@ -1,11 +1,11 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import ast
 from typing import Any
 
 """文件概览工具，提取单个源码文件的导入、函数和类结构。"""
 
-from app.tooling import ToolDefinition
+from app.agent.tooling import ToolDefinition
 from app.tools._code_nav_common import (
     build_function_signature,
     read_text_file,

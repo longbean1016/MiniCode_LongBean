@@ -1,7 +1,7 @@
-from typing import Any
+﻿from typing import Any
 
-from app.permissions import PermissionManager
-from app.tooling import ToolDefinition
+from app.agent.permissions import PermissionManager
+from app.agent.tooling import ToolDefinition
 from app.types import ToolContext, ToolResult
 
 

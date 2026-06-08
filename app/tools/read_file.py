@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from pathlib import Path
 import re
@@ -6,8 +6,8 @@ from typing import Any
 
 """读取文件工具，按块返回源码内容并附带覆盖范围信息。"""
 
-from app.permissions import PermissionManager
-from app.tooling import ToolDefinition
+from app.agent.permissions import PermissionManager
+from app.agent.tooling import ToolDefinition
 from app.types import ToolContext, ToolResult
 
 # 参考 minicode 的思路：正文类读取工具天然支持分段，

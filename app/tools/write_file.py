@@ -1,9 +1,9 @@
-"""写文件工具，负责按权限约束把内容写入目标文件。"""
+﻿"""写文件工具，负责按权限约束把内容写入目标文件。"""
 
 from typing import Any
 
-from app.permissions import PermissionManager
-from app.tooling import ToolDefinition
+from app.agent.permissions import PermissionManager
+from app.agent.tooling import ToolDefinition
 from app.types import ToolContext, ToolResult
 
 

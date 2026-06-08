@@ -1,11 +1,11 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from collections import Counter
 from typing import Any
 
 """代码库地图工具，输出适合大范围理解项目结构的简要索引。"""
 
-from app.tooling import ToolDefinition
+from app.agent.tooling import ToolDefinition
 from app.tools._code_nav_common import (
     format_symbol_record,
     iter_python_files,

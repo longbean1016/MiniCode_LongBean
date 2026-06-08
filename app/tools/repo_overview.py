@@ -1,11 +1,11 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from collections import Counter
 from typing import Any
 
 """仓库概览工具，用于生成项目目录和核心文件的整体摘要。"""
 
-from app.tooling import ToolDefinition
+from app.agent.tooling import ToolDefinition
 from app.tools._code_nav_common import iter_python_files, resolve_safe_path
 from app.types import ToolContext, ToolResult
 

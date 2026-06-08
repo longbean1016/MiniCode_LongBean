@@ -1,11 +1,11 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import tempfile
 import unittest
 from pathlib import Path
 
 from app.tools import build_tool_registry
-from app.tooling import ToolDefinition, ToolRegistry
+from app.agent.tooling import ToolDefinition, ToolRegistry
 from app.types import ToolContext, ToolResult
 
 

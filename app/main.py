@@ -1,27 +1,27 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import argparse
 
 """命令行入口，负责启动会话、组装依赖并驱动整轮交互。"""
 
-from app.agent_loop import continue_agent_from_history, run_agent_once
-from app.background_worker import wait_for_background_tasks
+from app.agent.loop import continue_agent_from_history, run_agent_once
+from app.infra.background_worker import wait_for_background_tasks
 from app.config import load_config
-from app.memory_decay import MemoryDecay
-from app.history_summarizer import OlderHistorySummarizer
+from app.memory.decay import MemoryDecay
+from app.context.history_summarizer import OlderHistorySummarizer
 from app.logger import log_event
-from app.memory_curator import MemoryCurator
-from app.memory_extractor import LongTermMemoryExtractor
-from app.memory_feedback import MemoryFeedbackStore
-from app.memory_guard import MemoryWriteGuard
-from app.memory_pipeline import MemoryPipeline
-from app.memory_read_pipeline import MemoryReadPipeline
-from app.memory_store import JsonMemoryStore
-from app.memory_vector_index import MemoryVectorIndex
-from app.memory_verifier import MemoryVerifier
-from app.memory_write_pipeline import MemoryWritePipeline
-from app.model_registry import OpenAIModelAdapter
-from app.session import (
+from app.memory.curator import MemoryCurator
+from app.memory.extractor import LongTermMemoryExtractor
+from app.memory.feedback import MemoryFeedbackStore
+from app.memory.guard import MemoryWriteGuard
+from app.memory.pipeline import MemoryPipeline
+from app.memory.read_pipeline import MemoryReadPipeline
+from app.memory.store import JsonMemoryStore
+from app.memory.vector_index import MemoryVectorIndex
+from app.memory.verifier import MemoryVerifier
+from app.memory.write_pipeline import MemoryWritePipeline
+from app.infra.model_registry import OpenAIModelAdapter
+from app.state.session import (
     SessionData,
     create_new_session,
     format_session_list,
@@ -33,7 +33,7 @@ from app.session import (
 from app.tools import build_tool_registry
 from app.tui.app import MiniCodeApp
 from app.types import AgentStep, ChatMessage, ToolContext
-from app.working_memory import WorkingMemory
+from app.state.working_memory import WorkingMemory
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:

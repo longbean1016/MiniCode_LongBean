@@ -1,10 +1,10 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from typing import Any
 
 """符号查找工具，用于扫描项目中的函数、类和变量定义。"""
 
-from app.tooling import ToolDefinition
+from app.agent.tooling import ToolDefinition
 from app.tools._code_nav_common import (
     format_symbol_record,
     iter_python_files,

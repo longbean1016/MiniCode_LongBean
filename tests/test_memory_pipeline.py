@@ -1,22 +1,22 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import tempfile
 import unittest
 from dataclasses import dataclass
 from pathlib import Path
 
-from app.explicit_memory import parse_manual_memory_input
-from app.memory_guard import MemoryWriteGuard
-from app.memory_reflection import ReflectionMemoryCandidate, TaskMemoryReflectionEngine
-from app.memory_decay import DecayRunResult
-from app.memory_feedback import MemoryFeedbackStore
-from app.memory_pipeline import MemoryPipeline
-from app.memory_read_pipeline import MemoryReadPipeline
-from app.memory_store import JsonMemoryStore, MemoryEntry, create_memory_entry
-from app.memory_write_pipeline import MemoryWritePipeline
-from app.session import create_new_session
+from app.memory.explicit import parse_manual_memory_input
+from app.memory.guard import MemoryWriteGuard
+from app.memory.reflection import ReflectionMemoryCandidate, TaskMemoryReflectionEngine
+from app.memory.decay import DecayRunResult
+from app.memory.feedback import MemoryFeedbackStore
+from app.memory.pipeline import MemoryPipeline
+from app.memory.read_pipeline import MemoryReadPipeline
+from app.memory.store import JsonMemoryStore, MemoryEntry, create_memory_entry
+from app.memory.write_pipeline import MemoryWritePipeline
+from app.state.session import create_new_session
 from app.types import AgentStep, ToolResult
-from app.working_memory import WorkingMemory
+from app.state.working_memory import WorkingMemory
 
 
 @dataclass

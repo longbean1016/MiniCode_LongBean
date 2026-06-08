@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 """文本搜索工具，负责在目录或文件范围内查找匹配内容。"""
 
@@ -6,8 +6,8 @@ from pathlib import Path
 import subprocess
 from typing import Any
 
-from app.permissions import PermissionManager
-from app.tooling import ToolDefinition
+from app.agent.permissions import PermissionManager
+from app.agent.tooling import ToolDefinition
 from app.types import ToolContext, ToolResult
 
 # 搜索类工具不一定要做 offset/limit 分页，

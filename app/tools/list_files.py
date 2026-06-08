@@ -1,10 +1,10 @@
-"""列目录工具，负责输出目录结构并控制返回规模。"""
+﻿"""列目录工具，负责输出目录结构并控制返回规模。"""
 
 from pathlib import Path
 from typing import Any
 
-from app.permissions import PermissionManager
-from app.tooling import ToolDefinition
+from app.agent.permissions import PermissionManager
+from app.agent.tooling import ToolDefinition
 from app.types import ToolContext, ToolResult
 
 DEFAULT_MAX_ENTRIES = 200
