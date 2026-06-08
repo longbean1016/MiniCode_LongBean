@@ -420,6 +420,9 @@ class MiniCodeApp(App):
                         self._working_memory, user_input
                     )
 
+            # 捕获最终 AgentStep，用于后续 finalize_turn
+            final_step = None
+
             try:
                 # 遍历 stream_agent 生成的每一条事件
                 for event in stream_agent(
@@ -476,6 +479,7 @@ class MiniCodeApp(App):
                     elif isinstance(event, DoneEvent):
                         # 本轮完成：更新历史、结束流式构建、刷新 token 显示
                         self._history = event.history
+                        final_step = event.step  # 保存 step 用于后台记忆写入
                         self.call_from_thread(
                             self.conversation.end_agent_response,
                         )
@@ -514,6 +518,7 @@ class MiniCodeApp(App):
 
                 # ---- 后台写入长期记忆 ----
                 from app.background_worker import submit_background
+                from app.turn_history import get_last_round_messages
 
                 finalize_task_description = user_input or ""
                 finalize_session_id = (
@@ -521,6 +526,10 @@ class MiniCodeApp(App):
                 )
                 finalize_working_memory = copy.deepcopy(self._working_memory)
                 finalize_mp = self._memory_pipeline
+                # 提取本轮对话消息，用于记忆抽取
+                finalize_turn_messages = copy.deepcopy(
+                    get_last_round_messages(self._history)
+                )
 
                 def _finalize_turn_background() -> None:
                     """后台任务：抽取并持久化长期记忆。"""
@@ -529,8 +538,8 @@ class MiniCodeApp(App):
                         if finalize_mp is not None:
                             finalize_mp.finalize_turn(
                                 task_description=finalize_task_description,
-                                final_step=None,
-                                turn_messages=[],
+                                final_step=final_step,
+                                turn_messages=finalize_turn_messages,
                                 session_id=finalize_session_id,
                                 working_memory=finalize_working_memory,
                                 decay_log_enabled=True,

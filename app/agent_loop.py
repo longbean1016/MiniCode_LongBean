@@ -895,6 +895,20 @@ def stream_agent(
 
     loop_started_at = time.perf_counter()
     pending_user_nudge: str | None = None
+    exploration_history: list[tuple[str, str]] = []
+
+    # ---- 分析护栏：初始化证据追踪器 ----
+    # 对代码分析类任务创建 tracker，后续每次工具调用都会往里面沉淀观察到的函数名、文件、行数。
+    # 最终回答前用 tracker 校验是否引用了未经观察的符号，防止模型"脑补"。
+    task_text = _extract_latest_real_user_message(builder.build())
+    analysis_tracker: dict[str, object] | None = None
+    blocked_analysis_tool_call_count = 0
+    if _is_code_analysis_request(task_text):
+        analysis_tracker = _create_analysis_tracker(task_text)
+        target_resolution_nudge = _build_analysis_target_resolution_nudge(analysis_tracker)
+        pending_user_nudge = NUDGE_ANALYSIS_TOOL_PRIORITY
+        if target_resolution_nudge:
+            pending_user_nudge = pending_user_nudge + "\n" + target_resolution_nudge
 
     log_event(
         f"[session={session_id or '-'}] 开始一轮 Agent 流式请求",
@@ -1031,6 +1045,33 @@ def stream_agent(
                     "id": tool_use_id,
                 })
 
+            # ---- 分析护栏：工具调用前的结构优先与冗余拦截 ----
+            if (
+                analysis_tracker is not None
+                and _should_redirect_analysis_to_structure_first(analysis_tracker, calls)
+            ):
+                pending_user_nudge = (
+                    NUDGE_ANALYSIS_TOOL_PRIORITY + "\n" + NUDGE_ANALYSIS_STRUCTURE_FIRST
+                )
+                continue
+
+            if (
+                analysis_tracker is not None
+                and _should_block_redundant_analysis_calls(
+                    analysis_tracker,
+                    calls=calls,
+                    step_index=step_index,
+                    max_steps=max_steps,
+                    is_exploration_tool=_is_exploration_tool,
+                )
+            ):
+                blocked_analysis_tool_call_count += 1
+                if blocked_analysis_tool_call_count >= 2:
+                    pending_user_nudge = _build_analysis_force_answer_nudge(analysis_tracker)
+                else:
+                    pending_user_nudge = _build_analysis_convergence_nudge(analysis_tracker)
+                continue
+
             # 逐个执行工具
             for call in calls:
                 tool_name = call["tool_name"]
@@ -1097,6 +1138,20 @@ def stream_agent(
                     ok=result.ok,
                 )
 
+                # ---- 分析护栏：记录观察到的文件/符号/行数 ----
+                if analysis_tracker is not None:
+                    _record_analysis_evidence(
+                        analysis_tracker,
+                        tool_name=tool_name,
+                        tool_input=tool_input,
+                        result=result,
+                    )
+
+                # 记录探索历史，用于后续判断是否连续重复探索同一目标
+                if _is_exploration_tool(tool_name):
+                    tool_target = _extract_tool_target(tool_input)
+                    exploration_history.append((tool_name, tool_target))
+
                 # ---- 权限检查：高风险操作需要用户授权 ----
                 if result.error == "PERMISSION_REQUIRED":
                     command = str(result.meta.get("command", ""))
@@ -1156,6 +1211,21 @@ def stream_agent(
                             result=result,
                         )
 
+            # ---- 分析护栏：重置冗余拦截计数器，注入收敛提示 ----
+            blocked_analysis_tool_call_count = 0
+            if _should_inject_convergence_nudge(
+                exploration_history=exploration_history,
+                step_index=step_index,
+                max_steps=max_steps,
+            ):
+                if (
+                    analysis_tracker is not None
+                    and _has_sufficient_analysis_evidence(analysis_tracker)
+                ):
+                    pending_user_nudge = _build_analysis_convergence_nudge(analysis_tracker)
+                else:
+                    pending_user_nudge = NUDGE_AFTER_TOOL_RESULT
+
             # 工具阶段结束，继续下一轮循环
             step_cost = time.perf_counter() - step_started_at
             log_event(
@@ -1168,6 +1238,38 @@ def stream_agent(
 
         # ---- 第四步：返回最终回答 ----
         if collected_text.strip():
+            # ---- 分析护栏：事实校验 ----
+            # 对代码分析类回答做最后一层检查：
+            # 1. 证据是否足够（至少读过目标文件、观察到过关键符号）
+            # 2. 回答中是否引用了未经 read_file/find_symbols 确认的函数名
+            # 3. 是否有无事实依据的分析断言
+            if (
+                analysis_tracker is not None
+                and _has_sufficient_analysis_evidence(analysis_tracker)
+            ):
+                invalid_names = _find_unobserved_answer_function_names(
+                    analysis_tracker,
+                    collected_text,
+                )
+                invalid_claims = _find_unsupported_analysis_claims(
+                    analysis_tracker,
+                    collected_text,
+                )
+                if (invalid_names or invalid_claims) and step_index < max_steps - 1:
+                    # 发现编造内容，注入纠正提示，要求模型自纠后再答
+                    pending_user_nudge = _build_analysis_fact_correction_nudge(
+                        analysis_tracker,
+                        invalid_names,
+                        invalid_claims,
+                    )
+                    continue
+
+                # 校验通过，规范化答案（去掉可能的幻觉修改）
+                collected_text = _normalize_analysis_answer_content(
+                    analysis_tracker,
+                    collected_text,
+                )
+
             # 把流式收集到的文本写入历史
             builder.add_assistant(collected_text)
 

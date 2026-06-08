@@ -42,6 +42,15 @@ class ConversationWidget(VerticalScroll):
         """组件挂载后显示欢迎信息。"""
         self.add_system_info("欢迎使用 MiniCode Agent！输入问题开始对话。")
 
+    def _smart_scroll(self) -> None:
+        """智能滚动：仅在用户未手动上翻时才自动滚到底部。
+
+        如果用户正在向上回看历史，就不强制拉回底部。
+        """
+        # 用户当前离底部不超过 3 行时，才自动跟随到底部
+        if self.max_scroll_y - self.scroll_y <= 3:
+            self.scroll_end(animate=False)
+
     # ============================================================
     # 公开方法，由 MiniCodeApp 通过 call_from_thread 调用
     # ============================================================
@@ -63,7 +72,7 @@ class ConversationWidget(VerticalScroll):
         user_text.append("▸ ", style="bold cyan")
         user_text.append(text, style="white")
         self.mount(Static(user_text, classes="user-message"))
-        self.scroll_end(animate=False)
+        self._smart_scroll()
 
     def begin_agent_response(self) -> None:
         """开始一段新的 Agent 回复。
@@ -76,7 +85,7 @@ class ConversationWidget(VerticalScroll):
         # 先添加 Agent 标签行
         self.mount(Static("Agent", classes="agent-label"))
         self.mount(self._current_static)
-        self.scroll_end(animate=False)
+        self._smart_scroll()
 
     def add_text_chunk(self, text: str) -> None:
         """流式追加文本 fragment。
@@ -95,18 +104,20 @@ class ConversationWidget(VerticalScroll):
             except Exception:
                 # Markdown 渲染失败时退回纯文本
                 self._current_static.update(self._current_response)
-        self.scroll_end(animate=False)
+        self._smart_scroll()
 
     def end_agent_response(self) -> None:
         """结束当前 Agent 回复的流式构建。
 
-        清空内部状态，同时移除所有临时的 thinking 提示行。
+        清空内部状态，同时移除本轮所有临时消息（thinking、工具调用状态条），
+        只保留 Agent 最终回答文本。
         """
         self._current_response = ""
         self._current_static = None
-        # 清理所有 thinking 消息（仅本轮临时显示，回复完成后不需要保留）
-        for widget in self.query(".thinking-message"):
-            widget.remove()
+        # 清理临时消息：thinking 提示、工具调用条、工具结果条
+        for cls in (".thinking-message", ".tool-call-message", ".tool-result-message"):
+            for widget in self.query(cls):
+                widget.remove()
 
     def add_thinking(self, text: str) -> None:
         """添加思考过程提示。
@@ -120,7 +131,7 @@ class ConversationWidget(VerticalScroll):
         thinking.append("  ", style="")
         thinking.append(text, style="dim italic")
         self.mount(Static(thinking, classes="thinking-message"))
-        self.scroll_end(animate=False)
+        self._smart_scroll()
 
     def add_tool_call(self, name: str, args: dict | None = None) -> None:
         """添加工具调用提示条。
@@ -146,7 +157,7 @@ class ConversationWidget(VerticalScroll):
         if args_str:
             text.append(args_str, style="yellow")
         self.mount(Static(text, classes="tool-call-message"))
-        self.scroll_end(animate=False)
+        self._smart_scroll()
 
     def add_tool_result(self, name: str, summary: str, ok: bool = True) -> None:
         """添加工具执行结果条。
@@ -163,7 +174,7 @@ class ConversationWidget(VerticalScroll):
         text = Text()
         text.append(f"  {icon} {name}: {summary}", style=style)
         self.mount(Static(text, classes="tool-result-message"))
-        self.scroll_end(animate=False)
+        self._smart_scroll()
 
     def add_error(self, message: str) -> None:
         """添加错误提示，红色文字。
@@ -174,7 +185,7 @@ class ConversationWidget(VerticalScroll):
         text = Text()
         text.append(f"  ⚠ {message}", style="bold red")
         self.mount(Static(text, classes="error-message"))
-        self.scroll_end(animate=False)
+        self._smart_scroll()
 
     def add_approval_prompt(self, message: str) -> None:
         """显示审批确认提示。
@@ -188,7 +199,7 @@ class ConversationWidget(VerticalScroll):
         text.append("  ⚠ ", style="bold yellow")
         text.append(message, style="yellow")
         self.mount(Static(text, classes="approval-message"))
-        self.scroll_end(animate=False)
+        self._smart_scroll()
 
     def add_system_info(self, text: str) -> None:
         """添加系统信息。
@@ -202,4 +213,4 @@ class ConversationWidget(VerticalScroll):
         info.append("  ℹ ", style="dim")
         info.append(text, style="dim")
         self.mount(Static(info, classes="system-message"))
-        self.scroll_end(animate=False)
+        self._smart_scroll()
