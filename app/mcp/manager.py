@@ -1,12 +1,12 @@
 # app/mcp/manager.py
 """MCP Server 生命周期管理器。
 
-统一管理所有 StdioMcpClient，提供:
+统一管理所有 MCP 客户端（StdioMcpClient / HttpMcpClient），提供:
     - bootstrap():   启动时批量初始化已配置的 Server
-    - add_server():  运行时添加并启动 Server（/mcp add）
+    - add_server():  运行时添加并启动 Server（/mcp add，支持 stdio 和 HTTP）
     - remove_server(): 运行时移除并停止 Server（/mcp remove）
     - list_servers(): 列出所有 Server 及连接状态（/mcp list）
-    - dispose():     退出时关闭所有子进程
+    - dispose():     退出时关闭所有连接
 """
 
 from __future__ import annotations
@@ -18,6 +18,7 @@ from typing import Callable
 
 from app.agent.tooling import ToolRegistry
 from app.mcp.client import StdioMcpClient, create_mcp_backed_tools
+from app.mcp.http_client import HttpMcpClient, create_http_mcp_backed_tools
 from app.mcp.config import (
     add_server_to_config,
     load_mcp_config,
@@ -87,7 +88,8 @@ class McpManager:
 
         支持子命令:
             /mcp list                              → 显示所有 Server 状态
-            /mcp add <name> -- <command> [args...] → 添加并启动 Server
+            /mcp add <name> -- <command> [args...] → 添加 stdio Server
+            /mcp add <name> --url <url>            → 添加 HTTP Server
             /mcp remove <name>                     → 移除并停止 Server
 
         Returns:
@@ -109,29 +111,59 @@ class McpManager:
             return self.remove_server(name)
 
         if subcommand == "add" and len(parts) >= 3:
-            # 解析: /mcp add <name> -- <command> [args...]
             name = parts[2]
+
+            # HTTP 模式: /mcp add <name> --url <url>
+            if "--url" in parts:
+                try:
+                    url_index = parts.index("--url", 3)
+                except ValueError:
+                    return "格式错误。HTTP 模式正确格式: /mcp add <name> --url <url>"
+                if url_index + 1 >= len(parts):
+                    return "格式错误：缺少 URL。正确格式: /mcp add <name> --url <url>"
+                url = parts[url_index + 1]
+                return self.add_server(name, url=url)
+
+            # Stdio 模式: /mcp add <name> -- <command> [args...]
             try:
                 dash_index = parts.index("--", 3)
             except ValueError:
-                return "格式错误。正确格式: /mcp add <name> -- <command> [args...]"
+                return (
+                    "格式错误。Stdio 模式: /mcp add <name> -- <command> [args...]\n"
+                    "HTTP 模式: /mcp add <name> --url <url>"
+                )
 
             if dash_index + 1 >= len(parts):
-                return "格式错误：缺少 command。正确格式: /mcp add <name> -- <command> [args...]"
+                return (
+                    "格式错误：缺少 command。\n"
+                    "Stdio 模式: /mcp add <name> -- <command> [args...]\n"
+                    "HTTP 模式: /mcp add <name> --url <url>"
+                )
 
             command = parts[dash_index + 1]
             args = parts[dash_index + 2:] if dash_index + 2 < len(parts) else []
-            return self.add_server(name, command, args)
+            return self.add_server(name, command=command, args=args)
 
         return self._help_text()
 
-    def add_server(self, name: str, command: str, args: list[str]) -> str:
+    def add_server(
+        self,
+        name: str,
+        command: str = "",
+        args: list[str] | None = None,
+        *,
+        url: str = "",
+    ) -> str:
         """异步添加并启动一个 MCP Server（不阻塞 TUI）。
+
+        支持两种传输方式:
+            - stdio: 传入 command + args，通过子进程通信
+            - HTTP:  传入 url，通过 HTTP POST 通信
 
         流程:
             1. 验证名称合法性（重复 / 正在添加中）
             2. 返回 "⏳ 正在添加..." 后立即恢复 TUI 交互
-            3. 后台线程完成: 持久化 → 启动子进程 → 发现工具 → 注册
+            3. 后台线程完成: 持久化 → 连接 → 发现工具 → 注册
             4. 通过回调通知 TUI 最终结果
         """
         # 检查重复
@@ -147,51 +179,84 @@ class McpManager:
         # 后台线程执行实际的添加逻辑
         threading.Thread(
             target=self._add_server_sync,
-            args=(name, command, args),
+            args=(name, command, args or [], url),
             daemon=True,
         ).start()
 
         return f"⏳ 正在后台添加 MCP Server: {name}..."
 
-    def _add_server_sync(self, name: str, command: str, args: list[str]) -> None:
-        """后台线程: 同步执行 MCP Server 添加（持久化 + 启动 + 工具发现 + 注册）。"""
+    def _add_server_sync(
+        self, name: str, command: str, args: list[str], url: str
+    ) -> None:
+        """后台线程: 同步执行 MCP Server 添加（持久化 + 连接 + 工具发现 + 注册）。"""
         result: str
+        is_http = bool(url)
         try:
-            # 先持久化配置（先写文件再启动，确保配置不丢）
-            add_server_to_config(self._cwd, name, command, args)
+            if is_http:
+                # HTTP 模式: 持久化 URL 配置 → 连接 → 发现工具
+                server_config = {"url": url}
+                add_server_to_config(self._cwd, name, server_config)
 
-            # 创建并启动客户端
-            config = {"command": command, "args": args, "enabled": True}
-            client = StdioMcpClient(name, config, self._cwd)
-
-            try:
-                client.start()
-            except Exception as error:
-                # 启动失败，回滚配置文件
+                client = HttpMcpClient(name, server_config, self._cwd)
                 try:
-                    remove_server_from_config(self._cwd, name)
-                except Exception:
-                    pass
-                result = f"❌ 启动 MCP Server '{name}' 失败: {error}"
-                # 通过回调通知 TUI
-                if self._result_callback is not None:
-                    self._result_callback(result)
-                return
+                    client.start()
+                except Exception as error:
+                    try:
+                        remove_server_from_config(self._cwd, name)
+                    except Exception:
+                        pass
+                    result = f"❌ 连接 MCP Server '{name}' 失败: {error}"
+                    if self._result_callback is not None:
+                        self._result_callback(result)
+                    return
 
-            # 发现并注册工具
-            try:
-                mcp_tools = create_mcp_backed_tools(server_name=name, client=client)
-            except Exception as error:
-                # 工具发现失败，关闭客户端 + 回滚配置
-                client.close()
                 try:
-                    remove_server_from_config(self._cwd, name)
-                except Exception:
-                    pass
-                result = f"❌ 发现 MCP Server '{name}' 的工具失败: {error}"
-                if self._result_callback is not None:
-                    self._result_callback(result)
-                return
+                    mcp_tools = create_http_mcp_backed_tools(
+                        server_name=name, client=client
+                    )
+                except Exception as error:
+                    client.close()
+                    try:
+                        remove_server_from_config(self._cwd, name)
+                    except Exception:
+                        pass
+                    result = f"❌ 发现 MCP Server '{name}' 的工具失败: {error}"
+                    if self._result_callback is not None:
+                        self._result_callback(result)
+                    return
+
+            else:
+                # Stdio 模式: 原有逻辑
+                server_config = {"command": command, "args": args}
+                add_server_to_config(self._cwd, name, server_config)
+
+                client = StdioMcpClient(name, server_config, self._cwd)
+                try:
+                    client.start()
+                except Exception as error:
+                    try:
+                        remove_server_from_config(self._cwd, name)
+                    except Exception:
+                        pass
+                    result = f"❌ 启动 MCP Server '{name}' 失败: {error}"
+                    if self._result_callback is not None:
+                        self._result_callback(result)
+                    return
+
+                try:
+                    mcp_tools = create_mcp_backed_tools(
+                        server_name=name, client=client
+                    )
+                except Exception as error:
+                    client.close()
+                    try:
+                        remove_server_from_config(self._cwd, name)
+                    except Exception:
+                        pass
+                    result = f"❌ 发现 MCP Server '{name}' 的工具失败: {error}"
+                    if self._result_callback is not None:
+                        self._result_callback(result)
+                    return
 
             for tool in mcp_tools:
                 self._tool_registry.register_tool(tool)
@@ -284,7 +349,9 @@ class McpManager:
             else:
                 status = "disconnected"
 
-            lines.append(f"  {srv_name}: {command} ({status})")
+            # HTTP Server 显示 url，Stdio Server 显示 command
+            label = srv_config.get("url") or command
+            lines.append(f"  {srv_name}: {label} ({status})")
 
         return "\n".join(lines)
 
@@ -311,12 +378,24 @@ class McpManager:
     def _start_server(self, server_name: str, config: dict) -> None:
         """内部方法: 启动单个 MCP Server（bootstrap 用）。
 
+        根据 config 中是否有 url 自动选择 HTTP 或 stdio 客户端。
+
         Raises:
             RuntimeError: 启动失败时抛出
         """
-        client = StdioMcpClient(server_name, config, self._cwd)
-        client.start()
-        mcp_tools = create_mcp_backed_tools(server_name=server_name, client=client)
+        if "url" in config:
+            # HTTP 模式
+            client = HttpMcpClient(server_name, config, self._cwd)
+            client.start()
+            mcp_tools = create_http_mcp_backed_tools(
+                server_name=server_name, client=client
+            )
+        else:
+            # Stdio 模式
+            client = StdioMcpClient(server_name, config, self._cwd)
+            client.start()
+            mcp_tools = create_mcp_backed_tools(server_name=server_name, client=client)
+
         for tool in mcp_tools:
             self._tool_registry.register_tool(tool)
         self._clients[server_name] = client
@@ -327,6 +406,7 @@ class McpManager:
         return (
             "/mcp 命令:\n"
             "  /mcp list                              查看已配置的 MCP Server\n"
-            '  /mcp add <name> -- <command> [args...] 添加并启动 MCP Server\n'
-            "  /mcp remove <name>                     移除并停止 MCP Server"
+            "  /mcp add <name> -- <command> [args...]  添加 stdio MCP Server\n"
+            "  /mcp add <name> --url <url>             添加 HTTP MCP Server\n"
+            "  /mcp remove <name>                      移除并停止 MCP Server"
         )

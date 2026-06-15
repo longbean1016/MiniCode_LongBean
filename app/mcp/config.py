@@ -49,9 +49,12 @@ def save_mcp_config(cwd: str, servers: dict[str, dict]) -> None:
     )
 
 
-def add_server_to_config(cwd: str, name: str, command: str, args: list[str]) -> None:
-    """向 .mcp.json 追加一个 MCP Server（保留已有配置）。"""
-    # 直接读原始文件获取全部 Server 配置（包括 enabled=False 的）
+def add_server_to_config(cwd: str, name: str, config: dict) -> None:
+    """向 .mcp.json 追加一个 MCP Server（保留已有配置）。
+
+    config 可以是 stdio 类型 {"command": "...", "args": [...]}
+    或 HTTP 类型 {"url": "...", "headers": {...}}。
+    """
     path = Path(cwd) / MCP_CONFIG_FILE
     if path.exists():
         try:
@@ -62,11 +65,8 @@ def add_server_to_config(cwd: str, name: str, command: str, args: list[str]) -> 
     else:
         all_servers = {}
 
-    all_servers[name] = {
-        "command": command,
-        "args": args,
-        "enabled": True,
-    }
+    config["enabled"] = True
+    all_servers[name] = config
     save_mcp_config(cwd, all_servers)
 
 
