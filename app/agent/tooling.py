@@ -64,6 +64,26 @@ class ToolRegistry:
     def find_tool(self, name: str) -> ToolDefinition | None:
         return self._tool_index.get(name)
 
+    def register_tool(self, tool: ToolDefinition) -> None:
+        """动态注册一个工具，/mcp add 时使用。
+
+        同时维护 _tools 列表和 _tool_index 字典，
+        保证 list_tools() 和 find_tool() 的一致性。
+        """
+        self._tools.append(tool)
+        self._tool_index[tool.name] = tool
+
+    def unregister_tool(self, name: str) -> bool:
+        """动态移除一个工具，/mcp remove 时使用。
+
+        返回 True 表示成功移除，False 表示工具不存在。
+        """
+        if name not in self._tool_index:
+            return False
+        self._tool_index.pop(name)
+        self._tools = [t for t in self._tools if t.name != name]
+        return True
+
     def _normalize_output(self, text: Any) -> str:
         """把工具输出统一转成字符串，并兜底空输出。"""
         if text is None:

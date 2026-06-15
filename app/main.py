@@ -107,7 +107,15 @@ def main() -> None:
 
     # 工具注册表和模型适配器都在启动时构建，
     # 后续整轮会话里复用同一套实例，避免每次用户输入都重新初始化依赖。
-    tool_registry = build_tool_registry()
+    from app.mcp.config import load_mcp_config
+
+    # 读取 MCP 配置（.mcp.json），文件不存在时返回空字典
+    mcp_config = load_mcp_config(config.workspace_root)
+    # 构建工具注册表 + MCP 管理器
+    tool_registry, mcp_manager = build_tool_registry(
+        cwd=config.workspace_root,
+        mcp_config=mcp_config,
+    )
 
     model = OpenAIModelAdapter(
         api_key=config.api_key,
@@ -261,6 +269,7 @@ def main() -> None:
         working_memory=working_memory,
         memory_pipeline=memory_pipeline,
         history_summarizer=history_summarizer,
+        mcp_manager=mcp_manager,  # 用于 /mcp 命令和退出清理
     )
 
     tui_app.run()

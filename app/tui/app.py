@@ -156,6 +156,7 @@ class MiniCodeApp(App):
         working_memory=None,
         memory_pipeline=None,
         history_summarizer=None,
+        mcp_manager=None,
     ) -> None:
         """初始化 MiniCodeApp。
 
@@ -169,6 +170,7 @@ class MiniCodeApp(App):
             working_memory: WorkingMemory 实例
             memory_pipeline: MemoryPipeline 实例
             history_summarizer: OlderHistorySummarizer 实例
+            mcp_manager: McpManager 实例（可选，用于 /mcp 命令）
         """
         super().__init__()
         self._model = model
@@ -178,6 +180,10 @@ class MiniCodeApp(App):
         self._working_memory = working_memory
         self._memory_pipeline = memory_pipeline
         self._history_summarizer = history_summarizer
+        self._mcp_manager = mcp_manager  # MCP 生命周期管理器
+        # 注入异步结果回调: MCP 后台线程完成后通过 call_from_thread 安全更新 UI
+        if mcp_manager is not None:
+            mcp_manager.set_result_callback(self._on_mcp_async_result)
         # 从 session 初始化消息历史
         self._history = list(session.messages) if session else []
         # 待处理的审批请求（ApprovalEvent 到达后暂存，等待用户 y/n）
@@ -237,11 +243,12 @@ class MiniCodeApp(App):
     def on_input_area_input_submitted(self, event: InputArea.InputSubmitted) -> None:
         """处理用户的输入提交。
 
-        根据输入类型分三种路径：
+        根据输入类型分五种路径：
         1. 审批回复（y/n） → _handle_approval_reply()
         2. 退出命令（exit/quit）→ _do_exit()
         3. 显式记忆命令 → memory_pipeline.handle_explicit_input()
-        4. 普通对话 → _run_agent_stream()
+        4. /mcp 命令 → mcp_manager.handle_command()
+        5. 普通对话 → _run_agent_stream()
         """
         user_text = event.text
 
@@ -268,6 +275,13 @@ class MiniCodeApp(App):
                 self.conversation.add_user_message(user_text)
                 self.conversation.add_system_info(explicit_result.assistant_text)
                 return
+
+        # /mcp 命令（管理 MCP Server），不走模型
+        if user_text.strip().startswith("/mcp") and self._mcp_manager is not None:
+            result = self._mcp_manager.handle_command(user_text)
+            self.conversation.add_user_message(user_text)
+            self.conversation.add_system_info(result)
+            return
 
         # 普通对话输入
         self.conversation.add_user_message(user_text)
@@ -320,15 +334,27 @@ class MiniCodeApp(App):
             self._pending_approval = None
             self.input_area.enable_input()
 
+    def _on_mcp_async_result(self, result: str) -> None:
+        """MCP 异步操作结果回调（由后台线程触发）。
+
+        通过 Textual 的 call_from_thread 安全地将结果写入 Conversation Widget。
+        """
+        self.call_from_thread(self.conversation.add_system_info, result)
+
     def _do_exit(self) -> None:
         """安全退出 TUI。
 
         退出前：
-        1. 把最新 history 写回 session
-        2. 持久化 session 到磁盘
-        3. 等待后台任务（长期记忆写入等）完成
-        4. 调用 self.exit() 退出 Textual App
+        1. 先清理 MCP 子进程，避免残留进程
+        2. 把最新 history 写回 session
+        3. 持久化 session 到磁盘
+        4. 等待后台任务（长期记忆写入等）完成
+        5. 调用 self.exit() 退出 Textual App
         """
+        # 先清理 MCP 子进程，避免残留进程
+        if self._mcp_manager is not None:
+            self._mcp_manager.dispose()
+
         from app.state.session import save_session
 
         if self._session is not None:

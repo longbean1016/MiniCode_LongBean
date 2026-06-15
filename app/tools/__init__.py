@@ -1,6 +1,7 @@
-﻿"""工具装配入口，负责把各个内置工具注册到统一注册表。"""
+"""工具装配入口，负责把各个内置工具和 MCP 远程工具注册到统一注册表。"""
 
 from app.agent.tooling import ToolRegistry
+from app.mcp.manager import McpManager
 from app.tools.codebase_map import codebase_map_tool
 from app.tools.edit_file import edit_file_tool
 from app.tools.file_overview import file_overview_tool
@@ -17,44 +18,54 @@ from app.tools.run_command import run_command_tool
 from app.tools.write_file import write_file_tool
 
 
-def build_tool_registry() -> ToolRegistry:
-    """
-    构建默认工具注册表。
+# 本地工具清单
+_LOCAL_TOOLS = [
+    list_files_tool,
+    read_file_tool,
+    grep_files_tool,
+    run_command_tool,
+    write_file_tool,
+    edit_file_tool,
+    make_dirs_tool,
+    repo_overview_tool,
+    codebase_map_tool,
+    file_overview_tool,
+    find_symbols_tool,
+    find_references_tool,
+    locate_symbol_tool,
+    get_ast_info_tool,
+]
 
-    当前分两类：
-    1. 基础文件与命令工具
-    2. 代码理解与代码导航工具
-    """
 
-    return ToolRegistry(
-        tools=[
-            # 注册列出目录内容的工具
-            list_files_tool,
-            # 注册读取文件内容的工具
-            read_file_tool,
-            # 注册按文本搜索文件内容的工具
-            grep_files_tool,
-            # 注册执行命令的工具
-            run_command_tool,
-            # 注册写入完整文件的工具
-            write_file_tool,
-            # 注册局部编辑文件内容的工具
-            edit_file_tool,
-            # 注册创建目录的工具
-            make_dirs_tool,
-            # 注册仓库级结构概览工具
-            repo_overview_tool,
-            # 注册代码库第一层地图工具
-            codebase_map_tool,
-            # 注册单文件结构概览工具
-            file_overview_tool,
-            # 注册 Python 符号定义扫描工具
-            find_symbols_tool,
-            # 注册 Python 符号引用搜索工具
-            find_references_tool,
-            # 注册符号定位组合工具
-            locate_symbol_tool,
-            # 注册 Python AST 结构摘要工具
-            get_ast_info_tool,
-        ]
-    )
+def build_tool_registry(
+    cwd: str = "",
+    mcp_config: dict[str, dict] | None = None,
+) -> tuple[ToolRegistry, McpManager]:
+    """构建工具注册表，包含本地工具和 MCP 远程工具。
+
+    Args:
+        cwd: 项目根目录（用于 MCP 配置读写）
+        mcp_config: load_mcp_config() 返回的 MCP 配置，
+                    留空或为 None 则不加载任何 MCP Server
+
+    Returns:
+        (tool_registry, mcp_manager):
+            tool_registry - 包含本地 + MCP 工具的 ToolRegistry
+            mcp_manager   - MCP 生命周期管理器（用于 /mcp 命令和退出清理）
+    """
+    # 先创建空的 ToolRegistry，后续动态注册 MCP 工具
+    tool_registry = ToolRegistry(tools=list(_LOCAL_TOOLS))
+    # 创建 MCP 管理器
+    mcp_manager = McpManager(cwd=cwd, tool_registry=tool_registry)
+
+    # 启动时加载 MCP 配置
+    mcp_config = mcp_config or {}
+    if mcp_config:
+        failed = mcp_manager.bootstrap(mcp_config)
+        if failed:
+            # 启动失败不阻塞，输出日志提示
+            import sys
+            for item in failed:
+                print(f"[MCP] 启动失败: {item}", file=sys.stderr)
+
+    return tool_registry, mcp_manager
