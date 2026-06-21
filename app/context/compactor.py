@@ -1,25 +1,19 @@
 ﻿from __future__ import annotations
 
 import hashlib
-import json
 import os
 import re
-import time
 from dataclasses import dataclass, field
-from pathlib import Path
 
 """上下文压缩执行模块，负责裁剪消息历史并保留关键恢复信息。"""
 
 from app.context.manager import estimate_messages_tokens
 from app.types import ChatMessage
 
-# 这里只对 read_file 做“路径 + 完整内容 hash”的精确去重；
+# 这里只对 read_file 做"路径 + 完整内容 hash"的精确去重；
 # list_files / grep_files 更像集合结果，直接复用同一规则容易误伤。
 _READ_TOOLS = {"read_file"}
 _COLLECTION_TOOLS = {"list_files", "grep_files"}
-_PREVIEW_HEAD_LINES = 8
-_PREVIEW_TAIL_LINES = 3
-_PREVIEW_LINE_CHAR_LIMIT = 160
 _READ_FILE_PATH_PATTERN = re.compile(r"^FILE:\s*(.+)$", re.MULTILINE)
 _MICROCOMPACT_MARKER_PREFIX = "[旧 tool_result 内容已由 microcompact 清理]"
 _EMPTY_SUCCESS_TOOL_RESULT_MARKER = "[工具执行成功，内容无额外信息]"
@@ -70,31 +64,20 @@ class ReadDedupeIdentity:
 def compact_recent_messages(
     messages: list[ChatMessage],
     *,
-    max_recent_tool_results: int,
-    truncate_tool_result_chars: int,
-    workspace: str | None = None,
     pinned_tool_names: set[str] | None = None,
     target_tokens: int | None = None,
     protected_recent_messages: int = 6,
 ) -> CompactionResult:
     """
-    对 recent window 做更接近 minicode 的微压缩。
-
-    关键点有两条：
-    1. 先按阶段处理，再在每一阶段后检查“预算是否已经足够”
-    2. 如果预算还不够，优先压旧消息，不提前破坏最近结构化证据
+    对 recent window 做微压缩。
 
     阶段顺序：
     1. 删除 assistant_progress
-    2. 对超大 tool_result 落盘并替换成首尾预览
-    3. 对重复读取结果做语义去重
-    4. 过滤纯确认类 tool_result
-    5. 去掉连续重复 assistant 回复
-    6. 如果仍超预算，再做一次“保护最近消息”的优先裁剪
+    2. 对重复读取结果做语义去重
+    3. 过滤纯确认类 tool_result
+    4. 去掉连续重复 assistant 回复
+    5. 如果仍超预算，再做一次"保护最近消息"的优先裁剪
     """
-    # 第一步先去掉 progress 类消息。
-    # 这类消息只对“流式展示过程”有用，对下一次推理几乎没有事实价值，
-    # 越早删掉，后面的压缩就越能把预算留给真实证据。
     compacted = [
         dict(message)
         for message in messages
@@ -103,37 +86,11 @@ def compact_recent_messages(
     result = CompactionResult(messages=compacted)
     result.dropped_progress_messages = max(0, len(messages) - len(compacted))
 
-    workspace_path = Path(workspace).resolve() if workspace else Path.cwd().resolve()
-    cache_dir = workspace_path / ".cache"
-    pinned_tools = {
-        str(tool_name).strip()
-        for tool_name in (pinned_tool_names or set())
-        if str(tool_name).strip()
-    }
-
-    # 优先使用工具原始输出；如果 ToolRegistry 已经做过 smart truncate，
-    # 会把完整原文放进 meta.raw_output。
-    # 这里单独缓存“工具原始输出”，后面的每个压缩阶段都基于同一份原文做判断。
-    # 这样即使 message["content"] 已经被预览版替换，去重/摘要阶段仍能基于完整证据工作。
     original_tool_contents: dict[int, str] = {
         index: _get_tool_original_content(message)
         for index, message in enumerate(compacted)
         if message.get("role") == "tool_result"
     }
-
-    effective_truncate_chars = _resolve_truncate_budget(
-        base_truncate_chars=truncate_tool_result_chars,
-        current_tokens=estimate_messages_tokens(compacted),
-        target_tokens=target_tokens,
-    )
-    _truncate_large_tool_results(
-        compacted=compacted,
-        original_tool_contents=original_tool_contents,
-        truncate_tool_result_chars=effective_truncate_chars,
-        cache_dir=cache_dir,
-        workspace_path=workspace_path,
-        result=result,
-    )
 
     _dedupe_tool_results(
         compacted=compacted,
@@ -213,67 +170,6 @@ def _is_within_target(*, current_tokens: int, target_tokens: int | None) -> bool
     return current_tokens <= target_tokens
 
 
-def _resolve_truncate_budget(
-    *,
-    base_truncate_chars: int,
-    current_tokens: int,
-    target_tokens: int | None,
-) -> int:
-    """
-    根据当前预算压力动态收紧 tool_result 的触发阈值。
-
-    压力越大，就越早把大结果替换成 preview；
-    压力不大时，尽量沿用外层 policy 给出的阈值，避免过度压缩。
-    """
-    if base_truncate_chars <= 0:
-        return 0
-    if target_tokens is None or target_tokens <= 0 or current_tokens <= target_tokens:
-        return base_truncate_chars
-
-    pressure_ratio = target_tokens / max(current_tokens, 1)
-    scaled = int(base_truncate_chars * max(0.35, min(1.0, pressure_ratio)))
-    return max(600, min(base_truncate_chars, scaled))
-
-
-def _truncate_large_tool_results(
-    *,
-    compacted: list[ChatMessage],
-    original_tool_contents: dict[int, str],
-    truncate_tool_result_chars: int,
-    cache_dir: Path,
-    workspace_path: Path,
-    result: CompactionResult,
-) -> None:
-    """先把过大的 tool_result 压成可追溯的首尾预览，而不是整段砍头去尾。"""
-    for index, message in enumerate(compacted):
-        if message.get("role") != "tool_result":
-            continue
-
-        original_content = original_tool_contents[index]
-        if len(original_content) <= truncate_tool_result_chars:
-            continue
-
-        tool_name = str(message.get("tool_name", "")) or "unknown"
-        persisted_path = _persist_tool_result(
-            cache_dir=cache_dir,
-            content=original_content,
-            tool_name=tool_name,
-            message_index=index,
-        )
-        preview = _generate_tool_result_preview(
-            content=original_content,
-            tool_name=tool_name,
-            persisted_path=persisted_path,
-            workspace_path=workspace_path,
-        )
-
-        compacted[index]["content"] = preview
-        compacted[index]["_persisted_path"] = str(persisted_path)
-        compacted[index]["_tool_result_preview"] = True
-        result.truncated_tool_results += 1
-        result.tokens_freed_estimate += max(0, len(original_content) - len(preview)) // 4
-
-
 def _microcompact_tool_results(
     *,
     compacted: list[ChatMessage],
@@ -317,7 +213,7 @@ def _microcompact_tool_results(
         except Exception:
             extracted = {}
         # 轻量模型抽取成功时，直接按结构化槽位写入结果；
-        # 失败则保持“只清正文、不写 WM”的文档约定。
+        # 失败则保持"只清正文、不写 WM"的文档约定。
         result.carried_tool_findings.extend(
             _normalize_extracted_lines(extracted, "tool_findings")
         )
@@ -451,7 +347,6 @@ def _is_already_microcompacted_tool_result(message: ChatMessage) -> bool:
         return True
     return bool(
         message.get("_microcompacted")
-        or message.get("_tool_result_preview")
         or message.get("_deduped_read_result")
     )
 
@@ -476,7 +371,7 @@ def _dedupe_tool_results(
     result: CompactionResult,
 ) -> None:
     """对重复读取结果做去重，但保留最新一份完整证据。"""
-    # 反向扫描意味着“保留最新一份，折掉更旧的一份”。
+    # 反向扫描意味着"保留最新一份，折掉更旧的一份"。
     # 这样模型看到的仍然是离当前推理最近的结果，不会因为去重把最新证据删掉。
     last_seen_by_key: dict[tuple[str, str, str], int] = {}
     last_seen_collection_key: dict[tuple[str, str], int] = {}
@@ -498,7 +393,7 @@ def _dedupe_tool_results(
             if collection_key not in last_seen_collection_key:
                 last_seen_collection_key[collection_key] = index
                 continue
-            # list/grep 更像“扫描快照”，这里不要求逐字符完全一致，
+            # list/grep 更像"扫描快照"，这里不要求逐字符完全一致，
             # 而是按头部统计 + 结果集合做轻量签名，避免同一轮反复扫目录把上下文刷爆。
             compacted[index]["content"] = (
                 "[扫描结果已去重：保留本轮较新的同类结果]\n"
@@ -521,7 +416,7 @@ def _dedupe_tool_results(
             continue
 
         # read_file 则必须更严格。
-        # 只有“规范化路径 + 完整内容 hash”都相同，才认为是同一份文件事实；
+        # 只有"规范化路径 + 完整内容 hash"都相同，才认为是同一份文件事实；
         # 任何一个字符变化，都必须保留为新证据，不能偷懒按文件名模糊折叠。
         compacted[index]["content"] = (
             "[读取结果已去重：文件内容未变化，保留本轮较新的同文件结果]\n"
@@ -588,7 +483,7 @@ def _drop_low_priority_old_messages(
     protected_recent_messages = max(0, protected_recent_messages)
 
     # 这一步是兜底，不是主力压缩手段。
-    # 只有前面的“预览化 / 去重 / 语义折叠”都做完仍超预算，才允许直接删旧消息。
+    # 只有前面的"预览化 / 去重 / 语义折叠"都做完仍超预算，才允许直接删旧消息。
     while estimate_messages_tokens(working) > target_tokens:
         protected_start = max(0, len(working) - protected_recent_messages)
         candidate_index = _find_low_priority_drop_index(
@@ -659,129 +554,6 @@ def _get_tool_original_content(message: ChatMessage) -> str:
         if isinstance(raw_output, str) and raw_output:
             return raw_output
     return str(message.get("content", ""))
-
-
-def _persist_tool_result(
-    *,
-    cache_dir: Path,
-    content: str,
-    tool_name: str,
-    message_index: int,
-) -> Path:
-    """把超大 tool_result 原文落盘，方便后续排查和人工查看。"""
-    cache_dir.mkdir(parents=True, exist_ok=True)
-
-    safe_tool_name = _sanitize_tool_name(tool_name)
-    file_name = f"tool_result_{safe_tool_name}_{message_index}_{int(time.time() * 1000)}.txt"
-    persisted_path = cache_dir / file_name
-
-    meta = {
-        "tool_name": tool_name,
-        "message_index": message_index,
-        "original_size": len(content),
-        "timestamp": time.time(),
-    }
-    header = json.dumps(meta, ensure_ascii=False) + "\n---CONTENT---\n"
-    return _write_persisted_tool_result(
-        preferred_path=persisted_path,
-        fallback_dir=cache_dir.parent / "tmp" / "context_cache",
-        safe_tool_name=safe_tool_name,
-        message_index=message_index,
-        content=header + content,
-    )
-
-
-def _write_persisted_tool_result(
-    *,
-    preferred_path: Path,
-    fallback_dir: Path,
-    safe_tool_name: str,
-    message_index: int,
-    content: str,
-) -> Path:
-    """优先写 .cache；遇到权限问题时退到 workspace/tmp/context_cache。"""
-    # 先写同名临时文件再原子替换，避免中途异常时留下半截文件。
-    # 这里不用 tempfile.mkstemp：在部分 Windows 环境中随机临时名探测会异常变慢；
-    # 目标文件名已经包含毫秒时间戳和消息索引，直接派生 .tmp 路径足够稳定。
-    for target_path in (
-        preferred_path,
-        fallback_dir / preferred_path.name,
-    ):
-        target_path.parent.mkdir(parents=True, exist_ok=True)
-        temp_path = target_path.parent / (
-            f".tmp_{safe_tool_name}_{message_index}_{os.getpid()}_"
-            f"{int(time.time() * 1000)}.tmp"
-        )
-        try:
-            temp_path.write_text(content, encoding="utf-8")
-            os.replace(temp_path, target_path)
-            return target_path
-        except PermissionError:
-            try:
-                if temp_path.exists():
-                    os.unlink(temp_path)
-            except OSError:
-                pass
-            continue
-
-    # 两个位置都不可写时才抛错；调用方会暴露真实环境问题。
-    raise PermissionError(f"无法写入工具结果缓存: {preferred_path}")
-
-
-def _generate_tool_result_preview(
-    *,
-    content: str,
-    tool_name: str,
-    persisted_path: Path,
-    workspace_path: Path,
-) -> str:
-    """生成 minicode 风格的按行预览，而不是整段按字符切头尾。"""
-    lines = content.splitlines() or [content]
-    head_lines = lines[:_PREVIEW_HEAD_LINES]
-
-    tail_lines: list[str] = []
-    if len(lines) > (_PREVIEW_HEAD_LINES + _PREVIEW_TAIL_LINES + 1):
-        tail_lines = lines[-_PREVIEW_TAIL_LINES:]
-
-    display_path = _format_display_path(persisted_path, workspace_path)
-    parts = [
-        f"[工具结果已落盘，为节省上下文已截断，原始字符数 {len(content)}]",
-        f"工具: {tool_name}",
-        f"路径: {display_path}",
-        "",
-        "--- 预览（首尾几行） ---",
-    ]
-    parts.extend(_trim_preview_line(line) for line in head_lines)
-
-    omitted_lines = len(lines) - len(head_lines) - len(tail_lines)
-    if omitted_lines > 0:
-        parts.append(f"...（省略 {omitted_lines} 行）...")
-
-    if tail_lines:
-        parts.extend(_trim_preview_line(line) for line in tail_lines)
-
-    return "\n".join(parts)
-
-
-def _sanitize_tool_name(tool_name: str) -> str:
-    """把工具名转换成适合落盘的文件名片段。"""
-    normalized = re.sub(r"[^A-Za-z0-9_.-]+", "_", tool_name).strip("._")
-    return normalized or "unknown"
-
-
-def _format_display_path(path: Path, workspace_path: Path) -> str:
-    """尽量把路径显示成相对 workspace 的 .cache/... 形式。"""
-    try:
-        return path.relative_to(workspace_path).as_posix()
-    except ValueError:
-        return str(path)
-
-
-def _trim_preview_line(line: str) -> str:
-    """避免单行超长导致 preview 仍然过胖。"""
-    if len(line) <= _PREVIEW_LINE_CHAR_LIMIT:
-        return line
-    return f"{line[:_PREVIEW_LINE_CHAR_LIMIT]} ...[本行已截断]"
 
 
 def _build_read_dedupe_identity(

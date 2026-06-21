@@ -669,7 +669,6 @@ def _build_compacted_request(
         messages=source_recent_messages,
         summary_source_messages=summary_source_messages,
         max_recent_tool_results=policy.max_recent_tool_results,
-        truncate_tool_result_chars=policy.truncate_tool_result_chars,
         workspace=session.workspace,
         usable_budget=usable_budget,
         fixed_overhead_tokens=fixed_overhead_tokens,
@@ -801,7 +800,6 @@ class LightweightCompactionConfig:
     """
 
     max_recent_tool_results: int
-    truncate_tool_result_chars: int
     protected_recent_messages: int = 6
 
 
@@ -847,7 +845,6 @@ class LightweightContextPhase:
         *,
         messages: list[ChatMessage],
         config: LightweightCompactionConfig,
-        workspace: str,
         usable_budget: int,
         fixed_overhead_tokens: int,
         pinned_tool_names: set[str] | None,
@@ -858,9 +855,6 @@ class LightweightContextPhase:
         )
         result = compact_recent_messages(
             messages,
-            max_recent_tool_results=config.max_recent_tool_results,
-            truncate_tool_result_chars=config.truncate_tool_result_chars,
-            workspace=workspace,
             pinned_tool_names=pinned_tool_names,
             target_tokens=target_tokens,
             protected_recent_messages=config.protected_recent_messages,
@@ -1058,7 +1052,6 @@ class ContextCompactor:
         compaction_result, steps_taken = self._lightweight_phase.run(
             messages=messages,
             config=lightweight_config,
-            workspace=workspace,
             usable_budget=usable_budget,
             fixed_overhead_tokens=fixed_overhead_tokens,
             pinned_tool_names=pinned_tool_names,
@@ -1166,7 +1159,6 @@ class ContextCompactorPipeline:
         messages: list[ChatMessage],
         summary_source_messages: list[ChatMessage] | None = None,
         max_recent_tool_results: int,
-        truncate_tool_result_chars: int,
         workspace: str,
         usable_budget: int,
         fixed_overhead_tokens: int,
@@ -1184,7 +1176,6 @@ class ContextCompactorPipeline:
             summary_source_messages=summary_source_messages,
             lightweight_config=LightweightCompactionConfig(
                 max_recent_tool_results=max_recent_tool_results,
-                truncate_tool_result_chars=truncate_tool_result_chars,
             ),
             workspace=workspace,
             usable_budget=usable_budget,

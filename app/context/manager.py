@@ -53,7 +53,6 @@ class ContextPolicy:
     retrieval_top_k: int
     memory_item_chars: int
     max_recent_tool_results: int
-    truncate_tool_result_chars: int
 
 
 def estimate_tokens(text: str) -> int:
@@ -155,7 +154,6 @@ def decide_context_policy(
             retrieval_top_k=2,
             memory_item_chars=80,
             max_recent_tool_results=2,
-            truncate_tool_result_chars=800,
         )
     elif ratio >= 0.65:
         policy = ContextPolicy(
@@ -165,7 +163,6 @@ def decide_context_policy(
             retrieval_top_k=4,
             memory_item_chars=110,
             max_recent_tool_results=3,
-            truncate_tool_result_chars=1600,
         )
     elif ratio >= 0.45:
         policy = ContextPolicy(
@@ -175,7 +172,6 @@ def decide_context_policy(
             retrieval_top_k=6,
             memory_item_chars=140,
             max_recent_tool_results=4,
-            truncate_tool_result_chars=2500,
         )
     else:
         policy = ContextPolicy(
@@ -185,7 +181,6 @@ def decide_context_policy(
             retrieval_top_k=8,
             memory_item_chars=180,
             max_recent_tool_results=5,
-            truncate_tool_result_chars=4000,
         )
 
     # 代码分析任务里，tool_result 往往承载真实符号表和文件事实。
@@ -200,7 +195,6 @@ def decide_context_policy(
         retrieval_top_k=policy.retrieval_top_k,
         memory_item_chars=policy.memory_item_chars,
         max_recent_tool_results=max(policy.max_recent_tool_results, 8),
-        truncate_tool_result_chars=max(policy.truncate_tool_result_chars, 6000),
     )
 
 
