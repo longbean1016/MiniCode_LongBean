@@ -193,12 +193,9 @@ def build_history_fingerprint(messages: list[ChatMessage]) -> str:
     return digest.hexdigest()
 
 
-def build_token_stats_snapshot(*, preview_stats: ContextStats, final_stats: ContextStats) -> dict[str, Any]:
+def build_token_stats_snapshot(*, final_stats: ContextStats) -> dict[str, Any]:
     """抽取一份轻量 token 快照，方便恢复和排查。"""
     return {
-        "preview_total": preview_stats.total_tokens,
-        "preview_usage": preview_stats.usage_ratio,
-        "preview_budget": preview_stats.usable_budget,
         "final_total": final_stats.total_tokens,
         "final_usage": final_stats.usage_ratio,
         "final_budget": final_stats.usable_budget,

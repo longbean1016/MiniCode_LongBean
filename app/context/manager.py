@@ -105,7 +105,7 @@ def collect_context_stats(
     统计一次模型请求前的上下文占用。
 
     这里把 system prompt 和记忆上下文拆开统计，
-    方便后面观察“到底是 recent history 胖，还是 memory 注入太多”。
+    方便后面观察"到底是 recent history 胖，还是 memory 注入太多"。
     """
     system_tokens = estimate_message_tokens({"role": "system", "content": system_prompt})
     recent_tokens = estimate_messages_tokens(recent_messages)
@@ -139,62 +139,27 @@ def collect_context_stats(
 
 
 def decide_context_policy(
-    stats: ContextStats,
+    stats: ContextStats | None = None,
     *,
     analysis_mode: bool = False,
 ) -> ContextPolicy:
-    """根据上下文占用比例决定压缩等级和记忆注入预算。"""
-    ratio = stats.usage_ratio
-
-    if ratio >= 0.80:
-        policy = ContextPolicy(
-            level=3,
-            keep_rounds=3,
-            memory_top_k=1,
-            retrieval_top_k=2,
-            memory_item_chars=80,
-            max_recent_tool_results=2,
-        )
-    elif ratio >= 0.65:
-        policy = ContextPolicy(
-            level=2,
-            keep_rounds=4,
-            memory_top_k=2,
-            retrieval_top_k=4,
-            memory_item_chars=110,
-            max_recent_tool_results=3,
-        )
-    elif ratio >= 0.45:
-        policy = ContextPolicy(
-            level=1,
-            keep_rounds=5,
-            memory_top_k=3,
-            retrieval_top_k=6,
-            memory_item_chars=140,
-            max_recent_tool_results=4,
-        )
-    else:
-        policy = ContextPolicy(
+    """返回固定的上下文策略。256K 上下文下无需动态收紧。"""
+    if analysis_mode:
+        return ContextPolicy(
             level=0,
-            keep_rounds=6,
+            keep_rounds=8,
             memory_top_k=4,
             retrieval_top_k=8,
             memory_item_chars=180,
-            max_recent_tool_results=5,
+            max_recent_tool_results=8,
         )
-
-    # 代码分析任务里，tool_result 往往承载真实符号表和文件事实。
-    # 如果压得和普通问答一样狠，就容易出现“前面看过、后面答错”的现象。
-    if not analysis_mode:
-        return policy
-
     return ContextPolicy(
-        level=policy.level,
-        keep_rounds=min(policy.keep_rounds + 1, 8),
-        memory_top_k=policy.memory_top_k,
-        retrieval_top_k=policy.retrieval_top_k,
-        memory_item_chars=policy.memory_item_chars,
-        max_recent_tool_results=max(policy.max_recent_tool_results, 8),
+        level=0,
+        keep_rounds=6,
+        memory_top_k=4,
+        retrieval_top_k=8,
+        memory_item_chars=180,
+        max_recent_tool_results=5,
     )
 
 
@@ -205,20 +170,6 @@ class CompactionPolicy:
     level: int
 
 
-def get_compaction_level(session: SessionData) -> int:
-    try:
-        return max(0, int(session.extra.get("compaction_level", 0)))
-    except (TypeError, ValueError):
-        return 0
-
-
-def build_compaction_policy(session: SessionData) -> CompactionPolicy:
-    level = get_compaction_level(session)
-
-    if level <= 0:
-        return CompactionPolicy(keep_rounds=6, min_round_delta_for_resummarize=2, level=0)
-    if level == 1:
-        return CompactionPolicy(keep_rounds=5, min_round_delta_for_resummarize=2, level=1)
-    if level == 2:
-        return CompactionPolicy(keep_rounds=4, min_round_delta_for_resummarize=3, level=2)
-    return CompactionPolicy(keep_rounds=3, min_round_delta_for_resummarize=4, level=level)
+def build_compaction_policy(session: SessionData | None = None) -> CompactionPolicy:
+    """返回固定的压缩策略。"""
+    return CompactionPolicy(keep_rounds=6, min_round_delta_for_resummarize=2, level=0)

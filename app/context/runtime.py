@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
@@ -6,7 +6,6 @@ from typing import Any
 
 """运行时上下文装配层，负责拼接消息窗口、记忆注入和压缩结果。"""
 
-from app.context.manager import build_compaction_policy
 from app.context.compact_memory import (
     CompactMemorySnapshot,
     build_active_context_snapshot,
@@ -89,7 +88,6 @@ class PreparedAgentContext:
 
     messages: list[ChatMessage]
     policy: ContextPolicy
-    preview_stats: ContextStats
     stats: ContextStats
     active_context_summary: str
     active_context_snapshot: CompactMemorySnapshot
@@ -142,27 +140,7 @@ def prepare_agent_context(
         user_profile_context=user_profile_context,
     )
 
-    # 先做压缩前预估，用来判断这一轮的真实上下文压力。
-    initial_policy = build_compaction_policy(session)
-    preview_recent_messages, preview_summary = _build_preview_source(
-        full_history=full_history,
-        session=session,
-        cached_state=cached_state,
-        initial_keep_rounds=max(6, initial_policy.keep_rounds),
-    )
-    preview_memory_context = _build_preview_memory_context(
-        active_context_summary=preview_summary,
-        working_memory=working_memory,
-    )
-    preview_stats = collect_context_stats(
-        system_prompt=base_system_prompt,
-        recent_messages=preview_recent_messages,
-        memory_context=preview_memory_context,
-        usable_budget=usable_budget,
-    )
-
-    # 先基于“预估上下文”选压缩级别，而不是等真正超预算了再补救。
-    policy = decide_context_policy(preview_stats, analysis_mode=analysis_mode)
+    policy = decide_context_policy(analysis_mode=analysis_mode)
     session.extra["compaction_level"] = policy.level
 
     # 命中可复用的 active context 时，优先走增量恢复，
@@ -208,9 +186,10 @@ def prepare_agent_context(
         recent_risks=recent_risks,
     )
 
-    fixed_overhead_tokens = max(0, preview_stats.total_tokens - preview_stats.recent_tokens)
+    # 固定 system + memory 开销估计（原基于 preview_stats 计算，简化为常数）
+    fixed_overhead_tokens = int(usable_budget * 0.12)
     pipeline = ContextCompactorPipeline()
-    # pipeline 负责真正把“摘要、memory、tool_result 裁剪、系统提示词”拼成最终请求。
+    # pipeline 负责真正把"摘要、memory、tool_result 裁剪、系统提示词"拼成最终请求。
     # prepare_agent_context 自己只做编排，不直接改写消息细节。
     pipeline_result, memory_context, final_stats, messages = _build_compacted_request(
         pipeline=pipeline,
@@ -243,7 +222,7 @@ def prepare_agent_context(
     )
 
     # 如果 memory 注入之后上下文还是高压，就再强制走一次 auto compact。
-    # 这一步是第二道保险，避免“摘要已经做了，但 memory 一加回来又超压”。
+    # 这一步是第二道保险，避免"摘要已经做了，但 memory 一加回来又超压"。
     if (
         final_stats.usage_ratio >= AUTO_COMPACT_TRIGGER_RATIO
         and pipeline_result.auto_compact_result.strategy != "full"
@@ -290,7 +269,6 @@ def prepare_agent_context(
         resolved_project_constraints=resolved_project_constraints,
         recent_risks=recent_risks,
         compacted_messages=pipeline_result.messages,
-        preview_stats=preview_stats,
         final_stats=final_stats,
         pipeline_history_entry=pipeline_result.compaction_history_entry,
         cached_state=cached_state,
@@ -304,7 +282,6 @@ def prepare_agent_context(
     return PreparedAgentContext(
         messages=messages,
         policy=policy,
-        preview_stats=preview_stats,
         stats=final_stats,
         active_context_summary=active_context_summary,
         active_context_snapshot=active_context_snapshot,
@@ -540,7 +517,6 @@ def _save_active_context_state(
     resolved_project_constraints: list[str],
     recent_risks: list[str],
     compacted_messages: list[ChatMessage],
-    preview_stats: ContextStats,
     final_stats: ContextStats,
     pipeline_history_entry: dict[str, object],
     cached_state: ContextStateData | None,
@@ -572,12 +548,11 @@ def _save_active_context_state(
             0.0,
             float(auto_compact_suppressed_until or 0.0),
         ),
-        # 这里保存的是“本轮结束后”的最近一次 microcompact 时间。
+        # 这里保存的是"本轮结束后"的最近一次 microcompact 时间。
         # 下一轮如果直接命中 context_state，就能继续做时间节流判断。
         last_microcompact_at=max(0.0, float(last_microcompact_at or 0.0)),
         compaction_history=history_entries,
         last_token_stats=build_token_stats_snapshot(
-            preview_stats=preview_stats,
             final_stats=final_stats,
         ),
     )

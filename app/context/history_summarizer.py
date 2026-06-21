@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import hashlib
 import json
@@ -110,7 +110,7 @@ class OlderHistorySummarizer:
         # 这样后面无论是模型阈值不满足、命中缓存、还是模型调用失败，都有稳定兜底结果。
         fallback_summary = build_older_history_summary(older_messages)
         fingerprint = self._fingerprint_messages(older_messages)
-        policy = build_compaction_policy(session)
+        policy = build_compaction_policy()
 
         cached_summary = str(session.extra.get("older_history_summary", "")).strip()
         cached_fingerprint = str(session.extra.get("older_history_fingerprint", "")).strip()
@@ -136,7 +136,7 @@ class OlderHistorySummarizer:
             return fallback_summary
 
         # 指纹一致说明 older 区域没有实质变化，直接复用缓存摘要即可。
-        # 这里不重新总结，是为了避免“同一段旧历史被模型多次改写措辞”，降低漂移。
+        # 这里不重新总结，是为了避免"同一段旧历史被模型多次改写措辞"，降低漂移。
         if cached_summary and cached_fingerprint == fingerprint:
             self._save_session_state(
                 session=session,
@@ -163,7 +163,7 @@ class OlderHistorySummarizer:
         # 传给摘要模型的输入不是原始消息 JSON，而是按 role 扁平化后的文本。
         # 这样做有两个好处：
         # 1. 更省 token
-        # 2. 更明确告诉模型“哪些是 user / assistant / tool result”
+        # 2. 更明确告诉模型"哪些是 user / assistant / tool result"
         context_text = self._build_context_text(older_messages)
         if not context_text:
             self._save_session_state(
@@ -216,7 +216,7 @@ class OlderHistorySummarizer:
         focus_lines: list[str] | None = None,
     ) -> tuple[str, CompactMemorySnapshot | None]:
         """
-        为 session/full compact 生成“模型优先，规则兜底”的结构化摘要。
+        为 session/full compact 生成"模型优先，规则兜底"的结构化摘要。
 
         返回值约定：
         - 成功时返回模型参与融合后的 summary_text / summary_snapshot
@@ -252,7 +252,7 @@ class OlderHistorySummarizer:
 
         model_snapshot = parse_active_context_summary(model_summary)
         if not model_snapshot:
-            # 模型可能没带“结构化压缩记忆”总标题，这里补一个再试一次解析。
+            # 模型可能没带"结构化压缩记忆"总标题，这里补一个再试一次解析。
             model_snapshot = parse_active_context_summary(
                 "结构化压缩记忆\n" + model_summary
             )
@@ -560,7 +560,7 @@ class OlderHistorySummarizer:
         compaction_level: int,
     ) -> None:
         """把旧历史摘要相关的 context state 写入 session.extra。"""
-        # 这些字段本质上就是“older 区域的持久化上下文状态”：
+        # 这些字段本质上就是"older 区域的持久化上下文状态"：
         # 下轮进来后，无需重新扫描完整旧历史，就能判断是否复用摘要、是否需要升级压缩等级。
         session.extra["older_history_summary"] = summary
         session.extra["older_history_fingerprint"] = fingerprint

@@ -314,15 +314,6 @@ def _run_agent_loop(
             f"steps={','.join(prepared_context.pipeline_steps)}"
         )
         log_event(
-            f"[session={session_id or '-'}] 第 {step_index + 1} 轮压缩前预估: "
-            f"preview_total={prepared_context.preview_stats.total_tokens} "
-            f"preview_usage={prepared_context.preview_stats.usage_ratio:.1%} "
-            f"preview_budget={prepared_context.preview_stats.usable_budget} "
-            f"preview_recent={prepared_context.preview_stats.recent_tokens} "
-            f"preview_memory={prepared_context.preview_stats.memory_tokens} "
-            f"preview_tool_results={prepared_context.preview_stats.tool_result_tokens}"
-        )
-        log_event(
             f"[session={session_id or '-'}] 第 {step_index + 1} 轮 token统计: "
             f"total={prepared_context.stats.total_tokens} usage={prepared_context.stats.usage_ratio:.1%} "
             f"budget={prepared_context.stats.usable_budget} system={prepared_context.stats.system_tokens} "
