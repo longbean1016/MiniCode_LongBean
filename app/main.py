@@ -93,30 +93,33 @@ def _load_or_create_session(workspace: str, session_id: str, resume: str) -> Ses
 
 def main() -> None:
     """程序入口：加载配置、恢复会话、启动 TUI 终端交互。"""
+    import time
+
+    _t_startup = time.time()
     parser = _build_arg_parser()
     args = parser.parse_args()
 
     # 配置先加载，再组装所有依赖。
-    # main 的职责不是执行业务逻辑，而是把"模型 / 工具 / 记忆 / 会话"这些基础设施接起来。
     config = load_config()
+    print(f"[STARTUP] config load: {time.time() - _t_startup:.1f}s")
 
     if args.resume == "list":
         metas = list_sessions(config.workspace_root)
         print(format_session_list(metas))
         return
 
-    # 工具注册表和模型适配器都在启动时构建，
-    # 后续整轮会话里复用同一套实例，避免每次用户输入都重新初始化依赖。
     from app.mcp.config import load_mcp_config
 
-    # 读取 MCP 配置（.mcp.json），文件不存在时返回空字典
+    _t = time.time()
     mcp_config = load_mcp_config(config.workspace_root)
-    # 构建工具注册表 + MCP 管理器
     tool_registry, mcp_manager = build_tool_registry(
         cwd=config.workspace_root,
         mcp_config=mcp_config,
+        start_mcp=False,  # 不阻塞，MCP 在 TUI 启动后异步连接
     )
+    print(f"[STARTUP] tool registry: {time.time() - _t:.1f}s (MCP deferred, {len(mcp_config)} servers)")
 
+    _t = time.time()
     model = OpenAIModelAdapter(
         api_key=config.api_key,
         base_url=config.base_url,
@@ -129,12 +132,9 @@ def main() -> None:
         circuit_failure_threshold=config.model_circuit_failure_threshold,
         circuit_recovery_timeout_seconds=config.model_circuit_recovery_timeout_seconds,
     )  # type: ignore[arg-type]
+    print(f"[STARTUP] model adapter: {time.time() - _t:.1f}s")
 
-    # ToolContext 保存的是"工具运行时共享状态"，
-    # 例如当前工作目录、已批准动作；它不是一次性参数，而是整场会话的执行上下文。
-    tool_context = ToolContext(
-        cwd=config.workspace_root,
-    )
+    tool_context = ToolContext(cwd=config.workspace_root)
 
     # 只有显式开启 Qdrant 时，才初始化服务端向量索引。
     # 这样默认开发模式仍然可以只用本地 JSON 跑起来。
@@ -255,12 +255,18 @@ def main() -> None:
         resume=args.resume or "",
     )
 
-    history: list[ChatMessage] = list(session.messages)
+    print(f"[STARTUP] memory pipeline + summarizer: {time.time() - _t:.1f}s")
 
-    # ---- TUI 模式：用 MiniCodeApp 接管终端 ----
-    # 所有业务依赖已在上方组装完成，直接注入 App 即可。
-    # MiniCodeApp.run() 会接管终端、渲染三区布局，
-    # 用户输入通过 InputArea Widget 驱动 stream_agent() 流式执行。
+    _t = time.time()
+    history: list[ChatMessage] = list(session.messages)
+    print(f"[STARTUP] session load: {time.time() - _t:.1f}s (messages: {len(history)})")
+
+    print(f"[STARTUP] total startup: {time.time() - _t_startup:.1f}s")
+    # MCP Server 在后台异步连接，不阻塞 TUI 启动
+    if mcp_config:
+        mcp_manager.bootstrap_async(mcp_config)
+
+    # ----
     tui_app = MiniCodeApp(
         model=model,
         tool_registry=tool_registry,

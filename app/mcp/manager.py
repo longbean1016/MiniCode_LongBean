@@ -61,9 +61,9 @@ class McpManager:
     # ---- 启动时批量初始化 ----
 
     def bootstrap(self, mcp_config: dict[str, dict]) -> list[str]:
-        """启动时批量初始化 .mcp.json 中已配置的 MCP Server。
+        """启动时批量初始化 .mcp.json 中已配置的 MCP Server（阻塞，返回失败列表）。
 
-        单个 Server 启动失败不阻塞其他 Server。
+        并行启动所有 Server，单个失败不阻塞其他。
 
         Args:
             mcp_config: load_mcp_config() 返回的配置字典
@@ -72,14 +72,61 @@ class McpManager:
             启动失败的 Server 名称列表（用于日志提示）
         """
         failed: list[str] = []
+        threads: list[threading.Thread] = []
+        lock = threading.Lock()
+
+        def _start_one(name: str, config: dict) -> None:
+            try:
+                self._start_server(name, config)
+            except Exception as error:
+                with lock:
+                    failed.append(f"{name}: {error}")
 
         for server_name, config in mcp_config.items():
-            try:
-                self._start_server(server_name, config)
-            except Exception as error:
-                failed.append(f"{server_name}: {error}")
+            t = threading.Thread(
+                target=_start_one,
+                args=(server_name, config),
+                daemon=True,
+            )
+            threads.append(t)
+            t.start()
+
+        for t in threads:
+            t.join()
 
         return failed
+
+    def bootstrap_async(self, mcp_config: dict[str, dict]) -> None:
+        """后台异步启动 .mcp.json 中已配置的 MCP Server。
+
+        不阻塞主线程，并行启动所有 Server。
+        就绪或失败时通过 result_callback 通知 TUI。
+
+        Args:
+            mcp_config: load_mcp_config() 返回的配置字典
+        """
+        lock = threading.Lock()
+
+        def _start_one(name: str, config: dict) -> None:
+            if name in self._clients or name in self._pending_adds:
+                return
+            self._pending_adds.add(name)
+            try:
+                self._start_server(name, config)
+                result = f"✅ MCP Server '{name}' 自动连接（{len(self._clients)} 个工具）"
+                if self._result_callback is not None:
+                    with lock:
+                        self._result_callback(result)
+            except Exception as error:
+                result = f"❌ 启动 MCP Server '{name}' 失败: {error}"
+                if self._result_callback is not None:
+                    with lock:
+                        self._result_callback(result)
+            finally:
+                self._pending_adds.discard(name)
+
+        for server_name, config in mcp_config.items():
+            threading.Thread(target=_start_one, args=(server_name, config), daemon=True).start()
 
     # ---- 运行时 /mcp 命令 ----
 

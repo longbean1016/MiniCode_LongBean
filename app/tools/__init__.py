@@ -40,6 +40,8 @@ _LOCAL_TOOLS = [
 def build_tool_registry(
     cwd: str = "",
     mcp_config: dict[str, dict] | None = None,
+    *,
+    start_mcp: bool = True,
 ) -> tuple[ToolRegistry, McpManager]:
     """构建工具注册表，包含本地工具和 MCP 远程工具。
 
@@ -47,6 +49,7 @@ def build_tool_registry(
         cwd: 项目根目录（用于 MCP 配置读写）
         mcp_config: load_mcp_config() 返回的 MCP 配置，
                     留空或为 None 则不加载任何 MCP Server
+        start_mcp: 是否立即启动 MCP Server（设为 False 可异步启动）
 
     Returns:
         (tool_registry, mcp_manager):
@@ -60,7 +63,7 @@ def build_tool_registry(
 
     # 启动时加载 MCP 配置
     mcp_config = mcp_config or {}
-    if mcp_config:
+    if mcp_config and start_mcp:
         failed = mcp_manager.bootstrap(mcp_config)
         if failed:
             # 启动失败不阻塞，输出日志提示

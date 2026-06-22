@@ -204,7 +204,7 @@ class StdioMcpClient:
                         "capabilities": {},
                         "clientInfo": {"name": "mini-code", "version": "1.0.0"},
                     },
-                    timeout_seconds=5.0,
+                    timeout_seconds=30.0,
                 )
                 # 通知服务端初始化完成
                 self.notify("notifications/initialized", {})
