@@ -120,7 +120,7 @@ def compact_recent_messages(
 def microcompact_old_tool_results(
     messages: list[ChatMessage],
     *,
-    keep_recent_tool_results: int,
+    keep_recent_tool_rounds: int,
     pinned_tool_names: set[str] | None = None,
     semantic_summarizer: object | None = None,
 ) -> CompactionResult:
@@ -138,9 +138,9 @@ def microcompact_old_tool_results(
     result = CompactionResult(messages=compacted)
     result.dropped_progress_messages = max(0, len(messages) - len(compacted))
 
-    protected_tool_indexes = _collect_protected_tool_indexes(
+    protected_tool_indexes = _collect_protected_tool_indexes_by_rounds(
         compacted=compacted,
-        max_recent_tool_results=max(0, keep_recent_tool_results),
+        max_recent_tool_rounds=max(0, keep_recent_tool_rounds),
         pinned_tools={
             str(tool_name).strip()
             for tool_name in (pinned_tool_names or set())
@@ -426,34 +426,49 @@ def _dedupe_tool_results(
         result.deduped_read_results += 1
 
 
-def _collect_protected_tool_indexes(
+def _collect_protected_tool_indexes_by_rounds(
     *,
     compacted: list[ChatMessage],
-    max_recent_tool_results: int,
+    max_recent_tool_rounds: int,
     pinned_tools: set[str],
 ) -> set[int]:
-    """
-    保护最近的 tool_result，以及分析模式下指定工具的最新一次结果。
+    """保护最近 N 轮的全部 tool_result（按 user 消息切分轮次）。
 
-    这些结果往往承载真实文件事实和符号表，不能在微压缩阶段被提前折掉。
+    这些结果往往承载真实文件事实，不能在微压缩阶段被提前折掉。
     """
-    tool_result_indexes = [
-        index
-        for index, message in enumerate(compacted)
-        if message.get("role") == "tool_result"
-    ]
-    keep_count = max(0, int(max_recent_tool_results))
-    keep_indexes = set(tool_result_indexes[-keep_count:]) if keep_count else set()
+    keep_indexes: set[int] = set()
 
+    if max_recent_tool_rounds > 0:
+        # 找到所有 user 消息的位置作为轮边界
+        round_boundaries: list[int] = []
+        for i, msg in enumerate(compacted):
+            if str(msg.get("role", "")) == "user":
+                round_boundaries.append(i)
+
+        if round_boundaries:
+            protected_start = round_boundaries[
+                -min(max_recent_tool_rounds, len(round_boundaries))
+            ]
+            for i, msg in enumerate(compacted):
+                if msg.get("role") == "tool_result" and i >= protected_start:
+                    keep_indexes.add(i)
+        else:
+            # 没有 user 消息，回退：保护全部
+            for i, msg in enumerate(compacted):
+                if msg.get("role") == "tool_result":
+                    keep_indexes.add(i)
+    # max_recent_tool_rounds <= 0 时不保护任何结果
+
+    # pinned_tools：保护指定工具的最新一次结果
     if pinned_tools:
         pending = set(pinned_tools)
-        for index in range(len(compacted) - 1, -1, -1):
-            message = compacted[index]
-            if message.get("role") != "tool_result":
+        for i in range(len(compacted) - 1, -1, -1):
+            msg = compacted[i]
+            if msg.get("role") != "tool_result":
                 continue
-            tool_name = str(message.get("tool_name", "")).strip()
+            tool_name = str(msg.get("tool_name", "")).strip()
             if tool_name in pending:
-                keep_indexes.add(index)
+                keep_indexes.add(i)
                 pending.remove(tool_name)
             if not pending:
                 break

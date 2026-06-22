@@ -292,11 +292,11 @@ def _run_agent_loop(
         microcompact_reason = str(
             prepared_context.compaction_history_entry.get("microcompact_reason", "")
         ).strip()
-        microcompact_tool_results = prepared_context.compaction_history_entry.get(
-            "microcompact_tool_results", 0
+        microcompact_tool_rounds = prepared_context.compaction_history_entry.get(
+            "microcompact_tool_rounds", 0
         )
-        microcompact_keep_recent = prepared_context.compaction_history_entry.get(
-            "microcompact_keep_recent", 0
+        microcompact_keep_recent_rounds = prepared_context.compaction_history_entry.get(
+            "microcompact_keep_recent_rounds", 0
         )
         microcompact_cooldown_remaining = prepared_context.compaction_history_entry.get(
             "microcompact_cooldown_remaining_seconds", 0.0
@@ -308,8 +308,8 @@ def _run_agent_loop(
             f"tool_truncated={prepared_context.compaction_result.truncated_tool_results} "
             f"tool_cleared={prepared_context.compaction_result.cleared_old_tool_results} "
             f"microcompact_reason={microcompact_reason or 'unknown'} "
-            f"microcompact_tool_results={microcompact_tool_results} "
-            f"microcompact_keep_recent={microcompact_keep_recent} "
+            f"microcompact_tool_rounds={microcompact_tool_rounds} "
+            f"microcompact_keep_recent_rounds={microcompact_keep_recent_rounds} "
             f"microcompact_cooldown_left={float(microcompact_cooldown_remaining):.0f}s "
             f"steps={','.join(prepared_context.pipeline_steps)}"
         )

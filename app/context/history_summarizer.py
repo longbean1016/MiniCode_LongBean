@@ -288,7 +288,7 @@ class OlderHistorySummarizer:
             return {"tool_findings": [], "open_issues": [], "key_decisions": []}
 
         lines: list[str] = []
-        for index, item in enumerate(tool_results[:8], start=1):
+        for index, item in enumerate(reversed(tool_results[-8:]), start=1):
             tool_name = str(item.get("tool_name", "") or "unknown")
             tool_input = self._shorten(json.dumps(item.get("tool_input", {}), ensure_ascii=False), 400)
             content = self._shorten(str(item.get("content", "")), 900)
