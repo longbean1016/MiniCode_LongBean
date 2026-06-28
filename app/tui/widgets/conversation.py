@@ -37,6 +37,10 @@ class ConversationWidget(VerticalScroll):
         self._current_static: Static | None = None
         # 已发送消息轮数，用于判断是否需要添加分隔线
         self._turn_count = 0
+        # 本轮是否已有过工具调用（用于判断是否需要收起中间消息）
+        self._had_tool_calls = False
+        # 中间消息是否已被收起
+        self._intermediate_collapsed = False
 
     def on_mount(self) -> None:
         """组件挂载后显示欢迎信息。"""
@@ -82,6 +86,8 @@ class ConversationWidget(VerticalScroll):
         """
         self._current_response = ""
         self._current_static = Static("", classes="agent-response")
+        self._had_tool_calls = False
+        self._intermediate_collapsed = False
         # 先添加 Agent 标签行
         self.mount(Static("Agent", classes="agent-label"))
         self.mount(self._current_static)
@@ -93,9 +99,17 @@ class ConversationWidget(VerticalScroll):
         把新到的文本片段拼接到累积内容中，用 Rich Markdown 重新渲染整体，
         实现"边出字边显示"的效果。
 
+        当模型开始输出最终答案（首个 TextEvent）且本轮已有工具调用时，
+        自动收起所有中间消息（thinking、工具调用、工具结果），
+        让终端只展示纯文字流式输出。
+
         Args:
             text: 模型流式输出的一个文本片段
         """
+        # 首次文本到达 + 本轮用过工具 → 立刻收起中间消息
+        if self._had_tool_calls and not self._intermediate_collapsed:
+            self._collapse_intermediate_messages()
+
         self._current_response += text
         if self._current_static is not None:
             try:
@@ -106,6 +120,22 @@ class ConversationWidget(VerticalScroll):
                 self._current_static.update(self._current_response)
         self._smart_scroll()
 
+    def _collapse_intermediate_messages(self) -> None:
+        """收起本轮所有中间消息（thinking、工具调用、工具结果）。
+
+        在两种时机触发：
+        1. 模型开始输出最终答案时（首个 TextEvent）
+        2. Agent 回复完全结束时（end_agent_response）
+        """
+        for cls in (
+            ".thinking-message",
+            ".tool-call-message",
+            ".tool-result-message",
+        ):
+            for widget in self.query(cls):
+                widget.remove()
+        self._intermediate_collapsed = True
+
     def end_agent_response(self) -> None:
         """结束当前 Agent 回复的流式构建。
 
@@ -114,10 +144,7 @@ class ConversationWidget(VerticalScroll):
         """
         self._current_response = ""
         self._current_static = None
-        # 清理临时消息：thinking 提示、工具调用条、工具结果条
-        for cls in (".thinking-message", ".tool-call-message", ".tool-result-message"):
-            for widget in self.query(cls):
-                widget.remove()
+        self._collapse_intermediate_messages()
 
     def add_thinking(self, text: str) -> None:
         """添加思考过程提示。
@@ -152,6 +179,7 @@ class ConversationWidget(VerticalScroll):
                 flat_items.append(f"{k}={v}")
             args_str = f" ({', '.join(flat_items)})"
 
+        self._had_tool_calls = True
         text = Text()
         text.append(f"  ⚡ 正在调用工具: {name}", style="bold yellow")
         if args_str:

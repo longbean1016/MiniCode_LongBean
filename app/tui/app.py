@@ -27,7 +27,6 @@ from app.tui.events import (
     ToolCallEvent,
     ToolResultEvent,
 )
-from app.tui.widgets.approval_dialog import ApprovalDialog
 from app.tui.widgets.conversation import ConversationWidget
 from app.tui.widgets.header import HeaderWidget
 from app.tui.widgets.input_area import InputArea
@@ -244,13 +243,18 @@ class MiniCodeApp(App):
     def on_input_area_input_submitted(self, event: InputArea.InputSubmitted) -> None:
         """处理用户的输入提交。
 
-        根据输入类型分四种路径：
-        1. 退出命令（exit/quit）→ _do_exit()
-        2. 显式记忆命令 → memory_pipeline.handle_explicit_input()
-        3. /mcp 命令 → mcp_manager.handle_command()
-        4. 普通对话 → _run_agent_stream()
+        根据输入类型分五种路径：
+        1. 审批回复 → _handle_approval_reply()
+        2. 退出命令（exit/quit）→ _do_exit()
+        3. 显式记忆命令 → memory_pipeline.handle_explicit_input()
+        4. /mcp 命令 → mcp_manager.handle_command()
+        5. 普通对话 → _run_agent_stream()
         """
         user_text = event.text
+
+        if event.is_approval:
+            self._handle_approval_reply(user_text)
+            return
 
         # 退出命令
         if user_text.lower() in ("quit", "exit"):
@@ -284,27 +288,20 @@ class MiniCodeApp(App):
         self.input_area.disable_input()
         self._run_agent_stream(user_text)
 
-    def _show_approval_dialog(self, approval) -> None:
-        """显示审批弹窗（在 UI 线程调用）。
+    def _handle_approval_reply(self, answer: str) -> None:
+        """处理审批回复（输入框内输入 y/n 或 s/p/n）。
 
-        Args:
-            approval: ApprovalRequest 实例
-        """
-        dialog = ApprovalDialog(
-            message=approval.message,
-            approval_type=approval.approval_type,
-        )
-        self.push_screen(dialog, callback=self._on_approval_dialog_result)
-
-    def _on_approval_dialog_result(self, answer: str) -> None:
-        """审批弹窗关闭后的回调。
+        命令审批: y → 执行, n → 拒绝
+        工作目录审批: s → 会话级加入, p → 永久加入, n → 拒绝
 
         Args:
             answer: "y" | "n" | "s" | "p"
         """
         approval = self._pending_approval
+        self.input_area.exit_approval_mode()
 
         if approval is None:
+            self.input_area.enable_input()
             return
 
         # ── 拒绝处理 ──
@@ -320,7 +317,6 @@ class MiniCodeApp(App):
             permanent = answer == "p"
             workspace_path = approval.workspace_path
 
-            # 把路径加入 ToolContext 的工作目录集合
             if permanent:
                 self._tool_context.permanent_workspaces.add(workspace_path)
                 self._save_permanent_workspace(workspace_path)
@@ -332,10 +328,9 @@ class MiniCodeApp(App):
                 f"已将 {workspace_path} 加入工作目录（{label}）。"
             )
         else:
-            # 命令审批：把 action_key 加入已批准集合
             self._tool_context.approved_actions.add(approval.action_key)
 
-        # 重新执行工具（共用逻辑）
+        # 重新执行工具
         self._tool_context.approved_actions.add(approval.action_key)
         result = self._tool_registry.execute_tool(
             tool_name=approval.tool_name,
@@ -349,7 +344,6 @@ class MiniCodeApp(App):
             ok=result.ok,
         )
 
-        # 用真实工具结果替换占位 tool_result
         self._history = self._replace_pending_tool_result(
             history=self._history,
             tool_use_id=approval.tool_use_id,
@@ -358,7 +352,6 @@ class MiniCodeApp(App):
             is_error=not result.ok,
         )
         self._pending_approval = None
-        # 继续剩余的 agent 流程
         self._run_agent_stream(None)
 
     @staticmethod
@@ -565,16 +558,20 @@ class MiniCodeApp(App):
                         )
 
                     elif isinstance(event, ApprovalEvent):
-                        # 审批事件：暂存审批请求，UI 显示确认提示，弹出选择弹窗
+                        # 审批事件：对话区显示提示，输入区切换审批模式
                         self._pending_approval = event.approval
                         self.call_from_thread(
                             self.conversation.add_approval_prompt,
                             event.approval.message,
                         )
-                        self.call_from_thread(
-                            self._show_approval_dialog,
-                            event.approval,
-                        )
+                        if event.approval.approval_type == "workspace_access":
+                            self.call_from_thread(
+                                self.input_area.enter_workspace_approval_mode,
+                            )
+                        else:
+                            self.call_from_thread(
+                                self.input_area.enter_approval_mode,
+                            )
 
                     elif isinstance(event, DoneEvent):
                         # 本轮完成：更新历史、结束流式构建、刷新 token 显示
