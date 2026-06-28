@@ -134,7 +134,10 @@ def main() -> None:
     )  # type: ignore[arg-type]
     print(f"[STARTUP] model adapter: {time.time() - _t:.1f}s")
 
-    tool_context = ToolContext(cwd=config.workspace_root)
+    tool_context = ToolContext(
+        cwd=config.workspace_root,
+        permanent_workspaces=set(config.workspace_additional_dirs),
+    )
 
     # 只有显式开启 Qdrant 时，才初始化服务端向量索引。
     # 这样默认开发模式仍然可以只用本地 JSON 跑起来。

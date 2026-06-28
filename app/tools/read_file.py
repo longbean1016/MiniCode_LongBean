@@ -6,7 +6,7 @@ from typing import Any
 
 """读取文件工具，按块返回源码内容并附带覆盖范围信息。"""
 
-from app.agent.permissions import PermissionManager
+from app.agent.permissions import PathAccessStatus, PermissionManager
 from app.agent.tooling import ToolDefinition
 from app.types import ToolContext, ToolResult
 
@@ -54,10 +54,27 @@ def _validate(input_data: Any) -> dict[str, int | str]:
 
 def _run(validated_input: dict[str, int | str], context: ToolContext) -> ToolResult:
     """读取文件的一段文本，并明确告诉上层是否还有后续内容。"""
-    permission_manager = PermissionManager(context.cwd)
+    permission_manager = PermissionManager(
+        context.cwd,
+        additional_workspaces={Path(p) for p in context.additional_workspaces},
+        permanent_workspaces={Path(p) for p in context.permanent_workspaces},
+    )
 
     raw_path = str(validated_input["path"])
-    target_path = permission_manager.ensure_path_access(raw_path)
+    check = permission_manager.check_path_access(raw_path)
+    if check.status == PathAccessStatus.OUTSIDE_WORKSPACE:
+        return ToolResult(
+            ok=False,
+            output=f"目标路径不在工作目录范围内：{raw_path}",
+            error="WORKSPACE_ACCESS_REQUIRED",
+            meta={
+                "path": raw_path,
+                "resolved_path": str(check.resolved_path) if check.resolved_path else raw_path,
+                "action_key": f"workspace::{raw_path}",
+                "reason": check.message,
+            },
+        )
+    target_path = check.resolved_path
     relative_path = _to_workspace_relative_path(target_path, context.cwd)
 
     # 先拦掉内部状态与大工具结果归档文件，避免模型把这些“调试产物”当成主分析材料反复回读。

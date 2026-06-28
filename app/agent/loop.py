@@ -765,6 +765,43 @@ def _run_agent_loop(
                     )
                     return approval_step, builder.build()
 
+                # 命中"工作目录越界"时，暂停并让用户选择是否加入工作目录
+                if result.error == "WORKSPACE_ACCESS_REQUIRED":
+                    raw_path = str(result.meta.get("path", ""))
+                    reason = str(result.meta.get("reason", ""))
+                    action_key = str(result.meta.get("action_key", ""))
+
+                    # 授权前先补一条占位 tool_result，保证消息协议完整
+                    builder.add_tool_result(
+                        tool_use_id=tool_use_id,
+                        tool_name=tool_name,
+                        content="目标路径不在工作目录范围内，需要用户授权。",
+                        is_error=True,
+                        meta=dict(result.meta),
+                    )
+
+                    approval_message = (
+                        "目标路径不在工作目录范围内。\n"
+                        f"工具: {tool_name}\n"
+                        f"路径: {raw_path}\n"
+                        f"原因: {reason}"
+                    )
+
+                    approval_step = AgentStep(
+                        type="approval",
+                        content=approval_message,
+                        approval=ApprovalRequest(
+                            tool_name=tool_name,
+                            tool_use_id=tool_use_id,
+                            action_key=action_key,
+                            message=approval_message,
+                            input_data=tool_input,
+                            approval_type="workspace_access",
+                            workspace_path=raw_path,
+                        ),
+                    )
+                    return approval_step, builder.build()
+
                 # 正常情况才把工具结果写回消息历史
                 context_output = result.meta.get("context_output", result.output)
                 if not isinstance(context_output, str) or not context_output.strip():
@@ -1174,6 +1211,46 @@ def stream_agent(
                             action_key=action_key,
                             message=approval_message,
                             input_data=tool_input,
+                        ),
+                    )
+                    # 把审批请求推送给 UI，暂停等待用户确认
+                    yield ApprovalEvent(approval=approval_step.approval)
+                    yield DoneEvent(step=approval_step, history=builder.build())
+                    return
+
+                # ---- 路径权限检查：工作目录越界需要用户授权 ----
+                if result.error == "WORKSPACE_ACCESS_REQUIRED":
+                    raw_path = str(result.meta.get("path", ""))
+                    reason = str(result.meta.get("reason", ""))
+                    action_key = str(result.meta.get("action_key", ""))
+
+                    # 写入占位 tool_result，保证消息协议完整
+                    builder.add_tool_result(
+                        tool_use_id=tool_use_id,
+                        tool_name=tool_name,
+                        content="目标路径不在工作目录范围内，需要用户授权。",
+                        is_error=True,
+                        meta=dict(result.meta),
+                    )
+
+                    approval_message = (
+                        "目标路径不在工作目录范围内。\n"
+                        f"工具: {tool_name}\n"
+                        f"路径: {raw_path}\n"
+                        f"原因: {reason}"
+                    )
+
+                    approval_step = AgentStep(
+                        type="approval",
+                        content=approval_message,
+                        approval=ApprovalRequest(
+                            tool_name=tool_name,
+                            tool_use_id=tool_use_id,
+                            action_key=action_key,
+                            message=approval_message,
+                            input_data=tool_input,
+                            approval_type="workspace_access",
+                            workspace_path=raw_path,
                         ),
                     )
                     # 把审批请求推送给 UI，暂停等待用户确认

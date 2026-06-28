@@ -33,13 +33,14 @@ class InputArea(Horizontal):
     """
 
     is_approval_mode: reactive[bool] = reactive(False)  # type: ignore[assignment]
+    approval_mode_type: reactive[str] = reactive("command")  # type: ignore[assignment]
 
     class InputSubmitted(Message):
         """用户提交了输入的自定义事件。
 
         Attributes:
             text: 用户输入的文本内容
-            is_approval: 是否为审批模式回复（y 或 n）
+            is_approval: 是否为审批模式回复
         """
 
         def __init__(self, text: str, is_approval: bool = False) -> None:
@@ -81,14 +82,19 @@ class InputArea(Horizontal):
         input_widget = self.query_one("#user-input", Input)
         hint = self.query_one("#input-hint", Static)
         if value:
-            input_widget.placeholder = "输入 y 执行 或 n 拒绝"
-            hint.update("y/n 确认")
+            if self.approval_mode_type == "workspace_access":
+                input_widget.placeholder = "s=仅本次会话 p=永久加入 n=拒绝"
+                hint.update("s/p/n 工作目录授权")
+            else:
+                input_widget.placeholder = "输入 y 执行 或 n 拒绝"
+                hint.update("y/n 确认")
             input_widget.value = ""
             self._history_index = -1
             self._draft_input = ""
         else:
             input_widget.placeholder = "输入你的问题..."
             hint.update("Ctrl+Enter 发送 | ↑↓ 历史")
+            self.approval_mode_type = "command"
 
     def on_key(self, event: Key) -> None:
         """拦截 ↑↓ 键实现命令历史浏览。
@@ -163,8 +169,13 @@ class InputArea(Horizontal):
             return
 
         if self.is_approval_mode:
-            # 审批模式：只接受 y 或 n
-            if text.lower() in ("y", "n"):
+            # 审批模式：根据类型接受不同输入
+            valid_responses = (
+                ("s", "p", "n")
+                if self.approval_mode_type == "workspace_access"
+                else ("y", "n")
+            )
+            if text.lower() in valid_responses:
                 self.post_message(
                     self.InputSubmitted(text=text.lower(), is_approval=True)
                 )
@@ -172,7 +183,8 @@ class InputArea(Horizontal):
             else:
                 # 非法输入，提示用户
                 self.query_one("#user-input", Input).value = ""
-                self.query_one("#user-input", Input).placeholder = "请输入 y 或 n"
+                hint = "/".join(valid_responses)
+                self.query_one("#user-input", Input).placeholder = f"请输入 {hint}"
         else:
             # 普通模式：存入历史，发送消息
             self._add_to_history(text)
@@ -213,6 +225,12 @@ class InputArea(Horizontal):
         """进入审批模式（由 MiniCodeApp 在收到 ApprovalEvent 时调用）。"""
         self.is_approval_mode = True
 
+    def enter_workspace_approval_mode(self) -> None:
+        """进入工作目录授权审批模式（三选项：s/p/n）。"""
+        self.approval_mode_type = "workspace_access"
+        self.is_approval_mode = True
+
     def exit_approval_mode(self) -> None:
         """退出审批模式（审批完成或取消后调用）。"""
         self.is_approval_mode = False
+        self.approval_mode_type = "command"

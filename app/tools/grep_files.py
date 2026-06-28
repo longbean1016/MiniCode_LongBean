@@ -6,7 +6,7 @@ from pathlib import Path
 import subprocess
 from typing import Any
 
-from app.agent.permissions import PermissionManager
+from app.agent.permissions import PathAccessStatus, PermissionManager
 from app.agent.tooling import ToolDefinition
 from app.types import ToolContext, ToolResult
 
@@ -59,12 +59,29 @@ def _validate(input_data: Any) -> dict[str, int | str]:
 
 def _run(validated_input: dict[str, int | str], context: ToolContext) -> ToolResult:
     """在目录内递归搜索文本，并返回显式的截断说明。"""
-    permission_manager = PermissionManager(context.cwd)
+    permission_manager = PermissionManager(
+        context.cwd,
+        additional_workspaces={Path(p) for p in context.additional_workspaces},
+        permanent_workspaces={Path(p) for p in context.permanent_workspaces},
+    )
 
     pattern = str(validated_input["pattern"])
     raw_path = str(validated_input["path"])
     max_matches = int(validated_input["max_matches"])
-    target_path = permission_manager.ensure_path_access(raw_path)
+    check = permission_manager.check_path_access(raw_path)
+    if check.status == PathAccessStatus.OUTSIDE_WORKSPACE:
+        return ToolResult(
+            ok=False,
+            output=f"目标路径不在工作目录范围内：{raw_path}",
+            error="WORKSPACE_ACCESS_REQUIRED",
+            meta={
+                "path": raw_path,
+                "resolved_path": str(check.resolved_path) if check.resolved_path else raw_path,
+                "action_key": f"workspace::{raw_path}",
+                "reason": check.message,
+            },
+        )
+    target_path = check.resolved_path
     normalized_path = _to_workspace_relative_path(target_path, context.cwd)
 
     # 默认不允许把内部上下文目录作为 grep 根目录，避免模型全文检索历史缓存后反复打转。

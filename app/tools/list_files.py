@@ -3,7 +3,7 @@
 from pathlib import Path
 from typing import Any
 
-from app.agent.permissions import PermissionManager
+from app.agent.permissions import PathAccessStatus, PermissionManager
 from app.agent.tooling import ToolDefinition
 from app.types import ToolContext, ToolResult
 
@@ -57,14 +57,30 @@ def _run(validated_input: dict[str, int | str], context: ToolContext) -> ToolRes
 
     # 第一步：创建权限管理器
     # 这里把 context.cwd 当作当前允许操作的工作根目录
-    permission_manager = PermissionManager(context.cwd)
+    permission_manager = PermissionManager(
+        context.cwd,
+        additional_workspaces={Path(p) for p in context.additional_workspaces},
+        permanent_workspaces={Path(p) for p in context.permanent_workspaces},
+    )
 
     # 第二步：拿到用户想查看的原始路径
     raw_path = validated_input["path"]
 
     # 第三步：权限管理器检查路径访问是否合法
-    # 如果路径越界，比如跑到工作目录外面，会直接抛出 PermissionError
-    target_path = permission_manager.ensure_path_access(raw_path)
+    check = permission_manager.check_path_access(raw_path)
+    if check.status == PathAccessStatus.OUTSIDE_WORKSPACE:
+        return ToolResult(
+            ok=False,
+            output=f"目标路径不在工作目录范围内：{raw_path}",
+            error="WORKSPACE_ACCESS_REQUIRED",
+            meta={
+                "path": raw_path,
+                "resolved_path": str(check.resolved_path) if check.resolved_path else raw_path,
+                "action_key": f"workspace::{raw_path}",
+                "reason": check.message,
+            },
+        )
+    target_path = check.resolved_path
     max_entries = int(validated_input["max_entries"])
     normalized_path = _to_workspace_relative_path(target_path, context.cwd)
 

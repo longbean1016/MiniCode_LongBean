@@ -6,7 +6,7 @@ from pathlib import Path
 
 """代码导航公共辅助模块，复用路径、AST 和输出格式化逻辑。"""
 
-from app.agent.permissions import PermissionManager
+from app.agent.permissions import PathAccessStatus, PermissionManager
 
 
 @dataclass(slots=True)
@@ -27,28 +27,32 @@ class ResolvedPath:
     display_path: str
 
 
-@dataclass(slots=True)
-class SymbolRecord:
-    """
-    表示一个从 Python 语法树中抽取出的符号。
-    """
-
-    kind: str
-    name: str
-    line: int
-    column: int
-    parent: str | None = None
-    signature: str = ""
-    doc: str = ""
-
-
-def resolve_safe_path(raw_path: str, workspace_root: str) -> ResolvedPath:
+def resolve_safe_path(
+    raw_path: str,
+    workspace_root: str,
+    additional_workspaces: set[Path] | None = None,
+    permanent_workspaces: set[Path] | None = None,
+) -> ResolvedPath | None:
     """
     解析并校验路径，确保工具只能访问当前工作目录范围内的内容。
+
+    如果路径越界，返回 None（调用方应返回 WORKSPACE_ACCESS_REQUIRED）。
+    与旧版不同，这里不再直接抛出 PermissionError。
     """
 
-    permission_manager = PermissionManager(workspace_root)
-    abs_path = permission_manager.ensure_path_access(raw_path)
+    permission_manager = PermissionManager(
+        workspace_root,
+        additional_workspaces=additional_workspaces,
+        permanent_workspaces=permanent_workspaces,
+    )
+    check_result = permission_manager.check_path_access(raw_path)
+
+    if check_result.status == PathAccessStatus.OUTSIDE_WORKSPACE:
+        return None
+
+    abs_path = check_result.resolved_path
+    if abs_path is None:
+        return None
 
     workspace_path = Path(workspace_root).resolve()
     try:
@@ -64,6 +68,42 @@ def resolve_safe_path(raw_path: str, workspace_root: str) -> ResolvedPath:
         abs_path=abs_path,
         display_path=display_path,
     )
+
+
+def workspace_access_denied_result(
+    raw_path: str,
+    resolved_path: str | None = None,
+) -> "ToolResult":
+    """返回统一的"工作目录越界，需要授权"的工具结果。"""
+    from app.types import ToolResult
+    return ToolResult(
+        ok=False,
+        output=f"目标路径不在工作目录范围内：{raw_path}",
+        error="WORKSPACE_ACCESS_REQUIRED",
+        meta={
+            "path": raw_path,
+            "resolved_path": resolved_path or raw_path,
+            "action_key": f"workspace::{raw_path}",
+            "reason": f"目标路径 {raw_path} 不在当前工作目录范围内，需要用户授权后才能访问。",
+        },
+    )
+
+
+@dataclass(slots=True)
+class SymbolRecord:
+    """
+    表示一个从 Python 语法树中抽取出的符号。
+    """
+
+    kind: str
+    name: str
+    line: int
+    column: int
+    parent: str | None = None
+    signature: str = ""
+    doc: str = ""
+
+
 
 
 def iter_python_files(target_path: Path) -> list[Path]:

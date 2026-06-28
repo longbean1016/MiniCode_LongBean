@@ -5,12 +5,15 @@ from typing import Any
 
 """AST 信息工具，输出源码的结构化语法树摘要。"""
 
+from pathlib import Path
+
 from app.agent.tooling import ToolDefinition
 from app.tools._code_nav_common import (
     build_function_signature,
     read_text_file,
     resolve_safe_path,
     shorten_doc,
+    workspace_access_denied_result,
 )
 from app.types import ToolContext, ToolResult
 
@@ -35,7 +38,14 @@ def _run(validated_input: dict[str, str], context: ToolContext) -> ToolResult:
     返回单个 Python 文件的 AST 结构摘要。
     """
 
-    resolved = resolve_safe_path(validated_input["path"], context.cwd)
+    resolved = resolve_safe_path(
+        validated_input["path"],
+        context.cwd,
+        additional_workspaces={Path(p) for p in context.additional_workspaces},
+        permanent_workspaces={Path(p) for p in context.permanent_workspaces},
+    )
+    if resolved is None:
+        return workspace_access_denied_result(validated_input["path"])
     if not resolved.abs_path.exists():
         return ToolResult(ok=False, output=f"文件不存在：{validated_input['path']}")
     if not resolved.abs_path.is_file():

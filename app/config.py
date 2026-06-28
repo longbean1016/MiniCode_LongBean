@@ -102,6 +102,16 @@ def load_config() -> AppConfig:
     workspace_root = _get_env("WORKSPACE_ROOT", default=".")
     workspace_root = str(Path(workspace_root).resolve())
 
+    # 加载永久额外工作目录（分号分隔，如 /path/a;/path/b）
+    workspace_additional_dirs_raw = _get_env("WORKSPACE_ADDITIONAL_DIRS", default="")
+    workspace_additional_dirs: list[str] = []
+    if workspace_additional_dirs_raw.strip():
+        workspace_additional_dirs = [
+            str(Path(p.strip()).resolve())
+            for p in workspace_additional_dirs_raw.split(";")
+            if p.strip()
+        ]
+
     qdrant_enabled = _get_bool_env("QDRANT_ENABLED", default=False)
     qdrant_url = _get_env("QDRANT_URL", default="http://localhost:6333")
     # Qdrant 本地路径统一解析到 workspace 下，
@@ -198,6 +208,7 @@ def load_config() -> AppConfig:
         embedding_base_url=embedding_base_url,
         embedding_dimensions=embedding_dimensions,
         workspace_root=workspace_root,
+        workspace_additional_dirs=workspace_additional_dirs,
         qdrant_enabled=qdrant_enabled,
         qdrant_url=qdrant_url,
         qdrant_path=qdrant_path,

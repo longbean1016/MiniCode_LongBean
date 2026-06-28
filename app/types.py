@@ -62,6 +62,8 @@ class ApprovalRequest:
     action_key: str  # 本次授权的唯一键，用于批准后重试
     message:str # 给终端展示的提示文案
     input_data: Any  # 原始工具输入，批准后用于重试
+    approval_type: str = "command"  # 审批类型：command | workspace_access
+    workspace_path: str = ""  # 待加入的工作目录路径（仅 workspace_access 类型使用）
 
 
 
@@ -126,6 +128,9 @@ class AppConfig:
 
     # agent 允许工作的根目录
     workspace_root: str
+
+    # 永久额外工作目录（分号分隔的绝对路径列表）
+    workspace_additional_dirs: list[str]
 
     # 是否启用 Qdrant 服务端向量索引
     qdrant_enabled: bool
@@ -243,6 +248,8 @@ class ToolContext:
     cwd: str # 当前工具执行时的工作目录
     approved_actions: set[str] = field(default_factory=set)  # 当前会话内已批准的动作键
     read_file_signatures: set[str] = field(default_factory=set)  # 当前这轮请求里已经读取过的文件区间签名
+    additional_workspaces: set[str] = field(default_factory=set)  # 会话级额外工作目录
+    permanent_workspaces: set[str] = field(default_factory=set)  # 永久额外工作目录
 
 
 

@@ -1,8 +1,9 @@
 ﻿"""写文件工具，负责按权限约束把内容写入目标文件。"""
 
+from pathlib import Path
 from typing import Any
 
-from app.agent.permissions import PermissionManager
+from app.agent.permissions import PathAccessStatus, PermissionManager
 from app.agent.tooling import ToolDefinition
 from app.types import ToolContext, ToolResult
 
@@ -44,8 +45,12 @@ def _run(validated_input: dict[str, Any], context: ToolContext) -> ToolResult:
     把内容写入目标文件。
     """
 
-    # 用当前工作目录作为权限边界
-    permission_manager = PermissionManager(context.cwd)
+    # 用当前工作目录作为权限边界，包含额外工作目录
+    permission_manager = PermissionManager(
+        context.cwd,
+        additional_workspaces={Path(p) for p in context.additional_workspaces},
+        permanent_workspaces={Path(p) for p in context.permanent_workspaces},
+    )
 
     # 取出校验后的输入
     raw_path = validated_input["path"]
@@ -53,7 +58,20 @@ def _run(validated_input: dict[str, Any], context: ToolContext) -> ToolResult:
     overwrite = validated_input["overwrite"]
 
     # 检查路径是否越界，并解析成绝对路径
-    target_path = permission_manager.ensure_path_access(raw_path)
+    check = permission_manager.check_path_access(raw_path)
+    if check.status == PathAccessStatus.OUTSIDE_WORKSPACE:
+        return ToolResult(
+            ok=False,
+            output=f"目标路径不在工作目录范围内：{raw_path}",
+            error="WORKSPACE_ACCESS_REQUIRED",
+            meta={
+                "path": raw_path,
+                "resolved_path": str(check.resolved_path) if check.resolved_path else raw_path,
+                "action_key": f"workspace::{raw_path}",
+                "reason": check.message,
+            },
+        )
+    target_path = check.resolved_path
 
     # 如果目标已存在且不是文件，直接拒绝
     if target_path.exists() and not target_path.is_file():

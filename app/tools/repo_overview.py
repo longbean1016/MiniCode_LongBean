@@ -5,8 +5,14 @@ from typing import Any
 
 """仓库概览工具，用于生成项目目录和核心文件的整体摘要。"""
 
+from pathlib import Path
+
 from app.agent.tooling import ToolDefinition
-from app.tools._code_nav_common import iter_python_files, resolve_safe_path
+from app.tools._code_nav_common import (
+    iter_python_files,
+    resolve_safe_path,
+    workspace_access_denied_result,
+)
 from app.types import ToolContext, ToolResult
 
 
@@ -33,7 +39,14 @@ def _run(validated_input: dict[str, str], context: ToolContext) -> ToolResult:
     生成仓库或目录级别的结构摘要。
     """
 
-    resolved = resolve_safe_path(validated_input["path"], context.cwd)
+    resolved = resolve_safe_path(
+        validated_input["path"],
+        context.cwd,
+        additional_workspaces={Path(p) for p in context.additional_workspaces},
+        permanent_workspaces={Path(p) for p in context.permanent_workspaces},
+    )
+    if resolved is None:
+        return workspace_access_denied_result(validated_input["path"])
     if not resolved.abs_path.exists():
         return ToolResult(ok=False, output=f"路径不存在：{validated_input['path']}")
     if not resolved.abs_path.is_dir():

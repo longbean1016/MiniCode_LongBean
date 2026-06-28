@@ -6,11 +6,14 @@ from typing import Any
 """文件概览工具，提取单个源码文件的导入、函数和类结构。"""
 
 from app.agent.tooling import ToolDefinition
+from pathlib import Path
+
 from app.tools._code_nav_common import (
     build_function_signature,
     read_text_file,
     resolve_safe_path,
     shorten_doc,
+    workspace_access_denied_result,
 )
 from app.types import ToolContext, ToolResult
 
@@ -38,7 +41,14 @@ def _run(validated_input: dict[str, str], context: ToolContext) -> ToolResult:
     如果不是 Python 文件，就返回基础文本统计。
     """
 
-    resolved = resolve_safe_path(validated_input["path"], context.cwd)
+    resolved = resolve_safe_path(
+        validated_input["path"],
+        context.cwd,
+        additional_workspaces={Path(p) for p in context.additional_workspaces},
+        permanent_workspaces={Path(p) for p in context.permanent_workspaces},
+    )
+    if resolved is None:
+        return workspace_access_denied_result(validated_input["path"])
     if not resolved.abs_path.exists():
         return ToolResult(ok=False, output=f"文件不存在：{validated_input['path']}")
     if not resolved.abs_path.is_file():

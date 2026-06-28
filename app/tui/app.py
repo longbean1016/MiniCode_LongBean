@@ -27,6 +27,7 @@ from app.tui.events import (
     ToolCallEvent,
     ToolResultEvent,
 )
+from app.tui.widgets.approval_dialog import ApprovalDialog
 from app.tui.widgets.conversation import ConversationWidget
 from app.tui.widgets.header import HeaderWidget
 from app.tui.widgets.input_area import InputArea
@@ -243,18 +244,13 @@ class MiniCodeApp(App):
     def on_input_area_input_submitted(self, event: InputArea.InputSubmitted) -> None:
         """处理用户的输入提交。
 
-        根据输入类型分五种路径：
-        1. 审批回复（y/n） → _handle_approval_reply()
-        2. 退出命令（exit/quit）→ _do_exit()
-        3. 显式记忆命令 → memory_pipeline.handle_explicit_input()
-        4. /mcp 命令 → mcp_manager.handle_command()
-        5. 普通对话 → _run_agent_stream()
+        根据输入类型分四种路径：
+        1. 退出命令（exit/quit）→ _do_exit()
+        2. 显式记忆命令 → memory_pipeline.handle_explicit_input()
+        3. /mcp 命令 → mcp_manager.handle_command()
+        4. 普通对话 → _run_agent_stream()
         """
         user_text = event.text
-
-        if event.is_approval:
-            self._handle_approval_reply(user_text)
-            return
 
         # 退出命令
         if user_text.lower() in ("quit", "exit"):
@@ -288,51 +284,128 @@ class MiniCodeApp(App):
         self.input_area.disable_input()
         self._run_agent_stream(user_text)
 
-    def _handle_approval_reply(self, answer: str) -> None:
-        """处理审批回复。
-
-        y → 执行已批准的工具，把结果写入 history，继续 agent
-        n → 拒绝操作，恢复输入区
+    def _show_approval_dialog(self, approval) -> None:
+        """显示审批弹窗（在 UI 线程调用）。
 
         Args:
-            answer: "y" 或 "n"
+            approval: ApprovalRequest 实例
         """
-        self.input_area.exit_approval_mode()
+        dialog = ApprovalDialog(
+            message=approval.message,
+            approval_type=approval.approval_type,
+        )
+        self.push_screen(dialog, callback=self._on_approval_dialog_result)
 
-        if answer == "y" and self._pending_approval is not None:
-            approval = self._pending_approval
-            # 先把 action_key 加入已批准集合，再执行工具。
-            # 否则工具在执行时还会命中权限检查，返回 PERMISSION_REQUIRED。
-            self._tool_context.approved_actions.add(approval.action_key)
-            # 执行已批准的工具
-            result = self._tool_registry.execute_tool(
-                tool_name=approval.tool_name,
-                input_data=approval.input_data,
-                context=self._tool_context,
-            )
+    def _on_approval_dialog_result(self, answer: str) -> None:
+        """审批弹窗关闭后的回调。
 
-            self.conversation.add_tool_result(
-                name=approval.tool_name,
-                summary=f"已执行" if result.ok else f"失败: {result.error}",
-                ok=result.ok,
-            )
+        Args:
+            answer: "y" | "n" | "s" | "p"
+        """
+        approval = self._pending_approval
 
-            # 用真实工具结果替换占位 tool_result
-            self._history = self._replace_pending_tool_result(
-                history=self._history,
-                tool_use_id=approval.tool_use_id,
-                tool_name=approval.tool_name,
-                content=result.output,
-                is_error=not result.ok,
-            )
-            self._pending_approval = None
-            # 继续剩余的 agent 流程（不追加新用户消息）
-            self._run_agent_stream(None)
-        else:
-            # 拒绝高风险操作
-            self.conversation.add_system_info("用户已拒绝此次高风险操作。")
+        if approval is None:
+            return
+
+        # ── 拒绝处理 ──
+        if answer == "n":
+            label = "工作目录加入" if approval.approval_type == "workspace_access" else "高风险操作"
+            self.conversation.add_system_info(f"用户已拒绝此次{label}请求。")
             self._pending_approval = None
             self.input_area.enable_input()
+            return
+
+        # ── 工作目录授权处理 ──
+        if approval.approval_type == "workspace_access":
+            permanent = answer == "p"
+            workspace_path = approval.workspace_path
+
+            # 把路径加入 ToolContext 的工作目录集合
+            if permanent:
+                self._tool_context.permanent_workspaces.add(workspace_path)
+                self._save_permanent_workspace(workspace_path)
+            else:
+                self._tool_context.additional_workspaces.add(workspace_path)
+
+            label = "永久" if permanent else "会话级"
+            self.conversation.add_system_info(
+                f"已将 {workspace_path} 加入工作目录（{label}）。"
+            )
+        else:
+            # 命令审批：把 action_key 加入已批准集合
+            self._tool_context.approved_actions.add(approval.action_key)
+
+        # 重新执行工具（共用逻辑）
+        self._tool_context.approved_actions.add(approval.action_key)
+        result = self._tool_registry.execute_tool(
+            tool_name=approval.tool_name,
+            input_data=approval.input_data,
+            context=self._tool_context,
+        )
+
+        self.conversation.add_tool_result(
+            name=approval.tool_name,
+            summary=f"已执行" if result.ok else f"失败: {result.error}",
+            ok=result.ok,
+        )
+
+        # 用真实工具结果替换占位 tool_result
+        self._history = self._replace_pending_tool_result(
+            history=self._history,
+            tool_use_id=approval.tool_use_id,
+            tool_name=approval.tool_name,
+            content=result.output,
+            is_error=not result.ok,
+        )
+        self._pending_approval = None
+        # 继续剩余的 agent 流程
+        self._run_agent_stream(None)
+
+    @staticmethod
+    def _save_permanent_workspace(workspace_path: str) -> None:
+        """将工作目录路径持久化追加到 .env 文件的 WORKSPACE_ADDITIONAL_DIRS。
+
+        Args:
+            workspace_path: 要持久化的绝对路径
+        """
+        from pathlib import Path as _Path
+
+        env_path = _Path(".env")
+        if not env_path.exists():
+            return
+
+        existing = ""
+        try:
+            existing = env_path.read_text(encoding="utf-8")
+        except Exception:
+            return
+
+        # 检查是否已存在
+        line_prefix = "WORKSPACE_ADDITIONAL_DIRS="
+        new_value = workspace_path
+        updated = False
+        lines = existing.splitlines()
+        for i, line in enumerate(lines):
+            if line.startswith(line_prefix):
+                current = line[len(line_prefix):].strip().strip('"').strip("'")
+                existing_paths = [p.strip() for p in current.split(";") if p.strip()]
+                if workspace_path not in existing_paths:
+                    existing_paths.append(workspace_path)
+                    new_value = ";".join(existing_paths)
+                else:
+                    return  # 已经存在，无需重复添加
+                lines[i] = f"{line_prefix}{new_value}"
+                updated = True
+                break
+
+        if not updated:
+            # 没有现有行，追加
+            lines.append(f"{line_prefix}{new_value}")
+
+        try:
+            env_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        except Exception:
+            pass  # 持久化失败不阻塞主流程
 
     def _on_mcp_async_result(self, result: str) -> None:
         """MCP 异步操作结果回调（由后台线程触发）。
@@ -492,14 +565,15 @@ class MiniCodeApp(App):
                         )
 
                     elif isinstance(event, ApprovalEvent):
-                        # 审批事件：暂存审批请求，UI 显示确认提示，切审批模式
+                        # 审批事件：暂存审批请求，UI 显示确认提示，弹出选择弹窗
                         self._pending_approval = event.approval
                         self.call_from_thread(
                             self.conversation.add_approval_prompt,
                             event.approval.message,
                         )
                         self.call_from_thread(
-                            self.input_area.enter_approval_mode,
+                            self._show_approval_dialog,
+                            event.approval,
                         )
 
                     elif isinstance(event, DoneEvent):

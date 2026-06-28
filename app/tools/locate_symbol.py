@@ -5,6 +5,8 @@ from typing import Any
 
 """符号定位工具，用于快速定位指定标识符的定义位置。"""
 
+from pathlib import Path
+
 from app.agent.tooling import ToolDefinition
 from app.tools._code_nav_common import (
     build_function_signature,
@@ -13,6 +15,7 @@ from app.tools._code_nav_common import (
     read_text_file,
     resolve_safe_path,
     to_relative_display,
+    workspace_access_denied_result,
 )
 from app.types import ToolContext, ToolResult
 
@@ -99,7 +102,14 @@ def _run(validated_input: dict[str, Any], context: ToolContext) -> ToolResult:
     - 大概有哪些引用点
     """
 
-    resolved = resolve_safe_path(validated_input["path"], context.cwd)
+    resolved = resolve_safe_path(
+        validated_input["path"],
+        context.cwd,
+        additional_workspaces={Path(p) for p in context.additional_workspaces},
+        permanent_workspaces={Path(p) for p in context.permanent_workspaces},
+    )
+    if resolved is None:
+        return workspace_access_denied_result(validated_input["path"])
     if not resolved.abs_path.exists():
         return ToolResult(ok=False, output=f"路径不存在：{validated_input['path']}")
 
