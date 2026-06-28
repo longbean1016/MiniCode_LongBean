@@ -953,7 +953,8 @@ def stream_agent(
         )
 
         # ---- 第一步：准备上下文窗口 ----
-        yield ThinkingEvent("正在分析请求并准备上下文...")
+        if step_index == 0:
+            yield ThinkingEvent("正在分析请求并准备上下文...")
 
         context_started_at = time.perf_counter()
         prepared_context = prepare_agent_context(
@@ -984,7 +985,8 @@ def stream_agent(
             pending_user_nudge = None
 
         # ---- 第二步：流式调模型 ----
-        yield ThinkingEvent("正在等待模型响应...")
+        if step_index == 0:
+            yield ThinkingEvent("正在等待模型响应...")
 
         # 收集流式结果的缓冲区
         collected_text = ""  # 累积的文本回答
@@ -1153,10 +1155,14 @@ def stream_agent(
                     echo=False,
                 )
 
-                # 构造工具结果摘要，通知 UI
+                # 构造工具结果摘要，通知 UI（优先显示目标路径）
                 output_len = len(str(result.output))
                 status_text = "完成" if result.ok else "失败"
-                summary = f"{status_text} ({output_len} 字符)"
+                tool_target = _extract_tool_target(tool_input)
+                if tool_target:
+                    summary = f"{tool_target}  {status_text} ({output_len} 字符)"
+                else:
+                    summary = f"{status_text} ({output_len} 字符)"
                 if result.error:
                     summary += f" — {result.error}"
 

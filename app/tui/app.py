@@ -48,10 +48,12 @@ class MiniCodeApp(App):
         app.run()  # 接管终端，启动 TUI
     """
 
-    # 键盘绑定：Ctrl+C 和 Ctrl+Q 都触发退出，保存会话后离开
+    # Ctrl+C: 有选中文本时复制，未选中时退出（终端标准行为）
+    # Ctrl+Y: 纯文本复制最后回答到剪贴板（不乱码兜底）
     BINDINGS = [
         ("ctrl+c", "quit", "退出"),
         ("ctrl+q", "quit", "退出"),
+        ("ctrl+y", "copy_last_response", "复制回答"),
     ]
 
     # ================================================================
@@ -86,64 +88,6 @@ class MiniCodeApp(App):
 
     ConversationWidget {
         scrollbar-size: 1 1;
-    }
-
-    .user-message {
-        margin: 1 1 0 1;
-    }
-
-    .agent-label {
-        color: $secondary;
-        text-style: bold;
-        margin: 1 1 0 1;
-    }
-
-    .agent-response {
-        margin: 0 1 1 1;
-    }
-
-    .thinking-message {
-        color: $text-disabled;
-        text-style: italic;
-        margin: 0 1;
-    }
-
-    .tool-call-message {
-        color: $warning;
-        margin: 0 1;
-        padding-left: 1;
-        border-left: solid $warning;
-    }
-
-    .tool-result-message {
-        color: $success;
-        margin: 0 1;
-        padding-left: 1;
-        border-left: solid $success;
-    }
-
-    .error-message {
-        color: $error;
-        margin: 0 1;
-        padding-left: 1;
-        border-left: solid $error;
-    }
-
-    .approval-message {
-        color: $warning;
-        margin: 1 1;
-        padding: 0 1;
-        background: $warning 15%;
-    }
-
-    .system-message {
-        color: $text-disabled;
-        margin: 0 1;
-    }
-
-    .turn-separator {
-        color: $text-disabled;
-        margin: 1 1 0 1;
     }
     """
 
@@ -188,6 +132,8 @@ class MiniCodeApp(App):
         self._history = list(session.messages) if session else []
         # 待处理的审批请求（ApprovalEvent 到达后暂存，等待用户 y/n）
         self._pending_approval = None
+        # Ctrl+C 退出防误触：记录上一次按下的时间戳
+        self._last_quit_attempt = 0.0
 
     # ================================================================
     # Widget 装配
@@ -202,23 +148,59 @@ class MiniCodeApp(App):
         yield ConversationWidget()
         yield InputArea()
 
+    def action_copy_last_response(self) -> None:
+        """Ctrl+Y: 静默复制最后回答到系统剪贴板。"""
+        text = self.conversation.get_last_response()
+        if not text:
+            return
+
+        import subprocess
+        import sys
+
+        try:
+            if sys.platform == "win32":
+                subprocess.run(
+                    ["clip"], input=text, text=True, encoding="utf-8", timeout=5
+                )
+            elif sys.platform == "darwin":
+                subprocess.run(["pbcopy"], input=text, text=True, timeout=5)
+            else:
+                subprocess.run(
+                    ["xclip", "-selection", "clipboard"],
+                    input=text,
+                    text=True,
+                    timeout=5,
+                )
+        except Exception:
+            pass
+
     def action_quit(self) -> None:
-        """Ctrl+C 或 quit 命令触发的退出动作。
+        """Ctrl+C: 首次提示，2 秒内再次按下才真正退出，防止误触。"""
+        now = time.monotonic()
+        double_press_window = 2.0  # 两次按键间隔不超过 2 秒才退出
 
-        覆盖 Textual 默认 action_quit，确保退出前：
-        1. 把最新 history 写回 session
-        2. 持久化到磁盘
-        3. 等待后台任务完成
-        """
-        from app.state.session import save_session
+        if (
+            self._last_quit_attempt > 0
+            and (now - self._last_quit_attempt) < double_press_window
+        ):
+            # 二次确认通过 → 真正退出
+            from app.state.session import save_session
 
-        if self._session is not None:
-            self._session.replace_messages(self._history)
-            save_session(self._session)
-        from app.infra.background_worker import wait_for_background_tasks
+            self.conversation.add_system_info("正在保存会话并退出...")
+            if self._session is not None:
+                self._session.replace_messages(self._history)
+                save_session(self._session)
+            from app.infra.background_worker import wait_for_background_tasks
 
-        wait_for_background_tasks()
-        self.exit()
+            wait_for_background_tasks()
+            self.exit()
+            return
+
+        # 首次按下 → 提示用户再按一次
+        self._last_quit_attempt = now
+        self.conversation.add_system_info(
+            "再按一次 Ctrl+C 确认退出（2 秒内有效）"
+        )
 
     # ================================================================
     # 便捷属性，避免每次都写 query_one
