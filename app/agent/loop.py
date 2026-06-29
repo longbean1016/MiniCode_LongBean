@@ -405,8 +405,7 @@ def _run_agent_loop(
                                 f"model={model_cost:.3f}s post={post_cost:.3f}s 总耗时={total_cost:.3f}s"
                             )
                             _check_memory_review(list(builder.build()), session_id)
-                            _check_memory_review(list(builder.build()), session_id)
-            return step, builder.build()
+                            return step, builder.build()
 
             # 模型调用异常时兜底为最终回答，避免主循环直接崩掉
             log_event(
