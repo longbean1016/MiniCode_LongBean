@@ -49,7 +49,8 @@ from app.context.state import (
 )
 from app.context.history_summarizer import OlderHistorySummarizer
 from app.context.history_summarizer import HistoryWindow, build_older_history_summary, select_history_window
-from app.memory.memory_store import MemoryStore, get_memory_store
+from app.memory.memory_store import MemoryStore
+from app.memory.memory_tool import get_memory_store
 from app.agent.prompt import build_system_prompt
 from app.state.session import SessionData
 from app.agent.tooling import ToolRegistry
