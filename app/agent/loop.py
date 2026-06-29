@@ -26,10 +26,9 @@ from app.context.auto_compact import (
     is_context_overflow_error,
     recover_from_context_overflow,
 )
-from app.context.runtime import prepare_agent_context, persist_post_response_working_memory_state
+from app.context.runtime import prepare_agent_context
 from app.context.history_summarizer import OlderHistorySummarizer
 from app.logger import log_event
-from app.memory.pipeline import MemoryPipeline
 from app.agent.message_builder import MessageBuilder
 from app.state.session import SessionData
 from app.agent.tooling import ToolRegistry
@@ -44,12 +43,6 @@ from app.tui.events import (
     ToolCallEvent,
     ToolResultEvent,
     ToolRunningEvent,
-)
-from app.state.working_memory import WorkingMemory
-from app.state.working_memory_updater import (
-    extract_active_paths,
-    extract_decisions_from_assistant,
-    summarize_failure,
 )
 
 NUDGE_CONTINUE = (
@@ -96,7 +89,7 @@ def _append_transient_user_nudge(
 
 
 def _extract_tool_target(tool_input: object) -> str:
-    """尽量把工具输入归一成“当前在看什么”。"""
+    """尽量把工具输入归一成"当前在看什么"。"""
     if not isinstance(tool_input, dict):
         return ""
 
@@ -165,8 +158,6 @@ def run_agent_once(
     tool_registry: ToolRegistry,
     tool_context: ToolContext,
     session: SessionData,
-    working_memory: WorkingMemory,
-    memory_pipeline: MemoryPipeline | None,
     history_summarizer: OlderHistorySummarizer | None = None,
     history: list[ChatMessage] | None = None,
     max_steps: int = 20,
@@ -182,7 +173,7 @@ def run_agent_once(
     builder.extend(history)
     builder.add_user(user_input)
 
-    # 从“新用户输入”开始进入主循环
+    # 从"新用户输入"开始进入主循环
     return _run_agent_loop(
         builder=builder,
         model=model,
@@ -190,8 +181,6 @@ def run_agent_once(
         tool_context=tool_context,
         session=session,
         max_steps=max_steps,
-        working_memory=working_memory,
-        memory_pipeline=memory_pipeline,
         history_summarizer=history_summarizer,
         session_id=session_id,
     )
@@ -203,8 +192,6 @@ def continue_agent_from_history(
     tool_registry: ToolRegistry,
     tool_context: ToolContext,
     session: SessionData,
-    working_memory: WorkingMemory,
-    memory_pipeline: MemoryPipeline | None,
     history_summarizer: OlderHistorySummarizer | None = None,
     max_steps: int = 20,
     session_id: str = "",
@@ -219,8 +206,6 @@ def continue_agent_from_history(
         tool_context=tool_context,
         session=session,
         max_steps=max_steps,
-        working_memory=working_memory,
-        memory_pipeline=memory_pipeline,
         history_summarizer=history_summarizer,
         session_id=session_id,
     )
@@ -233,8 +218,6 @@ def _run_agent_loop(
     tool_context: ToolContext,
     session: SessionData,
     max_steps: int,
-    working_memory: WorkingMemory,
-    memory_pipeline: MemoryPipeline | None,
     history_summarizer: OlderHistorySummarizer | None,
     session_id: str,
 ) -> tuple[AgentStep, list[ChatMessage]]:
@@ -247,7 +230,7 @@ def _run_agent_loop(
     task_text = _extract_latest_real_user_message(builder.build())
     analysis_tracker: dict[str, object] | None = None
     if _is_code_analysis_request(task_text):
-        # 分析类任务会额外维护一份“证据账本”。
+        # 分析类任务会额外维护一份"证据账本"。
         # 后面每次读文件/查符号，都会往里面沉淀可验证事实，
         # 最终用它判断是否该停止探索、是否允许直接放行答案。
         analysis_tracker = _create_analysis_tracker(task_text)
@@ -262,6 +245,7 @@ def _run_agent_loop(
     )
 
     # 限制循环步数，防止模型和工具来回打转
+    tool_iterations_this_turn = 0
     for step_index in range(max_steps):
         # 记录当前 step 开始时间
         step_started_at = time.perf_counter()
@@ -282,8 +266,6 @@ def _run_agent_loop(
             full_history=full_history,
             session=session,
             tool_registry=tool_registry,
-            working_memory=working_memory,
-            memory_pipeline=memory_pipeline,
             history_summarizer=history_summarizer,
         )
         context_cost = time.perf_counter() - context_started_at
@@ -325,7 +307,7 @@ def _run_agent_loop(
             prepared_context.messages,
             pending_user_nudge,
         )
-        # nudge 只对“这一次模型请求”生效，不会写回 builder 历史。
+        # nudge 只对"这一次模型请求"生效，不会写回 builder 历史。
         # 这样既能引导下一步动作，又不会污染后续真正的会话记录。
         if pending_user_nudge:
             log_event(
@@ -380,7 +362,7 @@ def _run_agent_loop(
                                 continue
 
                             # 对代码分析类回答做最后一道事实校验。
-                            # 这里拦的不是“回答不好”，而是“引用了未观察到的函数名/统计数字/step.type”。
+                            # 这里拦的不是"回答不好"，而是"引用了未观察到的函数名/统计数字/step.type"。
                             if (
                                 analysis_tracker is not None
                                 and _has_sufficient_analysis_evidence(analysis_tracker)
@@ -415,31 +397,6 @@ def _run_agent_loop(
                             builder.add_assistant(final_content)
 
                             post_started_at = time.perf_counter()
-                            if memory_pipeline is not None:
-                                memory_pipeline.record_assistant_reply(
-                                    working_memory,
-                                    content=final_content,
-                                )
-                            else:
-                                decisions = extract_decisions_from_assistant(final_content)
-                                for decision in decisions:
-                                    working_memory.protect(
-                                        decision,
-                                        entry_type="key_decision",
-                                        ttl_seconds=3600,
-                                        importance=0.95,
-                                    )
-                                    working_memory.protect(
-                                        decision,
-                                        entry_type="reflection_decision",
-                                        ttl_seconds=3600,
-                                        importance=0.95,
-                                    )
-
-                            persist_post_response_working_memory_state(
-                                session=session,
-                                working_memory=working_memory,
-                            )
                             post_cost = time.perf_counter() - post_started_at
                             step_cost = time.perf_counter() - step_started_at
                             total_cost = time.perf_counter() - loop_started_at
@@ -448,24 +405,17 @@ def _run_agent_loop(
                                 f"step耗时={step_cost:.3f}s context={context_cost:.3f}s "
                                 f"model={model_cost:.3f}s post={post_cost:.3f}s 总耗时={total_cost:.3f}s"
                             )
-                            return step, builder.build()
+                            _increment_review_counter(tool_iterations_this_turn, list(builder.build()), session_id)
+                            _increment_review_counter(tool_iterations_this_turn, list(builder.build()), session_id)
+            return step, builder.build()
 
             # 模型调用异常时兜底为最终回答，避免主循环直接崩掉
             log_event(
                 f"[session={session_id or '-'}] 第 {step_index + 1} 轮模型调用异常: {error}"
             )
-            # 记录最近一次模型失败，后面做 prompt 注入时可以提醒模型避坑
-            working_memory.protect(
-                f"模型调用失败: {error}",
-                entry_type="error_context",
-                ttl_seconds=1800,
-                importance=0.9,
-            )
-            working_memory.protect(
-                f"模型调用失败: {error}",
-                entry_type="reflection_failure",
-                ttl_seconds=1800,
-                importance=0.9,
+            # 记录最近一次模型失败
+            log_event(
+                f"[session={session_id or '-'}] 模型调用失败记录: {error}"
             )
             fallback = AgentStep(
                 type="assistant",
@@ -473,6 +423,7 @@ def _run_agent_loop(
                 kind="final",
             )
             builder.add_assistant(fallback.content)
+            _increment_review_counter(tool_iterations_this_turn, list(builder.build()), session_id)
             return fallback, builder.build() # type: ignore
 
         # 情况一：模型直接返回最终答案
@@ -527,34 +478,7 @@ def _run_agent_loop(
 
             builder.add_assistant(final_content)
 
-            # 从最终 assistant 回复里尝试抽一条关键决策。
-            # 这不是为了记录所有回答，而是尽量保留“已经确认的方向或约束”。
             post_started_at = time.perf_counter()
-            if memory_pipeline is not None:
-                memory_pipeline.record_assistant_reply(
-                    working_memory,
-                    content=final_content,
-                )
-            else:
-                decisions = extract_decisions_from_assistant(final_content)
-                for decision in decisions:
-                    working_memory.protect(
-                        decision,
-                        entry_type="key_decision",
-                        ttl_seconds=3600,
-                        importance=0.95,
-                    )
-                    working_memory.protect(
-                        decision,
-                        entry_type="reflection_decision",
-                        ttl_seconds=3600,
-                        importance=0.95,
-                    )
-
-            persist_post_response_working_memory_state(
-                session=session,
-                working_memory=working_memory,
-            )
             post_cost = time.perf_counter() - post_started_at
             # 记录当前 step 和整轮总耗时
             step_cost = time.perf_counter() - step_started_at
@@ -564,6 +488,7 @@ def _run_agent_loop(
                 f"step耗时={step_cost:.3f}s context={context_cost:.3f}s "
                 f"model={model_cost:.3f}s post={post_cost:.3f}s 总耗时={total_cost:.3f}s"
             )
+            _increment_review_counter(tool_iterations_this_turn, list(builder.build()), session_id)
             return step, builder.build()
 
         # 情况二：模型要求调用一个或多个工具
@@ -604,7 +529,7 @@ def _run_agent_loop(
                 )
             ):
                 blocked_analysis_tool_call_count += 1
-                # 第一次拦截时先温和提示“证据够了可以回答”；
+                # 第一次拦截时先温和提示"证据够了可以回答"；
                 # 连续第二次还想继续探索，就升级成强制直接作答。
                 if blocked_analysis_tool_call_count >= 2:
                     pending_user_nudge = _build_analysis_force_answer_nudge(analysis_tracker)
@@ -623,29 +548,7 @@ def _run_agent_loop(
                 tool_input = call["input"]
                 tool_use_id = call["id"]
                 tool_target = _extract_tool_target(tool_input)
-
-                # 这里只沉淀“当前任务正在碰哪些路径/命令/目标”。
-                # 后面的 working_memory 和 memory_pipeline 会把这些线索变成短期上下文。
-                if memory_pipeline is not None:
-                    memory_pipeline.record_tool_call(
-                        working_memory,
-                        tool_name=tool_name,
-                        tool_input=tool_input,
-                    )
-                else:
-                    for path in extract_active_paths(tool_name, tool_input):
-                        working_memory.protect(
-                            path,
-                            entry_type="active_task",
-                            ttl_seconds=1800,
-                            importance=0.8,
-                        )
-                        working_memory.protect(
-                            path,
-                            entry_type="reflection_file",
-                            ttl_seconds=1800,
-                            importance=0.7,
-                        )
+                tool_iterations_this_turn += 1
 
                 # 先把工具调用请求记到历史里
                 builder.add_tool_call(
@@ -706,30 +609,13 @@ def _run_agent_loop(
                         result=result,
                     )
 
-                # 工具失败时，把错误压成短摘要写进短期工作记忆。
+                # 工具失败时记录日志
                 if not result.ok:
-                    if memory_pipeline is not None:
-                        memory_pipeline.record_tool_failure(
-                            working_memory,
-                            tool_name=tool_name,
-                            result=result,
-                        )
-                    else:
-                        failure_summary = summarize_failure(tool_name, result)
-                        working_memory.protect(
-                            failure_summary,
-                            entry_type="error_context",
-                            ttl_seconds=1800,
-                            importance=0.9,
-                        )
-                        working_memory.protect(
-                            failure_summary,
-                            entry_type="reflection_failure",
-                            ttl_seconds=1800,
-                            importance=0.9,
-                        )
+                    log_event(
+                        f"[session={session_id or '-'}] 工具 {tool_name} 执行失败: {result.error}",
+                    )
 
-                # 命中“需要授权”时，不继续喂模型，而是把审批请求返回给 main
+                # 命中"需要授权"时，不继续喂模型，而是把审批请求返回给 main
                 if result.error=="PERMISSION_REQUIRED":
                     command=str(result.meta.get("command", ""))
                     reason = str(result.meta.get("reason", ""))
@@ -845,6 +731,7 @@ def _run_agent_loop(
             kind="final",
         )
         builder.add_assistant(fallback.content)
+        _increment_review_counter(tool_iterations_this_turn, list(builder.build()), session_id)
         return fallback, builder.build()
 
     # 达到最大步数时停止，防止死循环
@@ -858,6 +745,7 @@ def _run_agent_loop(
         kind="final",
     )
     builder.add_assistant(fallback.content)
+    _increment_review_counter(tool_iterations_this_turn, list(builder.build()), session_id)
     return fallback, builder.build()
 
 
@@ -867,8 +755,6 @@ def stream_agent(
     tool_registry: object,  # ToolRegistry
     tool_context: object,  # ToolContext
     session: object,  # SessionData
-    working_memory: object,  # WorkingMemory
-    memory_pipeline: object | None,  # MemoryPipeline | None
     history_summarizer: object | None,  # OlderHistorySummarizer | None
     history: list | None,  # list[ChatMessage] | None
     max_steps: int = 20,  # 最大循环步数，防止死循环
@@ -898,7 +784,6 @@ def stream_agent(
     )
     from app.context.runtime import (
         prepare_agent_context,
-        persist_post_response_working_memory_state,
     )
     from app.agent.message_builder import MessageBuilder
     from app.infra.model_registry import OpenAIModelAdapter
@@ -924,6 +809,7 @@ def stream_agent(
     loop_started_at = time.perf_counter()
     pending_user_nudge: str | None = None
     exploration_history: list[tuple[str, str]] = []
+    tool_iterations_this_turn = 0
 
     # ---- 分析护栏：初始化证据追踪器 ----
     # 对代码分析类任务创建 tracker，后续每次工具调用都会往里面沉淀观察到的函数名、文件、行数。
@@ -961,8 +847,6 @@ def stream_agent(
             full_history=list(builder.build()),
             session=session,
             tool_registry=tool_registry,
-            working_memory=working_memory,
-            memory_pipeline=memory_pipeline,
             history_summarizer=history_summarizer,
         )
         context_cost = time.perf_counter() - context_started_at
@@ -1050,6 +934,7 @@ def stream_agent(
                 kind="final",
             )
             builder.add_assistant(fallback.content)
+            _increment_review_counter(tool_iterations_this_turn, list(builder.build()), session_id)
             yield DoneEvent(step=fallback, history=builder.build())
             return
 
@@ -1107,17 +992,10 @@ def stream_agent(
                 tool_name = call["tool_name"]
                 tool_input = call["input"]
                 tool_use_id = call["id"]
+                tool_iterations_this_turn += 1
 
                 # 通知 UI：工具开始执行
                 yield ToolRunningEvent(name=tool_name)
-
-                # 记录到短期工作记忆
-                if memory_pipeline is not None:
-                    memory_pipeline.record_tool_call(
-                        working_memory,
-                        tool_name=tool_name,
-                        tool_input=tool_input,
-                    )
 
                 # 把工具调用请求写入消息历史
                 builder.add_tool_call(
@@ -1276,14 +1154,12 @@ def stream_agent(
                     meta=dict(result.meta),
                 )
 
-                # 工具失败时记录到短期工作记忆
+                # 工具失败时记录日志
                 if not result.ok:
-                    if memory_pipeline is not None:
-                        memory_pipeline.record_tool_failure(
-                            working_memory,
-                            tool_name=tool_name,
-                            result=result,
-                        )
+                    log_event(
+                        f"[session={session_id or '-'}] 工具 {tool_name} 执行失败: {result.error}",
+                        echo=False,
+                    )
 
             # ---- 分析护栏：重置冗余拦截计数器，注入收敛提示 ----
             blocked_analysis_tool_call_count = 0
@@ -1347,19 +1223,6 @@ def stream_agent(
             # 把流式收集到的文本写入历史
             builder.add_assistant(collected_text)
 
-            # 记录到工作记忆
-            if memory_pipeline is not None:
-                memory_pipeline.record_assistant_reply(
-                    working_memory,
-                    content=collected_text,
-                )
-
-            # 持久化工作记忆状态
-            persist_post_response_working_memory_state(
-                session=session,
-                working_memory=working_memory,
-            )
-
         step = AgentStep(
             type="assistant",
             content=collected_text,
@@ -1373,6 +1236,7 @@ def stream_agent(
             f"model={model_cost:.3f}s 总耗时={total_cost:.3f}s",
             echo=False,
         )
+        _increment_review_counter(tool_iterations_this_turn, list(builder.build()), session_id)
         yield DoneEvent(step=step, history=builder.build())
         return
 
@@ -1389,4 +1253,34 @@ def stream_agent(
         kind="final",
     )
     builder.add_assistant(fallback.content)
+    _increment_review_counter(tool_iterations_this_turn, list(builder.build()), session_id)
     yield DoneEvent(step=fallback, history=builder.build())
+
+
+# ---------------------------------------------------------------------------
+# 后台记忆反思触发器
+# ---------------------------------------------------------------------------
+
+_REVIEW_NUDGE_INTERVAL = 10
+_tool_iterations_since_review = 0
+_review_runner: object = None
+
+
+def configure_review_runner(runner: object) -> None:
+    """注入后台反思 runner，loop 在被调用时自动触发反思。"""
+    global _review_runner
+    _review_runner = runner
+
+
+def _increment_review_counter(tool_count: int, history: list[ChatMessage], session_id: str) -> None:
+    """累计工具调用次数，达到阈值时 spawn 后台反思线程。"""
+    global _tool_iterations_since_review
+    if _review_runner is None:
+        return
+    _tool_iterations_since_review += tool_count
+    if _tool_iterations_since_review >= _REVIEW_NUDGE_INTERVAL:
+        _tool_iterations_since_review = 0
+        try:
+            getattr(_review_runner, "spawn_review")(history, session_id=session_id)
+        except Exception:
+            pass
