@@ -12,6 +12,7 @@ from app.tools.grep_files import grep_files_tool
 from app.tools.list_files import list_files_tool
 from app.tools.make_dirs import make_dirs_tool
 from app.tools.locate_symbol import locate_symbol_tool
+from app.memory.memory_tool import memory_tool
 from app.tools.read_file import read_file_tool
 from app.tools.repo_overview import repo_overview_tool
 from app.tools.run_command import run_command_tool
@@ -34,6 +35,7 @@ _LOCAL_TOOLS = [
     find_references_tool,
     locate_symbol_tool,
     get_ast_info_tool,
+    memory_tool,
 ]
 
 
