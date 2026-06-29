@@ -138,7 +138,7 @@ python -m app.main
 然后输入：
 
 ```text
-帮我分析一下 app/main.py 的启动链路
+帮我分析一下当前项目 app/logger.py 的启动链路
 ```
 
 ## 说明
