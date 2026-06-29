@@ -174,7 +174,6 @@ def prepare_agent_context(
 
     active_context_snapshot, active_context_summary = _resolve_active_context(
         older_history_summary=older_history_summary,
-        working_memory=None,
         cached_state=cached_state,
         resolved_user_preferences=resolved_user_preferences,
         resolved_project_constraints=resolved_project_constraints,
