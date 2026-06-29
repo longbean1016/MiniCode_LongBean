@@ -4,29 +4,27 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
-"""用户偏好解析与规则生效模块，负责把 user.md 转成运行时策略。"""
+"""用户偏好解析与规则生效模块，负责把 `.memory/USER.md` 转成运行时策略。"""
 
 
-_SECTION_RE = re.compile(r"^##\s+(.+)$", re.MULTILINE)
-_KV_RE = re.compile(r"^-\s+\*\*(.+?)\*\*:\s*(.+)$")
 _PATH_SCOPED_RULE_RE = re.compile(
     r"^(?:在|对|针对|对于)\s*([A-Za-z0-9_./\\-]+)(?:\s*(?:目录|文件夹|路径))?(?:\s*(?:下|中|里))?"
 )
 _BARE_PATH_SCOPED_RULE_RE = re.compile(
     r"^([A-Za-z0-9_./\\-]+)\s*(?:目录|文件夹|路径|下|中|里)\b"
 )
+_LIST_ITEM_RE = re.compile(r"^\s*-\s+(.*\S)\s*$")
+_INDENTED_LINE_RE = re.compile(r"^(?: {2,}|\t+)(.*)$")
+_USER_TITLE = "# 用户记忆"
 
 
 @dataclass(frozen=True, slots=True)
 class UserPolicyRule:
-    """一条来自 USER.md 的结构化用户规则。"""
-
     instruction: str
     scope_type: str = "path"
     scope_value: str = ""
 
     def applies_to(self, task_text: str) -> bool:
-        """判断规则是否命中当前任务。"""
         if self.scope_type != "path":
             return True
 
@@ -45,15 +43,12 @@ class UserPolicyRule:
 
 @dataclass(slots=True)
 class ResolvedUserPolicy:
-    """按全局偏好和作用域规则拆开的 USER.md 运行时策略。"""
-
     identity_lines: list[str] = field(default_factory=list)
     global_preferences: list[str] = field(default_factory=list)
     scoped_rules: list[UserPolicyRule] = field(default_factory=list)
     source_path: str = ""
 
     def active_rules_for(self, task_text: str) -> list[UserPolicyRule]:
-        """筛出当前任务真正命中的规则。"""
         active_rules: list[UserPolicyRule] = []
         seen: set[tuple[str, str, str]] = set()
         for rule in self.scoped_rules:
@@ -71,30 +66,19 @@ class ResolvedUserPolicy:
         return active_rules
 
     def to_prompt_section(self, active_rules: list[UserPolicyRule] | None = None) -> str:
-        """渲染成每轮 system prompt 可直接注入的文本。"""
         lines: list[str] = []
-        # 身份信息优先级比普通偏好更高，且条数通常很少，
-        # 所以单独保留更大的注入额度，避免被普通偏好挤掉。
         for item in _dedupe_lines(self.identity_lines)[:8]:
             lines.append(f"- 身份信息：{item}")
-
-        # 普通偏好仍然控制注入上限，避免 USER.md 变长后挤占过多 system prompt。
         for item in _dedupe_lines(self.global_preferences)[:12]:
             lines.append(f"- 全局偏好：{item}")
-
         for rule in active_rules or []:
             scope_value = _normalize_scope_value(rule.scope_value) or rule.scope_value.strip()
             lines.append(f"- 当前任务命中规则（{scope_value}）：{rule.instruction.strip()}")
-
-        if not lines:
-            return ""
-        return "\n".join(lines)
+        return "\n".join(lines).strip()
 
 
 @dataclass(slots=True)
 class UserProfileSnapshot:
-    """工作区级 USER.md 快照，只保留当前上下文管理真正需要的字段。"""
-
     language: str = ""
     verbosity: str = ""
     response_style: str = ""
@@ -106,26 +90,17 @@ class UserProfileSnapshot:
     extra_preferences: dict[str, str] = field(default_factory=dict)
 
     def to_preference_lines(self) -> list[str]:
-        """把 USER.md 内容转成适合注入 state/compact memory 的短偏好列表。"""
-        # 不同类别使用不同的保留策略：
-        # 1. identity：尽量完整保留，避免名字/称呼被截断。
-        # 2. preferences：保留更多稳定长期偏好。
-        # 3. custom：只保留较少自由说明，防止文档越写越像记事本。
         lines = self._build_identity_lines()
         lines.extend(self._build_structured_preference_lines())
         lines.extend(_split_instruction_lines(self.preference_instructions, limit=12))
         lines.extend(_split_instruction_lines(self.custom_instructions, limit=8))
-
         return _dedupe_lines(lines)
 
     def build_resolved_policy(self) -> ResolvedUserPolicy:
-        """把自由文本偏好拆成全局偏好和作用域规则。"""
         identity_lines = self._build_identity_lines()
         global_preferences = self._build_structured_preference_lines()
         scoped_rules: list[UserPolicyRule] = []
 
-        # preferences/custom 都允许携带“某路径下的规则”，
-        # 这样用户既可以写长期偏好，也可以写场景化约束。
         free_text_lines = []
         free_text_lines.extend(_split_instruction_lines(self.preference_instructions, limit=12))
         free_text_lines.extend(_split_instruction_lines(self.custom_instructions, limit=8))
@@ -145,11 +120,9 @@ class UserProfileSnapshot:
         )
 
     def _build_identity_lines(self) -> list[str]:
-        """渲染身份类说明，单独保留，避免与普通偏好混在一起被截断。"""
         return _split_instruction_lines(self.identity_instructions, limit=8)
 
     def _build_structured_preference_lines(self) -> list[str]:
-        """只渲染可稳定映射的结构化偏好字段。"""
         lines: list[str] = []
 
         normalized_language = self.language.strip().lower()
@@ -178,24 +151,26 @@ class UserProfileSnapshot:
         return lines
 
 
+@dataclass(slots=True)
+class UserProfileCommandResult:
+    handled: bool
+    response_text: str = ""
+
+
 def load_user_profile(workspace: str) -> UserProfileSnapshot | None:
-    """从工作区读取 USER.md；不存在时返回 None。"""
-    path = Path(workspace).resolve() / "USER.md"
+    path = _get_user_profile_path(workspace)
     if not path.exists() or not path.is_file():
         return None
-
     try:
         content = path.read_text(encoding="utf-8")
     except OSError:
         return None
-
     profile = parse_user_md(content)
     profile.source_path = str(path)
     return profile
 
 
 def save_user_profile(workspace: str, profile: UserProfileSnapshot) -> str:
-    """把最小 USER.md 快照写回工作区根目录，并返回目标路径。"""
     path = _get_user_profile_path(workspace)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(serialize_user_md(profile), encoding="utf-8")
@@ -204,107 +179,82 @@ def save_user_profile(workspace: str, profile: UserProfileSnapshot) -> str:
 
 
 def parse_user_md(content: str) -> UserProfileSnapshot:
-    """解析一个最小可用的 USER.md。"""
     profile = UserProfileSnapshot()
-    sections = _split_sections(content)
+    entries = _parse_markdown_list_entries(content)
 
-    # 结构化字段只抽“当前系统真的会消费”的那部分，
-    # 其他自由文本根据 section 分流到 identity / preferences / custom。
-    preferences = _parse_key_values(sections.get("preferences", ""))
-    coding_style = _parse_key_values(sections.get("coding_style", ""))
+    identity_lines: list[str] = []
+    preference_lines: list[str] = []
+    custom_lines: list[str] = []
+    extra_preferences: dict[str, str] = {}
 
-    profile.language = preferences.get("language", "")
-    profile.verbosity = preferences.get("verbosity", "")
-    profile.response_style = preferences.get("response_style", "")
-    profile.comments = coding_style.get("comments", "")
-    loose_manual_text = _extract_loose_manual_text(content)
-    if loose_manual_text:
-        # 兼容用户直接手改 USER.md 的旧写法：
-        # 没有明确 section 的自由文本，默认视为普通 preferences，
-        # 比 custom 更稳定，也更符合“这是长期工作方式”的含义。
-        profile.preference_instructions = _merge_manual_instruction_text(loose_manual_text)
-    profile.identity_instructions = _merge_manual_instruction_text(
-        sections.get("identity", "").strip(),
-        sections.get("identify", "").strip(),
-        sections.get("idetify", "").strip(),
-    )
-    profile.preference_instructions = _merge_manual_instruction_text(
-        profile.preference_instructions,
-        sections.get("preference_instructions", "").strip(),
-        sections.get("preferences_notes", "").strip(),
-    )
-    profile.custom_instructions = _merge_manual_instruction_text(
-        sections.get("custom_instructions", "").strip(),
-    )
-    profile.extra_preferences = preferences
+    for entry in entries:
+        normalized = entry.strip()
+        lower_line = normalized.lower()
+
+        if lower_line.startswith("身份信息：") or lower_line.startswith("身份信息:"):
+            identity_lines.append(_strip_prefix_value(normalized))
+            continue
+        if lower_line.startswith("全局偏好：") or lower_line.startswith("全局偏好:"):
+            preference_lines.append(_strip_prefix_value(normalized))
+            continue
+        if lower_line.startswith("自定义：") or lower_line.startswith("自定义:"):
+            custom_lines.append(_strip_prefix_value(normalized))
+            continue
+
+        if "默认使用中文回答" in normalized:
+            profile.language = "zh-CN"
+        elif normalized.startswith("默认使用 ") and normalized.endswith(" 回答"):
+            profile.language = normalized[len("默认使用 ") : -len(" 回答")].strip()
+        elif normalized == "回答尽量简洁":
+            profile.verbosity = "concise"
+        elif normalized == "回答可以更详细":
+            profile.verbosity = "detailed"
+        elif normalized == "回答风格偏技术和直接":
+            profile.response_style = "technical"
+        elif normalized.startswith("回答风格偏 "):
+            profile.response_style = normalized[len("回答风格偏 ") :].strip()
+        elif normalized == "修改代码时加中文注释":
+            profile.comments = "中文注释"
+
+        if normalized:
+            preference_lines.append(normalized)
+
+    profile.identity_instructions = _merge_manual_instruction_text(*identity_lines)
+    profile.preference_instructions = _merge_manual_instruction_text(*preference_lines)
+    profile.custom_instructions = _merge_manual_instruction_text(*custom_lines)
+    if profile.language:
+        extra_preferences["language"] = profile.language
+    if profile.verbosity:
+        extra_preferences["verbosity"] = profile.verbosity
+    if profile.response_style:
+        extra_preferences["response_style"] = profile.response_style
+    profile.extra_preferences = extra_preferences
     return profile
 
 
 def serialize_user_md(profile: UserProfileSnapshot) -> str:
-    """把最小 USER.md 快照序列化成 markdown。"""
-    lines: list[str] = ["# User Profile", ""]
+    lines: list[str] = [_USER_TITLE, ""]
 
-    # 只输出当前项目真正会参与上下文管理的字段，避免 USER.md 越写越散。
-    preference_lines: list[str] = []
-    # 这里只序列化“当前上下文系统会稳定使用的字段”，
-    # 避免 USER.md 被越来越多的临时偏好污染成一个难以维护的大杂烩。
-    if profile.language.strip():
-        preference_lines.append(f"- **Language**: {profile.language.strip()}")
-    if profile.verbosity.strip():
-        preference_lines.append(f"- **Verbosity**: {profile.verbosity.strip()}")
-    if profile.response_style.strip():
-        preference_lines.append(f"- **Response Style**: {profile.response_style.strip()}")
-    for key, value in profile.extra_preferences.items():
-        normalized_key = key.strip().lower()
-        if normalized_key in {"language", "verbosity", "response_style"}:
-            continue
-        cleaned_value = value.strip()
-        if not cleaned_value:
-            continue
-        label = normalized_key.replace("_", " ").title()
-        preference_lines.append(f"- **{label}**: {cleaned_value}")
+    rendered_entries: list[str] = []
+    for item in _dedupe_lines(profile._build_identity_lines())[:8]:
+        rendered_entries.append(f"- 身份信息：{item}")
 
-    if preference_lines:
-        lines.append("## Preferences")
-        lines.extend(preference_lines)
+    structured_preferences = profile._build_structured_preference_lines()
+    free_preferences = _split_instruction_lines(profile.preference_instructions, limit=12)
+    for item in _dedupe_lines(structured_preferences + free_preferences)[:12]:
+        rendered_entries.append(f"- 全局偏好：{item}")
+
+    for item in _dedupe_lines(_split_instruction_lines(profile.custom_instructions, limit=8))[:8]:
+        rendered_entries.append(f"- 自定义：{item}")
+
+    lines.extend(rendered_entries)
+    if rendered_entries:
         lines.append("")
-
-    coding_style_lines: list[str] = []
-    if profile.comments.strip():
-        coding_style_lines.append(f"- **Comments**: {profile.comments.strip()}")
-    if coding_style_lines:
-        lines.append("## Coding Style")
-        lines.extend(coding_style_lines)
-        lines.append("")
-
-    if profile.identity_instructions.strip():
-        lines.append("## Identity")
-        lines.append(profile.identity_instructions.strip())
-        lines.append("")
-
-    if profile.preference_instructions.strip():
-        lines.append("## Preference Instructions")
-        lines.append(profile.preference_instructions.strip())
-        lines.append("")
-
-    if profile.custom_instructions.strip():
-        lines.append("## Custom Instructions")
-        lines.append(profile.custom_instructions.strip())
-        lines.append("")
-
+    lines.append("---")
     return "\n".join(lines).rstrip() + "\n"
 
 
-@dataclass(slots=True)
-class UserProfileCommandResult:
-    """`/user` 命令处理结果。"""
-
-    handled: bool
-    response_text: str = ""
-
-
 def handle_user_profile_command(user_input: str, workspace: str) -> UserProfileCommandResult:
-    """处理工作区级 `/user` 命令，提供手动维护 USER.md 的入口。"""
     raw = user_input.strip()
     if not raw.lower().startswith("/user"):
         return UserProfileCommandResult(handled=False)
@@ -347,7 +297,6 @@ def handle_user_profile_command(user_input: str, workspace: str) -> UserProfileC
 
     if args.lower().startswith("set "):
         payload = args[4:].strip()
-        # set 走显式字段更新，适合 language / verbosity 这类稳定配置。
         return UserProfileCommandResult(
             handled=True,
             response_text=_handle_user_set(payload, workspace),
@@ -364,7 +313,6 @@ def handle_user_profile_command(user_input: str, workspace: str) -> UserProfileC
 
 
 def render_user_profile_summary(workspace: str) -> str:
-    """把当前 USER.md 渲染成中文摘要，便于终端直接查看。"""
     profile = load_user_profile(workspace)
     path = _get_user_profile_path(workspace)
     if profile is None:
@@ -375,7 +323,6 @@ def render_user_profile_summary(workspace: str) -> str:
         )
 
     rendered = [f"USER.md 路径: {path} (exists)"]
-
     identity_lines = _dedupe_lines(profile._build_identity_lines())
     preference_lines = _dedupe_lines(
         profile._build_structured_preference_lines()
@@ -387,75 +334,48 @@ def render_user_profile_summary(workspace: str) -> str:
         rendered.append("")
         rendered.append("[Identity]")
         rendered.extend(f"- {line}" for line in identity_lines)
-
     if preference_lines:
         rendered.append("")
         rendered.append("[Preferences]")
         rendered.extend(f"- {line}" for line in preference_lines)
-
     if custom_lines:
         rendered.append("")
         rendered.append("[Custom]")
         rendered.extend(f"- {line}" for line in custom_lines)
-
     if len(rendered) == 1:
         rendered.append("")
         rendered.append("当前 USER.md 没有可用于上下文注入的偏好项")
-
     return "\n".join(rendered)
 
 
-def _split_sections(content: str) -> dict[str, str]:
-    """把 markdown 按 `##` 标题切成 section。"""
-    sections: dict[str, str] = {}
-    parts = _SECTION_RE.split(content)
-    for index in range(1, len(parts) - 1, 2):
-        heading = parts[index].strip().lower().replace(" ", "_")
-        sections[heading] = parts[index + 1]
-    return sections
-
-
-def _extract_loose_manual_text(content: str) -> str:
-    """提取第一个 `##` section 之前的自由文本，避免 section 内容串到别的类别。"""
-    # 这里不再全文件逐行扫描。
-    # 否则 `## Identity` / `## Custom Instructions` 下面的正文行
-    # 也会被误当成“散落自由文本”重新回灌到 preference_instructions。
-    # 当前策略只接受“第一个二级标题出现之前”的自由文本作为 loose text，
-    # 这样不同 section 的内容边界就是稳定的，不会发生串线。
-    section_match = _SECTION_RE.search(content)
-    if section_match is not None:
-        content = content[: section_match.start()]
-
-    lines: list[str] = []
+def _parse_markdown_list_entries(content: str) -> list[str]:
+    entries: list[str] = []
+    current_lines: list[str] = []
     for raw_line in content.splitlines():
-        stripped = raw_line.strip()
-        if not stripped:
+        line = raw_line.rstrip()
+        if not line.strip():
+            if current_lines:
+                current_lines.append("")
             continue
-        if stripped.startswith("#"):
+        if line.strip() == "---":
             continue
-        if stripped.startswith("## "):
+        if line.lstrip().startswith("#"):
             continue
-        if _KV_RE.match(stripped):
+        item_match = _LIST_ITEM_RE.match(line)
+        if item_match:
+            if current_lines:
+                entries.append("\n".join(current_lines).rstrip())
+            current_lines = [item_match.group(1).strip()]
             continue
-        lines.append(stripped)
-    return "\n".join(lines).strip()
-
-
-def _parse_key_values(body: str) -> dict[str, str]:
-    """解析 `- **Key**: value` 这种 USER.md 键值行。"""
-    result: dict[str, str] = {}
-    for raw_line in body.strip().splitlines():
-        match = _KV_RE.match(raw_line.strip())
-        if not match:
-            continue
-        key = match.group(1).strip().lower().replace(" ", "_")
-        value = match.group(2).strip()
-        result[key] = value
-    return result
+        indented_match = _INDENTED_LINE_RE.match(line)
+        if indented_match and current_lines:
+            current_lines.append(indented_match.group(1).rstrip())
+    if current_lines:
+        entries.append("\n".join(current_lines).rstrip())
+    return [entry for entry in entries if entry.strip()]
 
 
 def _split_instruction_lines(text: str, limit: int | None = None) -> list[str]:
-    """把自由文本 section 拆成若干条说明，并按类别上限截取。"""
     result: list[str] = []
     for raw_line in text.splitlines():
         line = raw_line.strip().lstrip("-").strip().rstrip("。.;；")
@@ -468,7 +388,6 @@ def _split_instruction_lines(text: str, limit: int | None = None) -> list[str]:
 
 
 def _dedupe_lines(lines: list[str]) -> list[str]:
-    """去重并保留原顺序。"""
     result: list[str] = []
     seen: set[str] = set()
     for line in lines:
@@ -481,12 +400,11 @@ def _dedupe_lines(lines: list[str]) -> list[str]:
 
 
 def _merge_manual_instruction_text(*parts: str) -> str:
-    """合并多来源手写说明，避免 USER.md 里的自由文本被结构化字段覆盖。"""
     merged_lines: list[str] = []
     seen: set[str] = set()
     for part in parts:
         for line in part.splitlines():
-            cleaned = line.strip()
+            cleaned = line.strip().lstrip("-").strip()
             normalized = " ".join(cleaned.lower().split())
             if not normalized or normalized in seen:
                 continue
@@ -496,19 +414,15 @@ def _merge_manual_instruction_text(*parts: str) -> str:
 
 
 def _build_scoped_rule(line: str) -> UserPolicyRule | None:
-    """尽量从自由文本里提取“某个路径/目录下的规则”。"""
     cleaned = line.strip()
     if not cleaned:
         return None
-
     match = _PATH_SCOPED_RULE_RE.match(cleaned) or _BARE_PATH_SCOPED_RULE_RE.match(cleaned)
     if match is None:
         return None
-
     scope_value = _normalize_scope_value(match.group(1))
     if not scope_value:
         return None
-
     return UserPolicyRule(
         instruction=cleaned,
         scope_type="path",
@@ -517,7 +431,6 @@ def _build_scoped_rule(line: str) -> UserPolicyRule | None:
 
 
 def _dedupe_policy_rules(rules: list[UserPolicyRule]) -> list[UserPolicyRule]:
-    """对结构化规则做稳定去重。"""
     result: list[UserPolicyRule] = []
     seen: set[tuple[str, str, str]] = set()
     for rule in rules:
@@ -534,7 +447,6 @@ def _dedupe_policy_rules(rules: list[UserPolicyRule]) -> list[UserPolicyRule]:
 
 
 def _normalize_scope_value(value: str) -> str:
-    """把路径作用域统一成稳定匹配格式。"""
     normalized = str(value).strip().strip("\"'`")
     normalized = normalized.replace("\\", "/")
     normalized = normalized.lstrip("./")
@@ -543,12 +455,10 @@ def _normalize_scope_value(value: str) -> str:
 
 
 def _normalize_policy_match_text(text: str) -> str:
-    """归一化任务文本，便于路径规则匹配。"""
     return " ".join(str(text).strip().lower().replace("\\", "/").split())
 
 
 def _handle_user_set(payload: str, workspace: str) -> str:
-    """处理 `/user set <key> <value>` 并持久化到 USER.md。"""
     parts = payload.strip().split(maxsplit=1)
     if len(parts) < 2:
         return (
@@ -577,7 +487,6 @@ def _handle_user_set(payload: str, workspace: str) -> str:
 
 
 def _handle_user_add(payload: str, workspace: str) -> str:
-    """处理 `/user add`，支持 identity/preferences/custom 三种显式分类。"""
     content = payload.strip()
     if not content:
         return (
@@ -605,14 +514,12 @@ def _handle_user_add(payload: str, workspace: str) -> str:
             limit=12,
         )
     else:
-        # 默认仍然落到 custom，兼容旧的 `/user add <内容>` 写法。
         profile.custom_instructions = _append_instruction_line(
             profile.custom_instructions,
             normalized_content,
             limit=8,
         )
 
-    # 常见的“中文注释”偏好顺手同步到结构化字段，方便后续稳定注入。
     if "注释" in normalized_content and "中文" in normalized_content and not profile.comments.strip():
         profile.comments = "中文注释"
 
@@ -621,7 +528,6 @@ def _handle_user_add(payload: str, workspace: str) -> str:
 
 
 def _parse_user_add_payload(payload: str) -> tuple[str, str]:
-    """解析 `/user add` 的显式分类前缀，避免把分类词本身写入内容。"""
     stripped = payload.strip()
     if not stripped:
         return "custom", ""
@@ -642,14 +548,12 @@ def _parse_user_add_payload(payload: str) -> tuple[str, str]:
 
 
 def _append_instruction_line(existing_text: str, content: str, *, limit: int) -> str:
-    """向某个文本 section 追加一条说明，并按该类别自己的上限保留。"""
     existing_lines = _split_instruction_lines(existing_text, limit=0)
     existing_lines.append(content.strip())
     return "\n".join(f"- {line}" for line in _dedupe_lines(existing_lines)[:limit])
 
 
 def _apply_user_setting(profile: UserProfileSnapshot, key: str, value: str) -> bool:
-    """把一条设置应用到最小 USER.md 快照。"""
     key_aliases = {
         "language": "preferences.language",
         "verbosity": "preferences.verbosity",
@@ -683,10 +587,15 @@ def _apply_user_setting(profile: UserProfileSnapshot, key: str, value: str) -> b
     if normalized_key == "custom_instructions":
         profile.custom_instructions = cleaned_value
         return True
-
     return False
 
 
+def _strip_prefix_value(line: str) -> str:
+    _, _, value = line.partition("：")
+    if not value:
+        _, _, value = line.partition(":")
+    return value.strip()
+
+
 def _get_user_profile_path(workspace: str) -> Path:
-    """返回当前工作区唯一的 USER.md 路径。"""
-    return Path(workspace).resolve() / "USER.md"
+    return Path(workspace).resolve() / ".memory" / "USER.md"
