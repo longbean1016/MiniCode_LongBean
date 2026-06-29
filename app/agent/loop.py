@@ -404,7 +404,7 @@ def _run_agent_loop(
                                 f"step耗时={step_cost:.3f}s context={context_cost:.3f}s "
                                 f"model={model_cost:.3f}s post={post_cost:.3f}s 总耗时={total_cost:.3f}s"
                             )
-                            _check_memory_review(list(builder.build()), session_id)
+                            _check_memory_review(list(builder.build()), session)
                             return step, builder.build()
 
             # 模型调用异常时兜底为最终回答，避免主循环直接崩掉
@@ -421,7 +421,7 @@ def _run_agent_loop(
                 kind="final",
             )
             builder.add_assistant(fallback.content)
-            _check_memory_review(list(builder.build()), session_id)
+            _check_memory_review(list(builder.build()), session)
             return fallback, builder.build() # type: ignore
 
         # 情况一：模型直接返回最终答案
@@ -486,7 +486,7 @@ def _run_agent_loop(
                 f"step耗时={step_cost:.3f}s context={context_cost:.3f}s "
                 f"model={model_cost:.3f}s post={post_cost:.3f}s 总耗时={total_cost:.3f}s"
             )
-            _check_memory_review(list(builder.build()), session_id)
+            _check_memory_review(list(builder.build()), session)
             return step, builder.build()
 
         # 情况二：模型要求调用一个或多个工具
@@ -728,7 +728,7 @@ def _run_agent_loop(
             kind="final",
         )
         builder.add_assistant(fallback.content)
-        _check_memory_review(list(builder.build()), session_id)
+        _check_memory_review(list(builder.build()), session)
         return fallback, builder.build()
 
     # 达到最大步数时停止，防止死循环
@@ -742,7 +742,7 @@ def _run_agent_loop(
         kind="final",
     )
     builder.add_assistant(fallback.content)
-    _check_memory_review(list(builder.build()), session_id)
+    _check_memory_review(list(builder.build()), session)
     return fallback, builder.build()
 
 
@@ -930,7 +930,7 @@ def stream_agent(
                 kind="final",
             )
             builder.add_assistant(fallback.content)
-            _check_memory_review(list(builder.build()), session_id)
+            _check_memory_review(list(builder.build()), session)
             yield DoneEvent(step=fallback, history=builder.build())
             return
 
@@ -1231,7 +1231,7 @@ def stream_agent(
             f"model={model_cost:.3f}s 总耗时={total_cost:.3f}s",
             echo=False,
         )
-        _check_memory_review(list(builder.build()), session_id)
+        _check_memory_review(list(builder.build()), session)
         yield DoneEvent(step=step, history=builder.build())
         return
 
@@ -1248,7 +1248,7 @@ def stream_agent(
         kind="final",
     )
     builder.add_assistant(fallback.content)
-    _check_memory_review(list(builder.build()), session_id)
+    _check_memory_review(list(builder.build()), session)
     yield DoneEvent(step=fallback, history=builder.build())
 
 
@@ -1257,8 +1257,10 @@ def stream_agent(
 # ---------------------------------------------------------------------------
 
 _REVIEW_NUDGE_INTERVAL = 10
-_turns_since_memory_review = 0
 _review_runner: object = None
+
+# 计数器 key，存放在 session.extra 中，跨会话重启保持
+_TURNS_KEY = "_turns_since_memory_review"
 
 
 def configure_review_runner(runner: object) -> None:
@@ -1267,14 +1269,21 @@ def configure_review_runner(runner: object) -> None:
     _review_runner = runner
 
 
-def _check_memory_review(history: list[ChatMessage], session_id: str) -> None:
-    """累计用户轮次，达到阈值时 spawn 后台记忆反思线程（参照 Hermes _memory_nudge_interval）。"""
-    global _turns_since_memory_review
-    if _review_runner is None:
+def _check_memory_review(history: list[ChatMessage], session: object) -> None:
+    """累计用户轮次，达到阈值时 spawn 后台记忆反思线程（参照 Hermes _memory_nudge_interval）。
+
+    计数器存放在 session.extra 中，跨会话重启保持。
+    """
+    if _review_runner is None or session is None:
         return
-    _turns_since_memory_review += 1
-    if _turns_since_memory_review >= _REVIEW_NUDGE_INTERVAL:
-        _turns_since_memory_review = 0
+    extra = getattr(session, "extra", {})
+    if not isinstance(extra, dict):
+        extra = {}
+    count = int(extra.get(_TURNS_KEY, 0)) + 1
+    extra[_TURNS_KEY] = count
+    if count >= _REVIEW_NUDGE_INTERVAL:
+        extra[_TURNS_KEY] = 0
+        session_id = getattr(session, "session_id", "")
         try:
             getattr(_review_runner, "spawn_review")(history, session_id=session_id)
         except Exception:
