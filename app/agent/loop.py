@@ -245,7 +245,6 @@ def _run_agent_loop(
     )
 
     # 限制循环步数，防止模型和工具来回打转
-    tool_iterations_this_turn = 0
     for step_index in range(max_steps):
         # 记录当前 step 开始时间
         step_started_at = time.perf_counter()
@@ -405,8 +404,8 @@ def _run_agent_loop(
                                 f"step耗时={step_cost:.3f}s context={context_cost:.3f}s "
                                 f"model={model_cost:.3f}s post={post_cost:.3f}s 总耗时={total_cost:.3f}s"
                             )
-                            _increment_review_counter(tool_iterations_this_turn, list(builder.build()), session_id)
-                            _increment_review_counter(tool_iterations_this_turn, list(builder.build()), session_id)
+                            _check_memory_review(list(builder.build()), session_id)
+                            _check_memory_review(list(builder.build()), session_id)
             return step, builder.build()
 
             # 模型调用异常时兜底为最终回答，避免主循环直接崩掉
@@ -423,7 +422,7 @@ def _run_agent_loop(
                 kind="final",
             )
             builder.add_assistant(fallback.content)
-            _increment_review_counter(tool_iterations_this_turn, list(builder.build()), session_id)
+            _check_memory_review(list(builder.build()), session_id)
             return fallback, builder.build() # type: ignore
 
         # 情况一：模型直接返回最终答案
@@ -488,7 +487,7 @@ def _run_agent_loop(
                 f"step耗时={step_cost:.3f}s context={context_cost:.3f}s "
                 f"model={model_cost:.3f}s post={post_cost:.3f}s 总耗时={total_cost:.3f}s"
             )
-            _increment_review_counter(tool_iterations_this_turn, list(builder.build()), session_id)
+            _check_memory_review(list(builder.build()), session_id)
             return step, builder.build()
 
         # 情况二：模型要求调用一个或多个工具
@@ -548,7 +547,6 @@ def _run_agent_loop(
                 tool_input = call["input"]
                 tool_use_id = call["id"]
                 tool_target = _extract_tool_target(tool_input)
-                tool_iterations_this_turn += 1
 
                 # 先把工具调用请求记到历史里
                 builder.add_tool_call(
@@ -731,7 +729,7 @@ def _run_agent_loop(
             kind="final",
         )
         builder.add_assistant(fallback.content)
-        _increment_review_counter(tool_iterations_this_turn, list(builder.build()), session_id)
+        _check_memory_review(list(builder.build()), session_id)
         return fallback, builder.build()
 
     # 达到最大步数时停止，防止死循环
@@ -745,7 +743,7 @@ def _run_agent_loop(
         kind="final",
     )
     builder.add_assistant(fallback.content)
-    _increment_review_counter(tool_iterations_this_turn, list(builder.build()), session_id)
+    _check_memory_review(list(builder.build()), session_id)
     return fallback, builder.build()
 
 
@@ -809,7 +807,6 @@ def stream_agent(
     loop_started_at = time.perf_counter()
     pending_user_nudge: str | None = None
     exploration_history: list[tuple[str, str]] = []
-    tool_iterations_this_turn = 0
 
     # ---- 分析护栏：初始化证据追踪器 ----
     # 对代码分析类任务创建 tracker，后续每次工具调用都会往里面沉淀观察到的函数名、文件、行数。
@@ -934,7 +931,7 @@ def stream_agent(
                 kind="final",
             )
             builder.add_assistant(fallback.content)
-            _increment_review_counter(tool_iterations_this_turn, list(builder.build()), session_id)
+            _check_memory_review(list(builder.build()), session_id)
             yield DoneEvent(step=fallback, history=builder.build())
             return
 
@@ -992,7 +989,6 @@ def stream_agent(
                 tool_name = call["tool_name"]
                 tool_input = call["input"]
                 tool_use_id = call["id"]
-                tool_iterations_this_turn += 1
 
                 # 通知 UI：工具开始执行
                 yield ToolRunningEvent(name=tool_name)
@@ -1236,7 +1232,7 @@ def stream_agent(
             f"model={model_cost:.3f}s 总耗时={total_cost:.3f}s",
             echo=False,
         )
-        _increment_review_counter(tool_iterations_this_turn, list(builder.build()), session_id)
+        _check_memory_review(list(builder.build()), session_id)
         yield DoneEvent(step=step, history=builder.build())
         return
 
@@ -1253,7 +1249,7 @@ def stream_agent(
         kind="final",
     )
     builder.add_assistant(fallback.content)
-    _increment_review_counter(tool_iterations_this_turn, list(builder.build()), session_id)
+    _check_memory_review(list(builder.build()), session_id)
     yield DoneEvent(step=fallback, history=builder.build())
 
 
@@ -1262,7 +1258,7 @@ def stream_agent(
 # ---------------------------------------------------------------------------
 
 _REVIEW_NUDGE_INTERVAL = 10
-_tool_iterations_since_review = 0
+_turns_since_memory_review = 0
 _review_runner: object = None
 
 
@@ -1272,14 +1268,14 @@ def configure_review_runner(runner: object) -> None:
     _review_runner = runner
 
 
-def _increment_review_counter(tool_count: int, history: list[ChatMessage], session_id: str) -> None:
-    """累计工具调用次数，达到阈值时 spawn 后台反思线程。"""
-    global _tool_iterations_since_review
+def _check_memory_review(history: list[ChatMessage], session_id: str) -> None:
+    """累计用户轮次，达到阈值时 spawn 后台记忆反思线程（参照 Hermes _memory_nudge_interval）。"""
+    global _turns_since_memory_review
     if _review_runner is None:
         return
-    _tool_iterations_since_review += tool_count
-    if _tool_iterations_since_review >= _REVIEW_NUDGE_INTERVAL:
-        _tool_iterations_since_review = 0
+    _turns_since_memory_review += 1
+    if _turns_since_memory_review >= _REVIEW_NUDGE_INTERVAL:
+        _turns_since_memory_review = 0
         try:
             getattr(_review_runner, "spawn_review")(history, session_id=session_id)
         except Exception:
