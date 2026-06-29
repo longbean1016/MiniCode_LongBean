@@ -66,7 +66,7 @@ NOTHING_TO_SAVE_MARKER = "Nothing to save."
 # ---------------------------------------------------------------------------
 
 
-@dataclass(slots=True)
+@dataclass
 class BackgroundReviewRunner:
     """后台记忆反思执行器。
 
@@ -86,7 +86,7 @@ class BackgroundReviewRunner:
     circuit_recovery_timeout_seconds: float = 45.0
 
     def __post_init__(self) -> None:
-        self.client = OpenAI(api_key=self.api_key, base_url=self.base_url)
+        object.__setattr__(self, "client", OpenAI(api_key=self.api_key, base_url=self.base_url))
         self.retry_policy = RetryPolicy(
             max_attempts=self.retry_max_attempts,
             base_delay_seconds=self.retry_base_delay_seconds,
