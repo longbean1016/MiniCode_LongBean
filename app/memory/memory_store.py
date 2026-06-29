@@ -66,53 +66,6 @@ def _timestamp_suffix() -> str:
 
 
 @dataclass(slots=True)
-class MemoryEntry:
-    id: str
-    content: str
-    category: str = "note"
-    tags: list[str] = field(default_factory=list)
-    created_at: float = field(default_factory=time.time)
-    updated_at: float = field(default_factory=time.time)
-    session_id: str = ""
-    scope: str = "project"
-    confidence: float = 0.0
-    domains: list[str] = field(default_factory=list)
-    source: str = ""
-    usage_count: int = 0
-    last_accessed_at: float = 0.0
-    decay_score: float = 1.0
-    archived: bool = False
-    extra: dict[str, object] = field(default_factory=dict)
-
-
-def create_memory_entry(
-    *,
-    content: str,
-    category: str = "note",
-    tags: list[str] | None = None,
-    session_id: str = "",
-    scope: str = "project",
-    confidence: float = 0.0,
-    domains: list[str] | None = None,
-    source: str = "",
-    extra: dict[str, object] | None = None,
-) -> MemoryEntry:
-    entry_id_source = f"{scope}:{category}:{content}:{time.time_ns()}"
-    return MemoryEntry(
-        id=hashlib.sha1(entry_id_source.encode("utf-8")).hexdigest()[:12],
-        content=content.strip(),
-        category=category,
-        tags=list(tags or []),
-        session_id=session_id,
-        scope=scope,
-        confidence=confidence,
-        domains=list(domains or []),
-        source=source,
-        extra=dict(extra or {}),
-    )
-
-
-@dataclass(slots=True)
 class FrozenMemorySnapshot:
     memory_entries: list[str]
     user_entries: list[str]
@@ -154,6 +107,8 @@ class MemoryStore:
             memory_hash="",
             user_hash="",
         )
+        self._live_memory_hash = ""
+        self._live_user_hash = ""
 
     def ensure_files(self) -> None:
         self.memory_dir.mkdir(parents=True, exist_ok=True)
@@ -178,6 +133,8 @@ class MemoryStore:
             memory_hash=_hash_text(memory_raw),
             user_hash=_hash_text(user_raw),
         )
+        self._live_memory_hash = self._snapshot.memory_hash
+        self._live_user_hash = self._snapshot.user_hash
         return self._snapshot
 
     def current_snapshot(self) -> FrozenMemorySnapshot:
@@ -186,12 +143,18 @@ class MemoryStore:
         return self._snapshot
 
     def view(self, target: str | None = None) -> str:
-        snapshot = self.current_snapshot()
+        self.ensure_files()
+        memory_raw = self.memory_path.read_text(encoding="utf-8")
+        user_raw = self.user_path.read_text(encoding="utf-8")
+        memory_text = self._render_markdown(MEMORY_TITLE, self._read_entries(memory_raw))
+        user_text = self._render_markdown(USER_TITLE, self._read_entries(user_raw))
         if target == "memory":
-            return snapshot.memory_text
+            return memory_text
         if target == "user":
-            return snapshot.user_text
-        return snapshot.format_for_prompt()
+            return user_text
+        return "\n".join(
+            part for part in (memory_text.strip(), user_text.strip()) if part
+        ).strip()
 
     def add(self, *, target: str, content: str, bypass_approval: bool = False) -> dict[str, object]:
         normalized_target = self._normalize_target(target)
@@ -275,7 +238,7 @@ class MemoryStore:
                     "error": f"写入后超过字符上限（{limit}）。",
                 }
             self._write_file(path, updated_entries, title)
-            self.load_snapshot()
+            self._refresh_live_hashes()
             return {
                 "success": True,
                 "message": message,
@@ -284,8 +247,8 @@ class MemoryStore:
             }
 
     def _assert_no_external_drift(self, target: str, path: Path) -> None:
-        snapshot = self.current_snapshot()
-        expected_hash = snapshot.memory_hash if target == "memory" else snapshot.user_hash
+        self.current_snapshot()
+        expected_hash = self._live_memory_hash if target == "memory" else self._live_user_hash
         current_hash = _hash_text(path.read_text(encoding="utf-8"))
         if expected_hash and current_hash != expected_hash:
             raise _ExternalDriftError(path)
@@ -294,7 +257,12 @@ class MemoryStore:
         raw_text = path.read_text(encoding="utf-8")
         backup_path = path.with_name(f"{path.name}.bak.{_timestamp_suffix()}")
         backup_path.write_text(raw_text, encoding="utf-8")
-        self.load_snapshot()
+        self._refresh_live_hashes()
+
+    def _refresh_live_hashes(self) -> None:
+        self.ensure_files()
+        self._live_memory_hash = _hash_text(self.memory_path.read_text(encoding="utf-8"))
+        self._live_user_hash = _hash_text(self.user_path.read_text(encoding="utf-8"))
 
     def _sanitize_for_snapshot(self, entry: str) -> str:
         return FILTERED_ENTRY_TEXT if _scan_memory_content(entry) else entry

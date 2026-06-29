@@ -41,8 +41,7 @@ class MiniCodeApp(App):
             tool_registry=tool_registry,
             tool_context=tool_context,
             session=session,
-            working_memory=working_memory,
-            memory_pipeline=memory_pipeline,
+            
             history_summarizer=history_summarizer,
         )
         app.run()  # 接管终端，启动 TUI
@@ -97,8 +96,7 @@ class MiniCodeApp(App):
         tool_registry=None,
         tool_context=None,
         session=None,
-        working_memory=None,
-        memory_pipeline=None,
+        
         history_summarizer=None,
         mcp_manager=None,
     ) -> None:
@@ -121,8 +119,8 @@ class MiniCodeApp(App):
         self._tool_registry = tool_registry
         self._tool_context = tool_context
         self._session = session
-        self._working_memory = working_memory
-        self._memory_pipeline = memory_pipeline
+        self._working_memory = None
+        self._memory_pipeline = None
         self._history_summarizer = history_summarizer
         self._mcp_manager = mcp_manager  # MCP 生命周期管理器
         # 注入异步结果回调: MCP 后台线程完成后通过 call_from_thread 安全更新 UI
@@ -243,20 +241,7 @@ class MiniCodeApp(App):
             self._do_exit()
             return
 
-        # 显式记忆命令（/user add、/memory add 等），不走模型
-        if self._memory_pipeline is not None:
-            explicit_result = self._memory_pipeline.handle_explicit_input(
-                user_input=user_text,
-                session_id=self._session.session_id,
-                history=self._history,
-                decay_log_enabled=True,
-                decay_log_echo=False,
-            )
-            if explicit_result.handled:
-                self._history = explicit_result.history
-                self.conversation.add_user_message(user_text)
-                self.conversation.add_system_info(explicit_result.assistant_text)
-                return
+        # 显式记忆命令已废弃 — memory pipeline 已移除，跳过
 
         # /mcp 命令（管理 MCP Server），不走模型
         if user_text.strip().startswith("/mcp") and self._mcp_manager is not None:
@@ -487,12 +472,7 @@ class MiniCodeApp(App):
             self.call_from_thread(self.conversation.begin_agent_response)
 
             if user_input is not None:
-                # 新请求：重置 turn runtime 并记录用户意图到工作记忆
-                if self._memory_pipeline is not None:
-                    self._memory_pipeline.reset_turn_runtime(self._working_memory)
-                    self._memory_pipeline.remember_user_intent(
-                        self._working_memory, user_input
-                    )
+                pass  # memory pipeline removed
 
             # 捕获最终 AgentStep，用于后续 finalize_turn
             final_step = None
@@ -505,8 +485,7 @@ class MiniCodeApp(App):
                     tool_registry=self._tool_registry,
                     tool_context=self._tool_context,
                     session=self._session,
-                    working_memory=self._working_memory,
-                    memory_pipeline=self._memory_pipeline,
+                    
                     history_summarizer=self._history_summarizer,
                     history=self._history,
                     max_steps=20,
@@ -603,8 +582,8 @@ class MiniCodeApp(App):
                 finalize_session_id = (
                     self._session.session_id if self._session else ""
                 )
-                finalize_working_memory = copy.deepcopy(self._working_memory)
-                finalize_mp = self._memory_pipeline
+                finalize_working_memory = None
+                finalize_mp = None
                 # 提取本轮对话消息，用于记忆抽取
                 finalize_turn_messages = copy.deepcopy(
                     get_last_round_messages(self._history)

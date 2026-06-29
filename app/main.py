@@ -33,7 +33,6 @@ from app.state.session import (
 from app.tools import build_tool_registry
 from app.tui.app import MiniCodeApp
 from app.types import AgentStep, ChatMessage, ToolContext
-from app.state.working_memory import WorkingMemory
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
@@ -181,9 +180,9 @@ def main() -> None:
                 f"[session=startup] 向量索引初始化收敛失败，已降级继续运行: {error}"
             )
 
-    # WorkingMemory 只承担"本次会话里近期要持续遵守/记住的事实"，
+    # WorkingMemory — removed, using MemoryStore snapshot instead 只承担"本次会话里近期要持续遵守/记住的事实"，
     # 长期知识仍然交给 memory store / memory pipeline。
-    working_memory = WorkingMemory()
+    # working_memory removed
 
     # 长期记忆抽取器：负责把本轮任务整理成 task reflection，并产出候选记忆。
     memory_extractor = LongTermMemoryExtractor(

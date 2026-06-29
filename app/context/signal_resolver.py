@@ -5,7 +5,6 @@ from __future__ import annotations
 import re
 
 from app.memory.memory_store import FrozenMemorySnapshot
-from app.state.user_profile import load_user_profile
 
 _TRANSIENT_CONSTRAINT_PHRASES = (
     "本次",
@@ -53,10 +52,9 @@ _CODE_LIKE_PREFIXES = ("def ", "class ", "return ", "import ", "from ", "if ", "
 
 
 def resolve_user_preferences(*, workspace: str) -> list[str]:
-    profile = load_user_profile(workspace)
-    if profile is None:
-        return []
-    return profile.to_preference_lines()[:6]
+    # USER.md 现在由 MemoryStore 以 Markdown 列表格式管理，
+    # 用户偏好通过 MemoryStore.get_prompt_context() 注入到持久记忆段
+    return []
 
 
 def resolve_project_constraints(
