@@ -109,8 +109,7 @@ class MiniCodeApp(App):
             tool_registry: ToolRegistry 实例
             tool_context: ToolContext 实例（含 cwd、approved_actions）
             session: SessionData 实例
-            working_memory: WorkingMemory 实例
-            memory_pipeline: MemoryPipeline 实例
+            记忆已改用 MemoryStore 快照注入
             history_summarizer: OlderHistorySummarizer 实例
             mcp_manager: McpManager 实例（可选，用于 /mcp 命令）
         """
@@ -226,7 +225,7 @@ class MiniCodeApp(App):
         根据输入类型分五种路径：
         1. 审批回复 → _handle_approval_reply()
         2. 退出命令（exit/quit）→ _do_exit()
-        3. 显式记忆命令 → memory_pipeline.handle_explicit_input()
+        3. 显式记忆命令 → 已废弃
         4. /mcp 命令 → mcp_manager.handle_command()
         5. 普通对话 → _run_agent_stream()
         """
@@ -573,51 +572,6 @@ class MiniCodeApp(App):
             finally:
                 # 无论成功或失败，都恢复输入区
                 self.call_from_thread(self.input_area.enable_input)
-
-                # ---- 后台写入长期记忆 ----
-                from app.infra.background_worker import submit_background
-                from app.state.turn_history import get_last_round_messages
-
-                finalize_task_description = user_input or ""
-                finalize_session_id = (
-                    self._session.session_id if self._session else ""
-                )
-                finalize_working_memory = None
-                finalize_mp = None
-                # 提取本轮对话消息，用于记忆抽取
-                finalize_turn_messages = copy.deepcopy(
-                    get_last_round_messages(self._history)
-                )
-
-                def _finalize_turn_background() -> None:
-                    """后台任务：抽取并持久化长期记忆。"""
-                    started_at = time.perf_counter()
-                    try:
-                        if finalize_mp is not None:
-                            finalize_mp.finalize_turn(
-                                task_description=finalize_task_description,
-                                final_step=final_step,
-                                turn_messages=finalize_turn_messages,
-                                session_id=finalize_session_id,
-                                working_memory=finalize_working_memory,
-                                decay_log_enabled=True,
-                                decay_log_echo=False,
-                            )
-                        elapsed = time.perf_counter() - started_at
-                        from app.logger import log_event
-                        log_event(
-                            f"[session={finalize_session_id}] 长期记忆后台写入完成 "
-                            f"耗时={elapsed:.3f}s",
-                            echo=False,
-                        )
-                    except Exception as error:
-                        from app.logger import log_event
-                        log_event(
-                            f"[session={finalize_session_id}] 长期记忆后台写入失败: {error}",
-                            echo=False,
-                        )
-
-                submit_background(_finalize_turn_background, name="finalize_turn")
 
                 # ---- 持久化会话 ----
                 from app.state.session import save_session

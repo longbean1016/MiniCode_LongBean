@@ -7,8 +7,7 @@ from dataclasses import dataclass
 
 from app.context.manager import estimate_tokens
 from app.types import ChatMessage
-WorkingMemory = None  # type: ignore — 已删除，仅兼容旧函数签名
-WorkingMemoryEntry = None  # type: ignore
+# WorkingMemory 已删除，compact_memory 中的 working_memory 参数均已改为可选
 
 # compact memory 是跨轮次续带的结构化基线，预算不能低到只够放 1-2 条句子。
 # 这里参考 minicode 的分层摘要 / working memory 量级，给到更合理的中等预算。
