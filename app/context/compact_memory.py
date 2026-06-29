@@ -192,7 +192,7 @@ _SECTION_SPECS = (
 def build_active_context_summary(
     *,
     older_history_summary: str,
-    working_memory: WorkingMemory,
+    working_memory: WorkingMemory | None = None,
     previous_active_context_summary: str = "",
     previous_snapshot: CompactMemorySnapshot | None = None,
     resolved_user_preferences: list[str] | None = None,
@@ -220,7 +220,7 @@ def build_active_context_summary(
 def build_active_context_snapshot(
     *,
     older_history_summary: str,
-    working_memory: WorkingMemory,
+    working_memory: WorkingMemory | None = None,
     previous_snapshot: CompactMemorySnapshot | None = None,
     previous_active_context_summary: str = "",
     resolved_user_preferences: list[str] | None = None,
@@ -240,7 +240,9 @@ def build_active_context_snapshot(
         carry_snapshot = _normalize_snapshot(
             _snapshot_from_previous_context(previous_active_context_summary)
         )
-    protected_snapshot = _normalize_snapshot(working_memory.build_protected_snapshot())
+    protected_snapshot: CompactMemorySnapshot = {}
+    if working_memory is not None:
+        protected_snapshot = _normalize_snapshot(working_memory.build_protected_snapshot())
     snapshot: CompactMemorySnapshot = {}
 
     snapshot["preferences"] = _merge_snapshot_lines(
@@ -519,7 +521,7 @@ def _build_snapshot_section(
 
 def _build_structured_section(
     *,
-    working_memory: WorkingMemory,
+    working_memory: WorkingMemory | None = None,
     title: str,
     entry_types: tuple[str, ...],
     max_entries: int,
@@ -561,7 +563,7 @@ def _build_structured_section(
 
 def _collect_ranked_entries(
     *,
-    working_memory: WorkingMemory,
+    working_memory: WorkingMemory | None = None,
     entry_types: tuple[str, ...],
 ) -> list[WorkingMemoryEntry]:
     """对不同类型的 working memory 条目做去重和优先级排序。"""
@@ -583,7 +585,7 @@ def _collect_ranked_entries(
 
 def _collect_snapshot_entries(
     *,
-    working_memory: WorkingMemory,
+    working_memory: WorkingMemory | None = None,
     entry_types: tuple[str, ...],
     max_entries: int,
     max_item_chars: int,

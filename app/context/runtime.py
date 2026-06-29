@@ -49,13 +49,12 @@ from app.context.state import (
 )
 from app.context.history_summarizer import OlderHistorySummarizer
 from app.context.history_summarizer import HistoryWindow, build_older_history_summary, select_history_window
-from app.memory.pipeline import MemoryPipeline
+from app.memory.memory_store import MemoryStore, get_memory_store
 from app.agent.prompt import build_system_prompt
 from app.state.session import SessionData
 from app.agent.tooling import ToolRegistry
 from app.types import ChatMessage
 from app.state.user_profile import ResolvedUserPolicy, UserPolicyRule, load_user_profile
-from app.state.working_memory import WorkingMemory
 
 _ANALYSIS_MODE_KEYWORDS = (
     "分析",
@@ -110,8 +109,6 @@ def prepare_agent_context(
     full_history: list[ChatMessage],
     session: SessionData,
     tool_registry: ToolRegistry,
-    working_memory: WorkingMemory,
-    memory_pipeline: MemoryPipeline | None,
     history_summarizer: OlderHistorySummarizer | None,
 ) -> PreparedAgentContext:
     """
@@ -130,7 +127,6 @@ def prepare_agent_context(
     active_user_rules = resolved_user_policy.active_rules_for(
         _build_user_policy_task_context(
             full_history=full_history,
-            working_memory=working_memory,
         )
     )
     user_profile_context = resolved_user_policy.to_prompt_section(active_user_rules)
@@ -169,17 +165,15 @@ def prepare_agent_context(
         )
 
     resolved_project_constraints = resolve_project_constraints(
-        memory_pipeline=memory_pipeline,
-        working_memory=working_memory,
+        memory_snapshot=None,
     )
     recent_risks = resolve_recent_risks(
-        working_memory=working_memory,
         cached_risks=cached_state.recent_risks if cached_state is not None else [],
     )
 
     active_context_snapshot, active_context_summary = _resolve_active_context(
         older_history_summary=older_history_summary,
-        working_memory=working_memory,
+        working_memory=None,
         cached_state=cached_state,
         resolved_user_preferences=resolved_user_preferences,
         resolved_project_constraints=resolved_project_constraints,
@@ -200,8 +194,8 @@ def prepare_agent_context(
         ).recent_messages,
         policy=policy,
         session=session,
-        working_memory=working_memory,
-        memory_pipeline=memory_pipeline,
+        working_memory=None,
+        memory_pipeline=None,
         active_context_summary=active_context_summary,
         active_context_snapshot=active_context_snapshot,
         tool_registry=tool_registry,
@@ -236,8 +230,8 @@ def prepare_agent_context(
             ).recent_messages,
             policy=policy,
             session=session,
-            working_memory=working_memory,
-            memory_pipeline=memory_pipeline,
+            working_memory=None,
+            memory_pipeline=None,
             active_context_summary=active_context_summary,
             active_context_snapshot=active_context_snapshot,
             tool_registry=tool_registry,
@@ -329,7 +323,7 @@ def _infer_analysis_mode_from_history(full_history: list[ChatMessage]) -> bool:
 def _build_preview_memory_context(
     *,
     active_context_summary: str,
-    working_memory: WorkingMemory,
+    working_memory: object = None,
 ) -> str:
     """构造预估阶段的轻量 memory_context，不触发长期记忆检索。"""
     sections: list[str] = []
@@ -350,7 +344,7 @@ def _build_preview_memory_context(
     return "\n".join(sections).strip()
 
 
-def _build_preview_working_memory_brief(working_memory: WorkingMemory) -> str:
+def _build_preview_working_memory_brief(working_memory: object) -> str:
     """预估阶段只保留少量高价值 working memory，避免预估值过度膨胀。"""
     sections: list[str] = []
     slot_specs = (
@@ -404,10 +398,12 @@ def _resolve_user_policy(workspace: str) -> ResolvedUserPolicy:
 def _build_user_policy_task_context(
     *,
     full_history: list[ChatMessage],
-    working_memory: WorkingMemory,
+    working_memory: object = None,
 ) -> str:
     """提取当前任务文本，用于筛选命中的路径规则。"""
     parts: list[str] = []
+    if working_memory is None:
+        return {}
     primary_intent = working_memory.get_primary_user_intent().strip()
     if primary_intent:
         parts.append(primary_intent)
@@ -430,16 +426,15 @@ def _build_user_policy_task_context(
 def _resolve_active_context(
     *,
     older_history_summary: str,
-    working_memory: WorkingMemory,
     cached_state: ContextStateData | None,
     resolved_user_preferences: list[str],
     resolved_project_constraints: list[str],
     recent_risks: list[str],
 ) -> tuple[CompactMemorySnapshot, str]:
-    """基于当前 working memory 重建 active context，并吸收上一版基线。"""
+    """基于 memory snapshot 重建 active context，并吸收上一版基线。"""
     snapshot = build_active_context_snapshot(
         older_history_summary=older_history_summary,
-        working_memory=working_memory,
+        working_memory=None,
         previous_snapshot=(
             cached_state.active_context_snapshot if cached_state is not None else None
         ),
@@ -566,7 +561,7 @@ def _save_active_context_state(
 def persist_post_response_working_memory_state(
     *,
     session: SessionData,
-    working_memory: WorkingMemory,
+    working_memory: object = None,
 ) -> None:
     """
     保存点 B：模型回复写入 WM 后，立即把增量快照合并进 context_state。
@@ -574,6 +569,8 @@ def persist_post_response_working_memory_state(
     保存点 A 负责请求前完整基线；这里只补当轮新产生的决策、风险、约束等 WM 增量，
     降低进程在两轮之间退出时丢失最新语义的概率。
     """
+    if working_memory is None:
+        return
     protected_snapshot = working_memory.build_protected_snapshot()
     if not protected_snapshot:
         return
@@ -586,7 +583,7 @@ def persist_post_response_working_memory_state(
 
 def _promote_microcompact_carryovers(
     *,
-    working_memory: WorkingMemory,
+    working_memory: object = None,
     compaction_result: CompactionResult,
 ) -> None:
     """在 microcompact 清理旧 tool_result 之后，把承接出的关键信息回写到 working memory。"""
@@ -594,7 +591,8 @@ def _promote_microcompact_carryovers(
         if str(finding).strip():
             # 旧 tool_result 正文会被清掉，但关键工具结论不能跟着丢。
             # 这里先回写到 working memory，后面再重新合并进 active context 摘要。
-            working_memory.protect(
+            if working_memory is not None:
+                working_memory.protect(
                 str(finding),
                 entry_type="tool_finding",
                 importance=1.2,
@@ -602,7 +600,8 @@ def _promote_microcompact_carryovers(
     for issue in compaction_result.carried_open_issues:
         if str(issue).strip():
             # open issue / recent risk 也要同步承接，否则 microcompact 后风险链路会断。
-            working_memory.protect(
+            if working_memory is not None:
+                working_memory.protect(
                 str(issue),
                 entry_type="recent_risk",
                 importance=1.1,
@@ -611,7 +610,8 @@ def _promote_microcompact_carryovers(
         if str(decision).strip():
             # microcompact 模型抽到的关键决策需要进入 WM，
             # 否则旧工具正文清掉后，后续轮次只能看到占位符而看不到结论。
-            working_memory.protect(
+            if working_memory is not None:
+                working_memory.protect(
                 str(decision),
                 entry_type="key_decision",
                 importance=1.15,
@@ -625,8 +625,6 @@ def _build_compacted_request(
     summary_source_messages: list[ChatMessage],
     policy: ContextPolicy,
     session: SessionData,
-    working_memory: WorkingMemory,
-    memory_pipeline: MemoryPipeline | None,
     active_context_summary: str,
     active_context_snapshot: CompactMemorySnapshot,
     tool_registry: ToolRegistry,
@@ -670,10 +668,6 @@ def _build_compacted_request(
         or pipeline_result.compaction_result.carried_open_issues
         or pipeline_result.compaction_result.carried_key_decisions
     ):
-        _promote_microcompact_carryovers(
-            working_memory=working_memory,
-            compaction_result=pipeline_result.compaction_result,
-        )
         overlay_snapshot: CompactMemorySnapshot = {}
         if pipeline_result.compaction_result.carried_tool_findings:
             overlay_snapshot["tool_findings"] = list(
@@ -710,18 +704,8 @@ def _build_compacted_request(
     )
 
     memory_context = ""
-    if memory_pipeline is not None:
-        memory_result = memory_pipeline.build_prompt_context(
-            user_input=working_memory.get_primary_user_intent(),
-            session=session_snapshot,
-            working_memory=working_memory,
-            # memory 检索也切到 active context baseline，避免继续由 older_history_summary 主导。
-            session_summary_override=active_context_summary,
-            top_k=policy.memory_top_k,
-            retrieval_top_k=policy.retrieval_top_k,
-            max_memory_chars_per_item=policy.memory_item_chars,
-        )
-        memory_context = memory_result.prompt_context
+    # 改用 MemoryStore 快照注入，不再走向量检索 pipeline
+    memory_context = get_memory_store().get_prompt_context()
 
     system_prompt = build_system_prompt(
         tool_registry=tool_registry,
