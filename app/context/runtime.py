@@ -194,8 +194,6 @@ def prepare_agent_context(
         ).recent_messages,
         policy=policy,
         session=session,
-        working_memory=None,
-        memory_pipeline=None,
         active_context_summary=active_context_summary,
         active_context_snapshot=active_context_snapshot,
         tool_registry=tool_registry,
@@ -230,8 +228,6 @@ def prepare_agent_context(
             ).recent_messages,
             policy=policy,
             session=session,
-            working_memory=None,
-            memory_pipeline=None,
             active_context_summary=active_context_summary,
             active_context_snapshot=active_context_snapshot,
             tool_registry=tool_registry,
@@ -346,6 +342,8 @@ def _build_preview_memory_context(
 
 def _build_preview_working_memory_brief(working_memory: object) -> str:
     """预估阶段只保留少量高价值 working memory，避免预估值过度膨胀。"""
+    if working_memory is None:
+        return ""
     sections: list[str] = []
     slot_specs = (
         # 这里和 MemoryReadPipeline 保持同一组核心槽位，
@@ -403,7 +401,7 @@ def _build_user_policy_task_context(
     """提取当前任务文本，用于筛选命中的路径规则。"""
     parts: list[str] = []
     if working_memory is None:
-        return {}
+        return ""
     primary_intent = working_memory.get_primary_user_intent().strip()
     if primary_intent:
         parts.append(primary_intent)

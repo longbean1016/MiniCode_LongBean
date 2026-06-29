@@ -8,6 +8,12 @@ from dataclasses import dataclass
 from app.context.manager import estimate_tokens
 from app.types import ChatMessage
 # WorkingMemory 已删除，compact_memory 中的 working_memory 参数均已改为可选
+# 保留类型占位符，from __future__ import annotations 下不会在运行时求值
+try:
+    from app.state.working_memory import WorkingMemory, WorkingMemoryEntry  # type: ignore # noqa: F401
+except ImportError:
+    WorkingMemory = object  # type: ignore
+    WorkingMemoryEntry = object  # type: ignore
 
 # compact memory 是跨轮次续带的结构化基线，预算不能低到只够放 1-2 条句子。
 # 这里参考 minicode 的分层摘要 / working memory 量级，给到更合理的中等预算。
@@ -567,6 +573,8 @@ def _collect_ranked_entries(
     entry_types: tuple[str, ...],
 ) -> list[WorkingMemoryEntry]:
     """对不同类型的 working memory 条目做去重和优先级排序。"""
+    if working_memory is None:
+        return []
     raw_entries: list[WorkingMemoryEntry] = []
     for entry_type in entry_types:
         raw_entries.extend(working_memory.get_entries_by_type(entry_type))
