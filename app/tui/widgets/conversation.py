@@ -159,6 +159,10 @@ class ConversationWidget(RichLog):
 
     # ── 工具 / 思考 ───────────────────────────────────────
 
+    def _add_spacer(self) -> None:
+        """在连续工具调用之间插入空行，增加视觉呼吸感。"""
+        self._entries.append(_Entry(renderable=Text(""), kind="spacer"))
+
     def add_thinking(self, text: str) -> None:
         t = Text()
         t.append("  ", style="")
@@ -167,8 +171,11 @@ class ConversationWidget(RichLog):
         self._render_all()
 
     def add_tool_call(self, name: str, args: dict | None = None) -> None:
+        # 在连续工具调用之间加空行分隔
+        if self._entries and self._entries[-1].kind in {"tool_result", "tool_call"}:
+            self._add_spacer()
         t = Text()
-        t.append(f"  ⚡ {name}", style="bold yellow")
+        t.append(f"  │ ⚡ {name}", style="bold yellow")
         if args:
             flat = []
             for i, (k, v) in enumerate(args.items()):
@@ -184,8 +191,9 @@ class ConversationWidget(RichLog):
         style = "bold green" if ok else "bold red"
         icon = "✓" if ok else "✗"
         t = Text()
-        t.append(f"  {icon} {name}: {summary}", style=style)
+        t.append(f"  └ {icon} {name}: {summary}", style=style)
         self._entries.append(_Entry(renderable=t, kind="tool_result"))
+        self._add_spacer()  # 工具结果后加空行，拉开与下一条消息的距离
         self._render_all()
 
     # ── 错误 / 审批 / 系统 ────────────────────────────────
