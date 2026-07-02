@@ -6,13 +6,6 @@ from typing import Any
 
 """运行时上下文装配层，负责拼接消息窗口、记忆注入和压缩结果。"""
 
-from app.context.compact_memory import (
-    CompactMemorySnapshot,
-    build_active_context_snapshot,
-    merge_active_context_snapshots,
-    parse_active_context_summary,
-    render_active_context_summary,
-)
 from app.context.auto_compact import (
     AUTO_COMPACT_TRIGGER_RATIO,
     AUTO_COMPACT_TARGET_RATIO,
@@ -89,7 +82,7 @@ class PreparedAgentContext:
     policy: ContextPolicy
     stats: ContextStats
     active_context_summary: str
-    active_context_snapshot: CompactMemorySnapshot
+    active_context_snapshot: dict
     older_history_summary: str
     resolved_user_preferences: list[str]
     resolved_user_policy: ResolvedUserPolicy
@@ -427,7 +420,7 @@ def _resolve_active_context(
     resolved_user_preferences: list[str],
     resolved_project_constraints: list[str],
     recent_risks: list[str],
-) -> tuple[CompactMemorySnapshot, str]:
+) -> tuple[dict, str]:
     """基于 memory snapshot 重建 active context，并吸收上一版基线。"""
     snapshot = build_active_context_snapshot(
         older_history_summary=older_history_summary,
@@ -503,7 +496,7 @@ def _save_active_context_state(
     full_history: list[ChatMessage],
     session: SessionData,
     active_context_summary: str,
-    active_context_snapshot: CompactMemorySnapshot,
+    active_context_snapshot: dict,
     older_history_summary: str,
     resolved_user_preferences: list[str],
     resolved_project_constraints: list[str],
@@ -586,7 +579,7 @@ def _build_compacted_request(
     policy: ContextPolicy,
     session: SessionData,
     active_context_summary: str,
-    active_context_snapshot: CompactMemorySnapshot,
+    active_context_snapshot: dict,
     tool_registry: ToolRegistry,
     usable_budget: int,
     fixed_overhead_tokens: int,
@@ -719,7 +712,7 @@ class ContextPipelineResult:
     auto_compact_result: AutoCompactResult
     steps_taken: list[str] = field(default_factory=list)
     compaction_history_entry: dict[str, Any] = field(default_factory=dict)
-    resolved_active_context_snapshot: CompactMemorySnapshot = field(default_factory=dict)
+    resolved_active_context_snapshot: dict = field(default_factory=dict)
     resolved_active_context_summary: str = ""
     last_microcompact_at: float = 0.0
     auto_compact_failure_count: int = 0
@@ -952,7 +945,7 @@ class ContextCompactor:
         usable_budget: int,
         fixed_overhead_tokens: int,
         auto_compact_summary: str,
-        auto_compact_snapshot: CompactMemorySnapshot | None,
+        auto_compact_snapshot: dict | None,
         force_auto_compact: bool,
         pinned_tool_names: set[str] | None,
         microcompact_state: MicrocompactState,
@@ -1080,7 +1073,7 @@ class ContextCompactorPipeline:
         usable_budget: int,
         fixed_overhead_tokens: int,
         auto_compact_summary: str,
-        auto_compact_snapshot: CompactMemorySnapshot | None = None,
+        auto_compact_snapshot: dict | None = None,
         force_auto_compact: bool = False,
         pinned_tool_names: set[str] | None = None,
         last_microcompact_at: float = 0.0,
@@ -1116,9 +1109,9 @@ class ContextCompactorPipeline:
 def _resolve_active_context_outputs(
     *,
     auto_compact_summary: str,
-    auto_compact_snapshot: CompactMemorySnapshot | None,
+    auto_compact_snapshot: dict | None,
     auto_compact_result: AutoCompactResult,
-) -> tuple[CompactMemorySnapshot, str]:
+) -> tuple[dict, str]:
     """统一解析 active context 的最终输出，避免散落在不同阶段重复拼接。"""
     resolved_snapshot = auto_compact_snapshot or parse_active_context_summary(
         auto_compact_summary

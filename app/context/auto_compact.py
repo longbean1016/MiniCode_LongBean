@@ -6,15 +6,6 @@ from dataclasses import dataclass
 
 """自动压缩策略模块，负责在上下文逼近阈值时触发历史压缩。"""
 
-from app.context.compact_memory import (
-    CompactMemorySnapshot,
-    build_active_context_event_snapshot,
-    merge_active_context_snapshots,
-    parse_active_context_summary,
-    prioritize_snapshot_for_current_focus,
-    render_active_context_summary,
-    render_full_active_context_summary,
-)
 from app.context.message_safety import is_internal_compaction_marker
 from app.context.manager import estimate_messages_tokens, estimate_tokens
 from app.context.history_summarizer import OlderHistorySummarizer
@@ -46,7 +37,7 @@ class AutoCompactResult:
     tokens_after: int = 0
     tokens_freed_estimate: int = 0
     summary_text: str = ""
-    summary_snapshot: CompactMemorySnapshot | None = None
+    summary_snapshot: dict | None = None
     failure_count: int = 0
     suppressed_until: float = 0.0
 
@@ -131,7 +122,7 @@ class AutoCompactDispatcher:
         messages: list[ChatMessage],
         usable_budget: int,
         summary_base: str,
-        summary_snapshot: CompactMemorySnapshot | None = None,
+        summary_snapshot: dict | None = None,
         summary_source_messages: list[ChatMessage] | None = None,
         fixed_overhead_tokens: int = 0,
         force_full: bool = False,
@@ -254,7 +245,7 @@ def run_auto_compact(
     messages: list[ChatMessage],
     usable_budget: int,
     summary_base: str,
-    summary_snapshot: CompactMemorySnapshot | None = None,
+    summary_snapshot: dict | None = None,
     summary_source_messages: list[ChatMessage] | None = None,
     fixed_overhead_tokens: int = 0,
     force_full: bool = False,
@@ -284,7 +275,7 @@ def _run_session_memory_compact(
     messages: list[ChatMessage],
     usable_budget: int,
     summary_base: str,
-    summary_snapshot: CompactMemorySnapshot | None,
+    summary_snapshot: dict | None,
     fixed_overhead_tokens: int,
     semantic_summarizer: OlderHistorySummarizer | None = None,
 ) -> AutoCompactResult:
@@ -380,7 +371,7 @@ def _run_full_compact(
     messages: list[ChatMessage],
     usable_budget: int,
     summary_base: str,
-    summary_snapshot: CompactMemorySnapshot | None,
+    summary_snapshot: dict | None,
     summary_source_messages: list[ChatMessage] | None,
     fixed_overhead_tokens: int,
     semantic_summarizer: OlderHistorySummarizer | None = None,
@@ -684,7 +675,7 @@ def _build_structured_summary(
     *,
     removed_messages: list[ChatMessage],
     summary_base: str,
-    summary_snapshot: CompactMemorySnapshot | None,
+    summary_snapshot: dict | None,
 ) -> str:
     """构造结构化快照摘要，保留语义槽位而不是原始措辞。"""
     _, rendered = _build_structured_summary_package(
@@ -700,9 +691,9 @@ def _build_structured_summary_package(
     removed_messages: list[ChatMessage],
     focus_source_messages: list[ChatMessage] | None,
     summary_base: str,
-    summary_snapshot: CompactMemorySnapshot | None,
+    summary_snapshot: dict | None,
     semantic_summarizer: OlderHistorySummarizer | None = None,
-) -> tuple[CompactMemorySnapshot, str]:
+) -> tuple[dict, str]:
     """同时返回 full compact 的结构化快照和渲染文本。"""
     # full compact 的关键不是生成一段漂亮 prose，
     # 而是把旧历史尽量归并到结构化槽位里，便于下一轮继续被稳定引用。
@@ -849,7 +840,7 @@ def _truncate_text_to_token_budget(text: str, max_tokens: int, suffix: str) -> s
 
 def _extract_full_compact_focus_snapshot(
     messages: list[ChatMessage],
-) -> CompactMemorySnapshot:
+) -> dict:
     # full compact 最怕“旧主题还很多，新主题刚刚出现”，
     # 这时如果只按全局频率抽摘要，旧主题很容易把当前主线盖过去。
     # 这里专门从最近 user / assistant 文本里抓“当前主问题 / 当前目标 / 当前风险”。
@@ -872,7 +863,7 @@ def _extract_full_compact_focus_snapshot(
         if len(captured) == len(markers):
             break
 
-    snapshot: CompactMemorySnapshot = {}
+    snapshot: dict = {}
     if "当前主问题" in captured:
         snapshot["active_tasks"] = [captured["当前主问题"]]
     if "当前目标" in captured:

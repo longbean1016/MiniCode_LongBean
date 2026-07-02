@@ -9,7 +9,9 @@ from pathlib import Path
 from typing import Any
 
 from app.context.manager import ContextStats
-from app.context.compact_memory import render_active_context_summary
+# compact_memory 已删除，这里用一行内联替代 _render_active_context_summary
+def __render_active_context_summary(snapshot: dict) -> str:
+    return "\n".join(f"{k}: {v}" for k, v in snapshot.items() if v)
 from app.types import ChatMessage
 
 CONTEXT_STATE_DIR_NAME = ".context_state"
@@ -178,7 +180,7 @@ def merge_context_state_snapshot(
         merged_snapshot[key] = list(lines)
 
     state.active_context_snapshot = merged_snapshot
-    state.active_context_summary = render_active_context_summary(merged_snapshot)
+    state.active_context_summary = _render_active_context_summary(merged_snapshot)
     return save_context_state(workspace, state)
 
 

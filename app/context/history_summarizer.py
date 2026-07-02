@@ -8,14 +8,6 @@ from dataclasses import dataclass
 
 from openai import OpenAI
 
-from app.context.compact_memory import (
-    CompactMemorySnapshot,
-    merge_active_context_snapshots,
-    parse_active_context_summary,
-    prioritize_snapshot_for_current_focus,
-    render_active_context_summary,
-    render_full_active_context_summary,
-)
 from app.agent.circuit_breaker import CircuitBreaker
 from app.context.manager import build_compaction_policy
 from app.logger import log_event
@@ -200,9 +192,9 @@ class OlderHistorySummarizer:
         strategy: str,
         removed_messages: list[ChatMessage],
         fallback_summary: str,
-        fallback_snapshot: CompactMemorySnapshot | None,
+        fallback_snapshot: dict | None,
         focus_lines: list[str] | None = None,
-    ) -> tuple[str, CompactMemorySnapshot | None]:
+    ) -> tuple[str, dict | None]:
         """
         为 session/full compact 生成"模型优先，规则兜底"的结构化摘要。
 
@@ -474,3 +466,236 @@ class OlderHistorySummarizer:
             return cleaned
         return cleaned[:max_chars].rstrip() + "..."
 
+
+    def _save_session_state(
+        self,
+        *,
+        session: SessionData,
+        summary: str,
+        fingerprint: str,
+        older_round_count: int,
+        compaction_level: int,
+    ) -> None:
+        """把旧历史摘要相关的 context state 写入 session.extra。"""
+        # 这些字段本质上就是"older 区域的持久化上下文状态"：
+        # 下轮进来后，无需重新扫描完整旧历史，就能判断是否复用摘要、是否需要升级压缩等级。
+        session.extra["older_history_summary"] = summary
+        session.extra["older_history_fingerprint"] = fingerprint
+        session.extra["last_compacted_round_count"] = older_round_count
+        session.extra["compaction_level"] = compaction_level
+
+    def _clear_session_state(self, session: SessionData) -> None:
+        """没有旧历史时，清理这几个持久化的 context state 字段。"""
+        session.extra.pop("older_history_summary", None)
+        session.extra.pop("older_history_fingerprint", None)
+        session.extra.pop("last_compacted_round_count", None)
+        session.extra.pop("compaction_level", None)
+
+    def _safe_int(self, value: object, default: int) -> int:
+        """把 extra 里的值转成 int，避免旧数据格式不一致。"""
+        try:
+            return int(value) # type: ignore
+        except (TypeError, ValueError):
+            return default
+
+    def _normalize_text(self, text: str) -> str:
+        """清洗文本里的多余空白。"""
+        return " ".join(text.strip().split())
+
+    def _shorten(self, text: str, max_chars: int) -> str:
+        """把长文本裁到固定长度。"""
+        cleaned = self._normalize_text(text)
+        if len(cleaned) <= max_chars:
+            return cleaned
+        return cleaned[:max_chars].rstrip() + "..."
+
+
+def _parse_json_object(content: str) -> dict[str, object]:
+    """从模型输出中解析 JSON 对象，兼容偶发的前后缀说明文本。"""
+    text = str(content).strip()
+    if not text:
+        return {}
+    try:
+        value = json.loads(text)
+    except json.JSONDecodeError:
+        start = text.find("{")
+        end = text.rfind("}")
+        if start < 0 or end <= start:
+            raise
+        value = json.loads(text[start:end + 1])
+    if not isinstance(value, dict):
+        return {}
+    return value
+
+
+# ── 会话摘要（原 session_summary.py） ──
+
+
+def _shorten_summary(text: str, max_chars: int) -> str:
+    """把文本裁剪到固定长度，避免摘要过长。"""
+    text = text.strip()
+    if len(text) <= max_chars:
+        return text
+    return f"{text[:max_chars]}..."
+
+
+def build_session_summary(messages: list[ChatMessage]) -> str:
+    """基于会话消息生成规则摘要。"""
+    user_messages: list[str] = []
+    assistant_messages: list[str] = []
+    tool_names: list[str] = []
+
+    for msg in messages:
+        role = msg.get("role")
+
+        if role == "user":
+            content = str(msg.get("content")).strip()
+            if content:
+                user_messages.append(content)
+        elif role == "assistant":
+            content = str(msg.get("content")).strip()
+            if content:
+                assistant_messages.append(content)
+        elif role == "assistant_tool_call":
+            tool_name = str(msg.get("tool_name")).strip()
+            if tool_name and tool_name not in tool_names:
+                tool_names.append(tool_name)
+
+    if not user_messages and not assistant_messages and not tool_names:
+        return ""
+
+    parts: list[str] = []
+
+    if user_messages:
+        latest_user_goal = _shorten_summary(user_messages[-1], 80)
+        parts.append(f"当前目标：{latest_user_goal}")
+
+    if assistant_messages:
+        latest_answer = _shorten_summary(assistant_messages[-1], 80)
+        parts.append(f"最近结论：{latest_answer}")
+
+    if tool_names:
+        tools_text = "、".join(tool_names[-5:])
+        parts.append(f"已使用工具：{tools_text}")
+
+    return "；".join(parts)
+
+
+# ── 历史窗口（原 history_window.py） ──
+
+
+@dataclass(slots=True)
+class HistoryWindow:
+    """
+    表示历史裁剪后的窗口结果。
+
+    older_messages:
+        比较早的历史消息，不再原样发给模型，而是交给摘要层处理。
+    recent_messages:
+        最近几轮完整消息，保留原始结构继续发给模型。
+    older_round_count:
+        被裁到窗口外的旧轮次数量。
+    recent_round_count:
+        当前直接保留的最近轮次数量。
+    """
+
+    older_messages: list[ChatMessage]
+    recent_messages: list[ChatMessage]
+    older_round_count: int = 0
+    recent_round_count: int = 0
+
+
+def split_history_rounds(history: list[ChatMessage]) -> list[list[ChatMessage]]:
+    """
+    按 user 消息把完整历史切成多轮。
+
+    规则：
+    1. 每遇到一条 user 消息，就视为新一轮开始。
+    2. 在下一条 user 出现之前的所有消息，都归属当前这一轮。
+    3. 如果历史开头在第一条 user 之前还有零散消息，就挂到第一轮前面。
+    """
+    rounds: list[list[ChatMessage]] = []
+    current_round: list[ChatMessage] = []
+    leading_messages: list[ChatMessage] = []
+
+    for message in history:
+        role = message.get("role")
+
+        if role == "user":
+            if current_round:
+                rounds.append(current_round)
+
+            current_round = list(leading_messages)
+            current_round.append(message)
+            leading_messages = []
+            continue
+
+        if not current_round:
+            leading_messages.append(message)
+            continue
+
+        current_round.append(message)
+
+    if current_round:
+        rounds.append(current_round)
+
+    if not rounds and leading_messages:
+        rounds.append(list(leading_messages))
+
+    return rounds
+
+
+def select_history_window(
+    history: list[ChatMessage],
+    keep_rounds: int = 6,
+) -> HistoryWindow:
+    """
+    从完整历史里切出"旧历史"和"最近几轮"。
+
+    keep_rounds 表示保留最近多少轮完整消息。
+    更早的消息不再原样透传，而是进入 older_messages 供摘要使用。
+    """
+    normalized_keep_rounds = max(1, keep_rounds)
+
+    rounds = split_history_rounds(history)
+    if not rounds:
+        return HistoryWindow(
+            older_messages=[],
+            recent_messages=[],
+            older_round_count=0,
+            recent_round_count=0,
+        )
+
+    if len(rounds) <= normalized_keep_rounds:
+        recent_messages = [msg for round_messages in rounds for msg in round_messages]
+        return HistoryWindow(
+            older_messages=[],
+            recent_messages=recent_messages,
+            older_round_count=0,
+            recent_round_count=len(rounds),
+        )
+
+    older_rounds = rounds[:-normalized_keep_rounds]
+    recent_rounds = rounds[-normalized_keep_rounds:]
+
+    older_messages = [msg for round_messages in older_rounds for msg in round_messages]
+    recent_messages = [msg for round_messages in recent_rounds for msg in round_messages]
+
+    return HistoryWindow(
+        older_messages=older_messages,
+        recent_messages=recent_messages,
+        older_round_count=len(older_rounds),
+        recent_round_count=len(recent_rounds),
+    )
+
+
+def build_older_history_summary(older_messages: list[ChatMessage]) -> str:
+    """
+    仅基于被裁掉的旧历史生成规则摘要。
+
+    这是模型摘要不可用时的稳定兜底。
+    """
+    if not older_messages:
+        return ""
+
+    return build_session_summary(older_messages)
