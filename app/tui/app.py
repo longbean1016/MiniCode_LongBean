@@ -498,12 +498,14 @@ class MiniCodeApp(App):
 
     @staticmethod
     def _get_usable_budget() -> int:
-        """获取当前上下文可用 token 预算。"""
+        """获取当前模型的上下文窗口大小（从 model_capabilities 动态读取）。"""
         try:
-            from app.context.manager import DEFAULT_USABLE_CONTEXT_BUDGET
-            return DEFAULT_USABLE_CONTEXT_BUDGET
+            from app.infra.model_capabilities import get_context_window
+            from app.config import load_config
+            config = load_config()
+            return get_context_window(config.model)
         except Exception:
-            return 100_000
+            return 128_000
 
     @staticmethod
     def _update_token_display(header: HeaderWidget, total: int, budget: int, cache_hit: int = 0, cache_miss: int = 0) -> None:
