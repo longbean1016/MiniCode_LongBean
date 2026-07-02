@@ -421,21 +421,8 @@ def _resolve_active_context(
     resolved_project_constraints: list[str],
     recent_risks: list[str],
 ) -> tuple[dict, str]:
-    """基于 memory snapshot 重建 active context，并吸收上一版基线。"""
-    snapshot = build_active_context_snapshot(
-        older_history_summary=older_history_summary,
-        working_memory=None,
-        previous_snapshot=(
-            cached_state.active_context_snapshot if cached_state is not None else None
-        ),
-        previous_active_context_summary=(
-            cached_state.active_context_summary if cached_state is not None else ""
-        ),
-        resolved_user_preferences=resolved_user_preferences,
-        resolved_project_constraints=resolved_project_constraints,
-        recent_risks=recent_risks,
-    )
-    return snapshot, render_active_context_summary(snapshot)
+    """返回空的 active context（compact_memory 已删除，active_context 不再使用）。"""
+    return {}, ""
 
 
 def _build_preview_source(
@@ -1112,20 +1099,8 @@ def _resolve_active_context_outputs(
     auto_compact_snapshot: dict | None,
     auto_compact_result: AutoCompactResult,
 ) -> tuple[dict, str]:
-    """统一解析 active context 的最终输出，避免散落在不同阶段重复拼接。"""
-    resolved_snapshot = auto_compact_snapshot or parse_active_context_summary(
-        auto_compact_summary
-    )
-    resolved_context = auto_compact_summary.strip()
-    if auto_compact_result.summary_snapshot:
-        resolved_snapshot = auto_compact_result.summary_snapshot
-        resolved_context = (
-            auto_compact_result.summary_text.strip()
-            or render_active_context_summary(resolved_snapshot)
-        )
-    elif resolved_snapshot and not resolved_context:
-        resolved_context = render_active_context_summary(resolved_snapshot)
-    return resolved_snapshot, resolved_context
+    """返回空的 active context 输出（compact_memory 已删除）。"""
+    return {}, ""
 
 
 def _merge_compaction_result(*, base: CompactionResult, overlay: CompactionResult) -> None:
