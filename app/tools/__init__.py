@@ -1,6 +1,6 @@
 """工具装配入口，负责把各个内置工具和 MCP 远程工具注册到统一注册表。
-   工具集已从旧 15 个工具收敛为 8 核心工具 + memory，
-   语义对齐 Claude Code 核心工作流。"""
+   工具集对齐 Claude Code 核心工作流：
+   10 个核心工具 + memory + MCP 外置。"""
 
 from app.agent.tooling import ToolRegistry
 from app.mcp.manager import McpManager
@@ -12,11 +12,12 @@ from app.tools.glob_files import glob_files_tool
 from app.tools.grep_files import grep_files_tool
 from app.tools.ask_user import ask_user_tool
 from app.tools.agent_dispatch import agent_dispatch_tool
+from app.tools.web_fetch import web_fetch_tool
+from app.tools.web_search import web_search_tool
 from app.memory.memory_tool import memory_tool
 
 
-# 8 个核心工具 + memory（对齐 Claude Code 工具集）
-# 旧分析工具（find_symbols/find_references/get_ast_info/file_overview/locate_symbol/codebase_map/repo_overview/list_files/make_dirs）已移除
+# 10 个核心工具 + memory（对齐 Claude Code 工具集）
 _LOCAL_TOOLS = [
     run_command_tool,
     read_file_tool,
@@ -26,6 +27,8 @@ _LOCAL_TOOLS = [
     grep_files_tool,
     ask_user_tool,
     agent_dispatch_tool,
+    web_fetch_tool,
+    web_search_tool,
     memory_tool,
 ]
 
