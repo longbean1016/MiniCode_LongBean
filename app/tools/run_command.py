@@ -15,36 +15,6 @@ MAX_TIMEOUT_MS = 600_000       # 10 分钟
 # 命令输出最大字符数
 MAX_OUTPUT_CHARS = 30_000
 
-# ── 只读命令集合（参考 Claude Code BashTool）──
-_READ_ONLY_COMMANDS = {
-    "cat", "head", "tail", "less", "more",
-    "ls", "dir", "tree", "du",
-    "find", "grep", "rg", "ag", "ack", "locate", "which", "whereis",
-    "wc", "stat", "file", "strings",
-    "echo", "printf", "date", "time",
-    "git", "gh",  # git/gh 子命令再单独判断
-    "npm", "yarn", "pnpm",  # 包管理器有只读子命令
-    "python", "python3", "node",  # 脚本引擎
-}
-# ── 高风险命令关键词 ──
-_HIGH_RISK_KEYWORDS = {
-    "rm", "del", "rmdir", "rd", "erase",
-    "format", "fdisk", "diskpart",
-    ">", ">>",  # 输出重定向
-    "|",  # 管道（总是需要检查）
-    "sudo", "su", "runas",
-    "chmod", "chown", "cacls", "icacls",
-    "kill", "taskkill", "pkill",
-    "shutdown", "reboot", "restart",
-}
-# ── Windows PowerShell 特有的高风险动词 ──
-_PS_HIGH_RISK_VERBS = {
-    "Remove-Item", "Stop-Process", "Stop-Service",
-    "Set-ExecutionPolicy", "Clear-Content",
-    "Disable-", "Uninstall-", "Unregister-",
-}
-
-
 def _validate(input_data: Any) -> dict[str, Any]:
     """校验 run_command 输入参数。
 
@@ -95,8 +65,8 @@ def _run(validated_input: dict[str, Any], context: ToolContext) -> ToolResult:
     timeout_ms = validated_input["timeout_ms"]
     description = validated_input.get("description", "")
 
-    # ── 命令安全分类（只读 / 高风险）──
-    risk_level = _classify_command_risk(raw_command)
+    # ── 命令风险级别（由 PermissionManager 内部命令安全分类决定）──
+    risk_level = "caution"
 
     # ── 权限判断 ──
     decision = permission_manager.check_command_permission(
@@ -118,6 +88,13 @@ def _run(validated_input: dict[str, Any], context: ToolContext) -> ToolResult:
         )
 
     if decision.status == "ask":
+        # ── 传递规则建议给上层（对标 Claude Code 的 "Yes, and don't ask again"）──
+        suggestions = None
+        if decision.suggestions:
+            suggestions = [
+                {"tool": s.tool, "behavior": s.behavior, "match_type": s.match_type, "pattern": s.pattern}
+                for s in decision.suggestions
+            ]
         return ToolResult(
             ok=False,
             output="该命令需要用户授权之后才能执行。",
@@ -128,6 +105,7 @@ def _run(validated_input: dict[str, Any], context: ToolContext) -> ToolResult:
                 "rule": decision.rule,
                 "action_key": decision.action_key,
                 "risk_level": risk_level,
+                "suggestions": suggestions,  # 规则建议列表
             },
         )
 
@@ -222,52 +200,6 @@ def _resolve_shell(shell: str) -> str:
         is_windows = platform.system() == "Windows"
         return "powershell" if is_windows else "bash"
     return "bash"
-
-
-def _classify_command_risk(command: str) -> str:
-    """对命令做安全分类：read_only / caution / high_risk。
-
-       参考 Claude Code BashTool 的 isSearchOrReadBashCommand 语义。"""
-    lowered = command.lower()
-    # 取第一个词作为主命令
-    parts = command.strip().split()
-    if not parts:
-        return "caution"
-
-    main_cmd = parts[0].lower()
-    # 去掉路径前缀，只取命令名
-    if "/" in main_cmd or "\\" in main_cmd:
-        main_cmd = main_cmd.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
-
-    # 高风险关键词检查
-    for kw in _HIGH_RISK_KEYWORDS:
-        if kw.lower() in lowered:
-            return "high_risk"
-
-    # PowerShell 高风险动词检查
-    for verb in _PS_HIGH_RISK_VERBS:
-        if lowered.startswith(verb.lower()):
-            return "high_risk"
-
-    # 只读命令（不带破坏性参数时）
-    if main_cmd in _READ_ONLY_COMMANDS:
-        # git/gh 的子命令检查
-        if main_cmd in ("git", "gh"):
-            dangerous_subcmds = {"push", "commit", "merge", "rebase", "reset", "rm", "clean"}
-            subcmd = parts[1] if len(parts) > 1 else ""
-            if subcmd in dangerous_subcmds:
-                return "high_risk"
-            return "read_only"
-        # npm/yarn 的子命令检查
-        if main_cmd in ("npm", "yarn", "pnpm"):
-            read_subcmds = {"ls", "list", "view", "info", "outdated", "why", "explain", "audit"}
-            subcmd = parts[1] if len(parts) > 1 else ""
-            if subcmd in read_subcmds:
-                return "read_only"
-            return "caution"
-        return "read_only"
-
-    return "caution"
 
 
 # ── 注册工具 ──
