@@ -819,13 +819,13 @@ class MicrocompactEngine:
         *,
         messages: list[ChatMessage],
         pinned_tool_names: set[str] | None,
-        usable_budget: int,
         semantic_summarizer: OlderHistorySummarizer | None = None,
     ) -> MicrocompactResult:
+        """对标 Claude Code microcompactMessages → maybeTimeBasedMicrocompact：
+           纯空闲时间触发，不依赖 usable_budget 或工具轮数。"""
         now = time.time()
         decision = self._evaluate(
             messages=messages,
-            usable_budget=usable_budget,
             now=now,
         )
         if not bool(decision["should_apply"]):
@@ -876,14 +876,14 @@ class MicrocompactEngine:
         self,
         *,
         messages: list[ChatMessage],
-        usable_budget: int,
         now: float,
     ) -> bool:
         """基于空闲时间判断是否需要触发 microcompact。
 
            对标 Claude Code evaluateTimeBasedTrigger()：
-           如果最后一条 assistant 消息距今超过阈值（默认 60 分钟），
-           说明服务器端 prompt cache 已过期，清旧 tool_result 能减小下次请求体积。
+           唯一触发条件 — 最后一条 assistant 消息距今超过 60 分钟。
+           注意：ChatMessage 暂无 timestamp 字段，gap 计算依赖 future 添加。
+           当前回退策略：gap 不可用时不触发 microcompact。
         """
         gap_minutes = _gap_since_last_assistant_minutes(messages, now)
         if gap_minutes is None:
@@ -894,10 +894,9 @@ class MicrocompactEngine:
         self,
         *,
         messages: list[ChatMessage],
-        usable_budget: int,
         now: float,
     ) -> dict[str, float | int | str | bool]:
-        """评估是否触发 microcompact，返回决策字典。"""
+        """评估是否触发 microcompact。对标 Claude Code evaluateTimeBasedTrigger()。"""
         tool_rounds = _count_tool_rounds(messages)
         keep_recent = max(0, self._state.keep_recent_tool_rounds)
         gap_minutes = _gap_since_last_assistant_minutes(messages, now)
@@ -906,16 +905,6 @@ class MicrocompactEngine:
             return {
                 "should_apply": False,
                 "reason": "no_assistant_message",
-                "tool_round_count": tool_rounds,
-                "keep_recent_tool_rounds": keep_recent,
-                "cooldown_remaining_seconds": 0.0,
-            }
-
-        # 工具结果太少时没必要压缩
-        if tool_rounds <= keep_recent:
-            return {
-                "should_apply": False,
-                "reason": "below_threshold",
                 "tool_round_count": tool_rounds,
                 "keep_recent_tool_rounds": keep_recent,
                 "cooldown_remaining_seconds": 0.0,
@@ -991,7 +980,6 @@ class ContextCompactor:
         microcompact_result = microcompact_engine.run(
             messages=compaction_result.messages,
             pinned_tool_names=pinned_tool_names,
-            usable_budget=usable_budget,
             semantic_summarizer=semantic_summarizer,
         )
         if microcompact_result.applied:
