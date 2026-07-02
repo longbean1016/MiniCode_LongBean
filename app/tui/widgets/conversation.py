@@ -41,7 +41,61 @@ class ConversationWidget(RichLog):
         self._last_agent_response = ""
 
     def on_mount(self) -> None:
-        self.add_system_info("欢迎使用 MiniCode Agent！输入问题开始对话。")
+        # 默认欢迎文案。如果上层调用 replay_history() 回填历史消息，文案会被覆盖。
+        self._has_history = False
+
+    def replay_history(self, messages: list) -> None:
+        """回放已加载的会话历史消息到对话区。
+
+        从 session.messages 恢复显示，让用户继续之前的对话时能看到完整上下文。
+        支持的消息角色：user / assistant / assistant_tool_call / tool_result / system
+        """
+        self.clear()
+        self._entries.clear()
+        self._turn_count = 0
+        self._current_response = ""
+
+        for msg in messages:
+            role = msg.get("role", "")
+            content = msg.get("content", "")
+
+            if role == "user":
+                self.add_user_message(content)
+
+            elif role == "assistant":
+                # 模型的文本回答 — 已经渲染为 Markdown
+                if content.strip():
+                    self._entries.append(
+                        _Entry(renderable=Markdown(content), kind="agent")
+                    )
+
+            elif role == "assistant_tool_call":
+                # 模型发起工具调用
+                tool_name = msg.get("tool_name", "?")
+                tool_input = msg.get("input")
+                self.add_tool_call(tool_name, tool_input if isinstance(tool_input, dict) else None)
+
+            elif role == "tool_result":
+                # 工具执行结果
+                tool_name = msg.get("tool_name", "?")
+                is_error = msg.get("is_error", False)
+                # 用输出长度做简要摘要
+                summary = content[:120].replace("\n", " ") + ("..." if len(content) > 120 else "")
+                self.add_tool_result(tool_name, summary, ok=not is_error)
+
+            elif role == "system":
+                if content.strip():
+                    self.add_system_info(content)
+
+        self._has_history = True
+        self._render_all()
+
+        # 历史回放完成后追加分隔线和续接提示
+        if self._turn_count > 0:
+            self._entries.append(
+                _Entry(renderable=Text("─" * 60 + " 以上为历史会话，继续对话", style="dim"), kind="system")
+            )
+            self._render_all()
 
     # ── 渲染 ──────────────────────────────────────────────
 

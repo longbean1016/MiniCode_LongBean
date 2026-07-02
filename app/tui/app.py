@@ -215,9 +215,16 @@ class MiniCodeApp(App):
     def input_area(self) -> InputArea:
         return self.query_one(InputArea)
 
-    # ================================================================
-    # 输入事件处理
-    # ================================================================
+    def on_mount(self) -> None:
+        """挂载完成后回放会话历史（如果存在）。"""
+        if not self._history:
+            return
+        # 延迟回放：等 Textual 完成布局后再填充历史消息
+        self.set_timer(0.1, self._replay_session_history)
+
+    def _replay_session_history(self) -> None:
+        """将已加载的会话历史消息渲染到对话区。"""
+        self.conversation.replay_history(self._history)
 
     def on_input_area_input_submitted(self, event: InputArea.InputSubmitted) -> None:
         """处理用户的输入提交。
