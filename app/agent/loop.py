@@ -886,13 +886,12 @@ def stream_agent(
 
                 elif chunk.type == "tool_call_name":
                     # 工具调用第一块：包含 id 和函数名
+                    # 参数在后续 tool_call_args 块中逐步到达，这里先不 yield Event
                     idx = chunk.tool_index
                     if idx not in tool_calls_buf:
                         tool_calls_buf[idx] = {"id": "", "name": "", "args_str": ""}
                     tool_calls_buf[idx]["id"] = chunk.tool_id
                     tool_calls_buf[idx]["name"] = chunk.text
-                    # 解析出工具名时立即通知 UI
-                    yield ToolCallEvent(name=chunk.text, args={})
 
                 elif chunk.type == "tool_call_args":
                     # 工具调用后续块：arguments JSON 增量片段
@@ -957,6 +956,9 @@ def stream_agent(
                     parsed_input = json.loads(args_str) if args_str.strip() else {}
                 except json.JSONDecodeError:
                     parsed_input = {}
+
+                # 现在 args 已完整收集 → yield ToolCallEvent 带完整参数
+                yield ToolCallEvent(name=tool_name, args=parsed_input)
 
                 calls.append({
                     "tool_name": tool_name,
@@ -1037,15 +1039,12 @@ def stream_agent(
                 )
 
                 # 构造工具结果摘要，通知 UI（优先显示目标路径）
-                output_len = len(str(result.output))
-                status_text = "完成" if result.ok else "失败"
-                tool_target = _extract_tool_target(tool_input)
-                if tool_target:
-                    summary = f"{tool_target}  {status_text} ({output_len} 字符)"
-                else:
-                    summary = f"{status_text} ({output_len} 字符)"
+                # 用实际内容的前 120 字符做摘要（对齐 replay_history 的显示逻辑）
+                raw = str(result.output).strip()
+                preview = raw[:120].replace("\n", " ") + ("..." if len(raw) > 120 else "")
+                summary = preview
                 if result.error:
-                    summary += f" — {result.error}"
+                    summary += f"  错误 {result.error}"
 
                 yield ToolResultEvent(
                     name=tool_name,
