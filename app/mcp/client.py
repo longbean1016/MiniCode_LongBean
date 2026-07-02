@@ -204,7 +204,7 @@ class StdioMcpClient:
                         "capabilities": {},
                         "clientInfo": {"name": "mini-code", "version": "1.0.0"},
                     },
-                    timeout_seconds=30.0,
+                    timeout_seconds=120.0,  # npx 首次运行需下载包，给足时间
                 )
                 # 通知服务端初始化完成
                 self.notify("notifications/initialized", {})
