@@ -765,9 +765,6 @@ class MicrocompactResult:
     cleared_count: int = 0
     tokens_freed_estimate: int = 0
     last_compact_at: float = 0.0
-    carried_tool_findings: list[str] = field(default_factory=list)
-    carried_open_issues: list[str] = field(default_factory=list)
-    carried_key_decisions: list[str] = field(default_factory=list)
     # 记录 microcompact 决策细节，便于日志和 context_state 直接定位原因。
     reason: str = "not_evaluated"
     tool_round_count: int = 0
@@ -852,10 +849,7 @@ class MicrocompactEngine:
             return MicrocompactResult(
                 messages=list(compaction_result.messages),
                 last_compact_at=self._state.last_time_based_compact,
-                carried_tool_findings=list(compaction_result.carried_tool_findings),
-                carried_open_issues=list(compaction_result.carried_open_issues),
-                carried_key_decisions=list(compaction_result.carried_key_decisions),
-                reason="no_old_tool_results",
+                                reason="no_old_tool_results",
                 tool_round_count=int(decision["tool_round_count"]),
                 keep_recent_tool_results=int(decision["keep_recent_tool_results"]),
             )
@@ -1157,6 +1151,3 @@ def _merge_compaction_result(*, base: CompactionResult, overlay: CompactionResul
     base.dropped_progress_messages += overlay.dropped_progress_messages
     base.priority_dropped_messages += overlay.priority_dropped_messages
     base.tokens_freed_estimate += overlay.tokens_freed_estimate
-    base.carried_tool_findings.extend(overlay.carried_tool_findings)
-    base.carried_open_issues.extend(overlay.carried_open_issues)
-    base.carried_key_decisions.extend(overlay.carried_key_decisions)
