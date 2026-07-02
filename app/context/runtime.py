@@ -661,6 +661,8 @@ def _build_compacted_request(
 
 _MICROCOMPACT_KEEP_RECENT_TOOL_ROUNDS = 3
 _MICROCOMPACT_INTERVAL_SECONDS = 60 * 60
+# 对标 Claude Code timeBasedMCConfig.gapThresholdMinutes（默认 60 分钟）
+_MICROCOMPACT_GAP_THRESHOLD_MINUTES = 60
 
 
 def _count_tool_rounds(messages: list[ChatMessage]) -> int:
@@ -682,6 +684,25 @@ def _count_tool_rounds(messages: list[ChatMessage]) -> int:
     if current_has_tools:
         rounds += 1
     return rounds
+
+
+def _gap_since_last_assistant_minutes(
+    messages: list[ChatMessage],
+    now: float | None = None,
+) -> float | None:
+    """计算距离最后一条 assistant 消息已经过了多少分钟。
+
+       对标 Claude Code evaluateTimeBasedTrigger() 的 gapMinutes 计算。
+
+       注意：当前 MiniCode ChatMessage 没有 timestamp 字段，
+       因此无法精确计算空闲时间。此函数仅检查是否存在 assistant 消息，
+       存在时返回 0（表示刚活跃过），不存在时返回 None。
+       后续 ChatMessage 加 timestamp 字段后可以启用精确计算。
+    """
+    for msg in reversed(messages):
+        if msg.get("role") == "assistant":
+            return 0.0  # 有 assistant 消息但无法知道具体时间
+    return None
 
 
 @dataclass(slots=True)
@@ -858,19 +879,16 @@ class MicrocompactEngine:
         usable_budget: int,
         now: float,
     ) -> bool:
-        # 先做时间节流。
-        # 这里按 MiniCode 新版的思路：microcompact 不是"只要 tool_result 多就每轮都压"，
-        # 而是压过一次后先冷却 1 小时，避免连续多轮把同一批旧工具结果反复清空。
-        if (
-            self._state.last_time_based_compact > 0
-            and (now - self._state.last_time_based_compact) < self._state.time_based_interval
-        ):
-            return False
+        """基于空闲时间判断是否需要触发 microcompact。
 
-        tool_rounds = _count_tool_rounds(messages)
-        # 只要有工具调用的轮数超过保留阈值，就触发 microcompact。
-        # 不再按单条 tool_result 计数，避免同一轮推理中途被打断。
-        return tool_rounds > max(0, self._state.keep_recent_tool_rounds)
+           对标 Claude Code evaluateTimeBasedTrigger()：
+           如果最后一条 assistant 消息距今超过阈值（默认 60 分钟），
+           说明服务器端 prompt cache 已过期，清旧 tool_result 能减小下次请求体积。
+        """
+        gap_minutes = _gap_since_last_assistant_minutes(messages, now)
+        if gap_minutes is None:
+            return False
+        return gap_minutes > _MICROCOMPACT_GAP_THRESHOLD_MINUTES
 
     def _evaluate(
         self,
@@ -879,41 +897,43 @@ class MicrocompactEngine:
         usable_budget: int,
         now: float,
     ) -> dict[str, float | int | str | bool]:
+        """评估是否触发 microcompact，返回决策字典。"""
         tool_rounds = _count_tool_rounds(messages)
-        tool_round_count = tool_rounds
         keep_recent = max(0, self._state.keep_recent_tool_rounds)
+        gap_minutes = _gap_since_last_assistant_minutes(messages, now)
 
-        # 先做时间节流。microcompact 一旦刚执行过，就冷却 1 小时，避免连续多轮重复清理同一批旧结果。
-        if (
-            self._state.last_time_based_compact > 0
-            and (now - self._state.last_time_based_compact) < self._state.time_based_interval
-        ):
+        if gap_minutes is None:
             return {
                 "should_apply": False,
-                "reason": "cooldown",
-                "tool_round_count": tool_round_count,
+                "reason": "no_assistant_message",
+                "tool_round_count": tool_rounds,
                 "keep_recent_tool_rounds": keep_recent,
-                "cooldown_remaining_seconds": max(
-                    0.0,
-                    self._state.time_based_interval
-                    - (now - self._state.last_time_based_compact),
-                ),
+                "cooldown_remaining_seconds": 0.0,
             }
 
-        # 只有有工具调用的轮数超过保留阈值时，才允许做 microcompact。
-        if tool_round_count <= keep_recent:
+        # 工具结果太少时没必要压缩
+        if tool_rounds <= keep_recent:
             return {
                 "should_apply": False,
                 "reason": "below_threshold",
-                "tool_round_count": tool_round_count,
+                "tool_round_count": tool_rounds,
                 "keep_recent_tool_rounds": keep_recent,
                 "cooldown_remaining_seconds": 0.0,
+            }
+
+        if gap_minutes <= _MICROCOMPACT_GAP_THRESHOLD_MINUTES:
+            return {
+                "should_apply": False,
+                "reason": "gap_too_small",
+                "tool_round_count": tool_rounds,
+                "keep_recent_tool_rounds": keep_recent,
+                "cooldown_remaining_seconds": (_MICROCOMPACT_GAP_THRESHOLD_MINUTES - gap_minutes) * 60.0,
             }
 
         return {
             "should_apply": True,
             "reason": "ready",
-            "tool_round_count": tool_round_count,
+            "tool_round_count": tool_rounds,
             "keep_recent_tool_rounds": keep_recent,
             "cooldown_remaining_seconds": 0.0,
         }
