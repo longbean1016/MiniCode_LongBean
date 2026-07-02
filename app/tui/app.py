@@ -423,10 +423,18 @@ class MiniCodeApp(App):
 
     def _on_mcp_async_result(self, result: str) -> None:
         """MCP 异步操作结果回调（由后台线程触发）。
-
-        通过 Textual 的 call_from_thread 安全地将结果写入 Conversation Widget。
+        MCP 启动/连接消息属于后台运维信息，显示 5 秒后自动消失。
         """
-        self.call_from_thread(self.conversation.add_system_info, result)
+        self.call_from_thread(self._show_temporary_info, result, 5.0)
+
+    def _show_temporary_info(self, text: str, seconds: float = 5.0) -> None:
+        """在对话区显示临时信息，定时后自动移除。"""
+        self.conversation.add_system_info(text)
+        self.set_timer(seconds, lambda: self.conversation.remove_last_system_info(text))
+
+    def _remove_last_mcp_info(self, text: str) -> None:
+        """移除最后一条匹配文本的系统消息。"""
+        self.conversation.remove_last_system_info(text)
 
     def _do_exit(self) -> None:
         """安全退出 TUI。

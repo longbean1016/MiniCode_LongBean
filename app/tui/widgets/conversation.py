@@ -237,3 +237,12 @@ class ConversationWidget(RichLog):
         t.append(text, style="dim")
         self._entries.append(_Entry(renderable=t, kind="system"))
         self._render_all()
+
+    def remove_last_system_info(self, text: str) -> None:
+        """移除最后一条匹配文本的系统消息（用于临时消息自动消失）。"""
+        for i in range(len(self._entries) - 1, -1, -1):
+            e = self._entries[i]
+            if e.kind == "system" and hasattr(e.renderable, "plain") and text in e.renderable.plain:
+                self._entries.pop(i)
+                self._render_all()
+                return
