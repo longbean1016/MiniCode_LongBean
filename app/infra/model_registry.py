@@ -194,10 +194,14 @@ class OpenAIModelAdapter:
 
         # 遍历流式响应，把每一块 delta 转成 StreamChunk
         for chunk in response_stream:
-            # 捕获 API 返回的 token 用量（OpenAI 在 choices=[] 的单独 chunk 里，
-            # DeepSeek 等厂商在最后一个带 choices 的 chunk 里一并返回 usage）
+            # 捕获 API 返回的 token 用量和缓存命中信息
+            # DeepSeek/OpenAI 支持 prompt caching，重复前缀自动命中缓存
             if chunk.usage:
-                yield StreamChunk(type="usage", text=str(chunk.usage.total_tokens))
+                total = chunk.usage.total_tokens
+                cache_hit = getattr(chunk.usage, "prompt_cache_hit_tokens", 0) or 0
+                cache_miss = getattr(chunk.usage, "prompt_cache_miss_tokens", 0) or 0
+                # 用逗号分隔 total/cache_hit/cache_miss，下游解析
+                yield StreamChunk(type="usage", text=f"{total},{cache_hit},{cache_miss}")
 
             if not chunk.choices:
                 continue

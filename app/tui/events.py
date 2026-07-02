@@ -70,13 +70,16 @@ class ToolResultEvent:
 
 @dataclass(slots=True)
 class UsageEvent:
-    """API 返回的 token 用量统计。
+    """API 返回的 token 用量和 prompt cache 命中统计。
 
-    对标准 Claude Code 的 usage 信息展示。
-    total_tokens 是本次 API 调用的总 token 消耗。
+       对标 Claude Code 的 usage 展示，增加缓存命中率信息。
+       cache_hit_tokens: 被服务器端缓存命中的 token 数（只收 10%~50% 费用）
+       cache_miss_tokens: 未命中缓存的 token 数（全额计费）
     """
 
     total_tokens: int = 0
+    cache_hit_tokens: int = 0
+    cache_miss_tokens: int = 0
 
 
 @dataclass(slots=True)

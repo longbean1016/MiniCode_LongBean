@@ -506,15 +506,14 @@ class MiniCodeApp(App):
             return 100_000
 
     @staticmethod
-    def _update_token_display(header: HeaderWidget, total: int, budget: int) -> None:
-        """更新 Header 的 token 显示。
-
-        Args:
-            header: HeaderWidget 实例
-            total: 当前估算的 token 总数
-            budget: 可用上下文预算（来自 DEFAULT_USABLE_CONTEXT_BUDGET）
-        """
-        header.token_info = f"{total / 1000:.1f}k / {budget / 1000:.0f}k"
+    def _update_token_display(header: HeaderWidget, total: int, budget: int, cache_hit: int = 0, cache_miss: int = 0) -> None:
+        """更新 Header 的 token 和 prompt cache 命中显示。"""
+        info = f"{total / 1000:.1f}k / {budget / 1000:.0f}k"
+        cache_total = cache_hit + cache_miss
+        if cache_total > 0:
+            hit_rate = (cache_hit / cache_total) * 100
+            info += f"  cache: {hit_rate:.0f}%"
+        header.token_info = info
 
     def _run_agent_stream(self, user_input: str | None) -> None:
         """在 worker 线程中执行 stream_agent，实时推送事件到 UI。
@@ -612,13 +611,15 @@ class MiniCodeApp(App):
                         )
 
                     elif isinstance(event, UsageEvent):
-                        # API 返回的实时 token 用量 → 更新 Header（对标 Claude Code）
+                        # API 返回的实时 token 用量和缓存命中率 → 更新 Header
                         try:
                             self.call_from_thread(
                                 self._update_token_display,
                                 self.header,
                                 event.total_tokens,
                                 self._get_usable_budget(),
+                                event.cache_hit_tokens,
+                                event.cache_miss_tokens,
                             )
                         except Exception:
                             pass

@@ -901,10 +901,17 @@ def stream_agent(
                     tool_calls_buf[idx]["args_str"] += chunk.text
 
                 elif chunk.type == "usage":
-                    # API 返回的 token 用量统计（对标 Claude Code 的 usage）
-                    total_tokens = int(chunk.text) if chunk.text.isdigit() else 0
-                    yield UsageEvent(total_tokens=total_tokens)
-
+                    # API 返回的 token 用量 + prompt cache 命中统计
+                    # chunk.text 格式: "total,cache_hit,cache_miss"
+                    parts = chunk.text.split(",")
+                    total_tokens = int(parts[0]) if len(parts) > 0 and parts[0].lstrip("-").isdigit() else 0
+                    cache_hit = int(parts[1]) if len(parts) > 1 and parts[1].lstrip("-").isdigit() else 0
+                    cache_miss = int(parts[2]) if len(parts) > 2 and parts[2].lstrip("-").isdigit() else 0
+                    yield UsageEvent(
+                        total_tokens=total_tokens,
+                        cache_hit_tokens=cache_hit,
+                        cache_miss_tokens=cache_miss,
+                    )
             model_cost = time.perf_counter() - model_started_at
 
         except Exception as error:
