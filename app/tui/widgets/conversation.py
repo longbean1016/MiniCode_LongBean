@@ -110,13 +110,17 @@ class ConversationWidget(RichLog):
 
     def add_user_message(self, text: str) -> None:
         if self._turn_count > 0:
+            # 轮次之间加大分隔
             self._entries.append(
-                _Entry(renderable=Text("─" * 60, style="dim"), kind="system")
+                _Entry(renderable=Text(""), kind="spacer")
+            )
+            self._entries.append(
+                _Entry(renderable=Text("━" * 60, style="dim"), kind="system")
             )
         self._turn_count += 1
         user = Text()
         user.append("▸ ", style="bold cyan")
-        user.append(text, style="white")
+        user.append(text, style="bold white")
         self._entries.append(_Entry(renderable=user, kind="user"))
         self._render_all()
 
@@ -125,9 +129,10 @@ class ConversationWidget(RichLog):
     def begin_agent_response(self) -> None:
         self._current_response = ""
         self._intermediate_collapsed = False
-        self._entries.append(
-            _Entry(renderable=Text("Agent", style="bold $secondary"), kind="agent")
-        )
+        # 用醒目的标签区分 agent 回答
+        label = Text()
+        label.append("◆ Agent ", style="bold $success")
+        self._entries.append(_Entry(renderable=label, kind="agent"))
         self._render_all()
 
     def add_text_chunk(self, text: str) -> None:
