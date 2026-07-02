@@ -43,6 +43,7 @@ from app.tui.events import (
     ToolCallEvent,
     ToolResultEvent,
     ToolRunningEvent,
+    UsageEvent,
 )
 
 NUDGE_CONTINUE = (
@@ -899,6 +900,11 @@ def stream_agent(
                     if idx not in tool_calls_buf:
                         tool_calls_buf[idx] = {"id": "", "name": "", "args_str": ""}
                     tool_calls_buf[idx]["args_str"] += chunk.text
+
+                elif chunk.type == "usage":
+                    # API 返回的 token 用量统计（对标 Claude Code 的 usage）
+                    total_tokens = int(chunk.text) if chunk.text.isdigit() else 0
+                    yield UsageEvent(total_tokens=total_tokens)
 
             model_cost = time.perf_counter() - model_started_at
 

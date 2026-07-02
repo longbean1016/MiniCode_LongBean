@@ -32,7 +32,7 @@ class StreamChunk:
     - "tool_call_args":  工具调用的 arguments JSON 增量（后续块）
     """
 
-    type: Literal["text", "tool_call_name", "tool_call_args"]
+    type: Literal["text", "tool_call_name", "tool_call_args", "usage"]
     text: str = ""
     tool_id: str = ""
     tool_index: int = 0
@@ -196,6 +196,9 @@ class OpenAIModelAdapter:
         for chunk in response_stream:
             # 用法统计（Usage）出现在最后一个 chunk 中，没有 choices 字段
             if not chunk.choices:
+                # 捕获 API 返回的 token 用量（对标 Claude Code 的 usage 展示）
+                if chunk.usage:
+                    yield StreamChunk(type="usage", text=str(chunk.usage.total_tokens))
                 continue
 
             delta = chunk.choices[0].delta

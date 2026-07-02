@@ -26,6 +26,7 @@ from app.tui.events import (
     ThinkingEvent,
     ToolCallEvent,
     ToolResultEvent,
+    UsageEvent,
 )
 from app.tui.widgets.conversation import ConversationWidget
 from app.tui.widgets.header import HeaderWidget
@@ -496,6 +497,15 @@ class MiniCodeApp(App):
         return updated
 
     @staticmethod
+    def _get_usable_budget() -> int:
+        """获取当前上下文可用 token 预算。"""
+        try:
+            from app.context.manager import DEFAULT_USABLE_CONTEXT_BUDGET
+            return DEFAULT_USABLE_CONTEXT_BUDGET
+        except Exception:
+            return 100_000
+
+    @staticmethod
     def _update_token_display(header: HeaderWidget, total: int, budget: int) -> None:
         """更新 Header 的 token 显示。
 
@@ -616,6 +626,18 @@ class MiniCodeApp(App):
                         self.call_from_thread(
                             self.conversation.add_error, event.message
                         )
+
+                    elif isinstance(event, UsageEvent):
+                        # API 返回的实时 token 用量 → 更新 Header（对标 Claude Code）
+                        try:
+                            self.call_from_thread(
+                                self._update_token_display,
+                                self.header,
+                                event.total_tokens,
+                                self._get_usable_budget(),
+                            )
+                        except Exception:
+                            pass
 
             except Exception as error:
                 self.call_from_thread(

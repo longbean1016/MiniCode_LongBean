@@ -69,6 +69,17 @@ class ToolResultEvent:
 
 
 @dataclass(slots=True)
+class UsageEvent:
+    """API 返回的 token 用量统计。
+
+    对标准 Claude Code 的 usage 信息展示。
+    total_tokens 是本次 API 调用的总 token 消耗。
+    """
+
+    total_tokens: int = 0
+
+
+@dataclass(slots=True)
 class ApprovalEvent:
     """高风险操作需要用户确认。
 
@@ -109,6 +120,7 @@ AgentEvent = (
     | ToolCallEvent
     | ToolRunningEvent
     | ToolResultEvent
+    | UsageEvent
     | ApprovalEvent
     | DoneEvent
     | ErrorEvent
