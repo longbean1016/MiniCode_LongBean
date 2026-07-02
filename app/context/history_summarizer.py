@@ -73,13 +73,6 @@ class OlderHistorySummarizer:
             failure_threshold=circuit_failure_threshold,
             recovery_timeout_seconds=circuit_recovery_timeout_seconds,
         )
-        # 轻量抽取与 Collapse/历史摘要使用独立熔断器；
-        # 抽取失败只影响 WM 承接，不应该连带阻断真正的压缩摘要。
-        self.microcompact_circuit_breaker = CircuitBreaker(
-            name="microcompact_extractor",
-            failure_threshold=circuit_failure_threshold,
-            recovery_timeout_seconds=circuit_recovery_timeout_seconds,
-        )
         self.assistant_reply_circuit_breaker = CircuitBreaker(
             name="assistant_reply_extractor",
             failure_threshold=circuit_failure_threshold,
@@ -277,41 +270,6 @@ class OlderHistorySummarizer:
             rendered = render_active_context_summary(merged_snapshot).strip()
 
         return rendered or normalized_fallback, merged_snapshot or None
-
-    def extract_microcompact_carryovers(
-        self,
-        *,
-        tool_results: list[dict[str, object]],
-    ) -> dict[str, list[str]]:
-        """从即将被 microcompact 清正文的工具结果中抽取可续带的关键语义。"""
-        if not tool_results:
-            return {"tool_findings": [], "open_issues": [], "key_decisions": []}
-
-        lines: list[str] = []
-        for index, item in enumerate(reversed(tool_results[-8:]), start=1):
-            tool_name = str(item.get("tool_name", "") or "unknown")
-            tool_input = self._shorten(json.dumps(item.get("tool_input", {}), ensure_ascii=False), 400)
-            content = self._shorten(str(item.get("content", "")), 900)
-            lines.append(
-                f"### tool_result {index}\n"
-                f"tool_name: {tool_name}\n"
-                f"tool_input: {tool_input}\n"
-                f"content: {content}"
-            )
-
-        system_prompt = (
-            "你是代码 Agent 的 microcompact 语义承接器。\n"
-            "请只抽取旧 tool_result 正文被清掉后仍必须保留的事实。\n"
-            "输出必须是 JSON 对象，字段固定为 tool_findings、open_issues、key_decisions，值都是字符串数组。\n"
-            "不要输出 markdown，不要解释。"
-        )
-        user_prompt = "请从下面这些工具结果中抽取关键承接信息：\n\n" + "\n\n".join(lines)
-        return self._call_json_extractor(
-            breaker=self.microcompact_circuit_breaker,
-            system_prompt=system_prompt,
-            user_prompt=user_prompt,
-            expected_keys=("tool_findings", "open_issues", "key_decisions"),
-        )
 
     def extract_assistant_reply_memory(self, *, content: str) -> dict[str, list[str]]:
         """从 assistant 最终回复中抽取 WM 需要的决策、风险、偏好和约束。"""

@@ -578,43 +578,6 @@ def persist_post_response_working_memory_state(
     )
 
 
-def _promote_microcompact_carryovers(
-    *,
-    working_memory: object = None,
-    compaction_result: CompactionResult,
-) -> None:
-    """在 microcompact 清理旧 tool_result 之后，把承接出的关键信息回写到 working memory。"""
-    for finding in compaction_result.carried_tool_findings:
-        if str(finding).strip():
-            # 旧 tool_result 正文会被清掉，但关键工具结论不能跟着丢。
-            # 这里先回写到 working memory，后面再重新合并进 active context 摘要。
-            if working_memory is not None:
-                working_memory.protect(
-                str(finding),
-                entry_type="tool_finding",
-                importance=1.2,
-            )
-    for issue in compaction_result.carried_open_issues:
-        if str(issue).strip():
-            # open issue / recent risk 也要同步承接，否则 microcompact 后风险链路会断。
-            if working_memory is not None:
-                working_memory.protect(
-                str(issue),
-                entry_type="recent_risk",
-                importance=1.1,
-            )
-    for decision in compaction_result.carried_key_decisions:
-        if str(decision).strip():
-            # microcompact 模型抽到的关键决策需要进入 WM，
-            # 否则旧工具正文清掉后，后续轮次只能看到占位符而看不到结论。
-            if working_memory is not None:
-                working_memory.protect(
-                str(decision),
-                entry_type="key_decision",
-                importance=1.15,
-            )
-
-
 def _build_compacted_request(
     *,
     pipeline: ContextCompactorPipeline,
@@ -660,33 +623,6 @@ def _build_compacted_request(
         # session/full compact 摘要优先尝试模型生成结构化结果，失败再退回规则摘要。
         semantic_summarizer=history_summarizer,
     )
-    if (
-        pipeline_result.compaction_result.carried_tool_findings
-        or pipeline_result.compaction_result.carried_open_issues
-        or pipeline_result.compaction_result.carried_key_decisions
-    ):
-        overlay_snapshot: CompactMemorySnapshot = {}
-        if pipeline_result.compaction_result.carried_tool_findings:
-            overlay_snapshot["tool_findings"] = list(
-                pipeline_result.compaction_result.carried_tool_findings
-            )
-        if pipeline_result.compaction_result.carried_open_issues:
-            overlay_snapshot["open_issues"] = list(
-                pipeline_result.compaction_result.carried_open_issues
-            )
-        if pipeline_result.compaction_result.carried_key_decisions:
-            overlay_snapshot["decisions"] = list(
-                pipeline_result.compaction_result.carried_key_decisions
-            )
-        pipeline_result.resolved_active_context_snapshot = merge_active_context_snapshots(
-            base_snapshot=(
-                pipeline_result.resolved_active_context_snapshot or active_context_snapshot
-            ),
-            overlay_snapshot=overlay_snapshot,
-        )
-        pipeline_result.resolved_active_context_summary = render_active_context_summary(
-            pipeline_result.resolved_active_context_snapshot
-        )
     active_context_summary = (
         pipeline_result.resolved_active_context_summary or active_context_summary
     )
