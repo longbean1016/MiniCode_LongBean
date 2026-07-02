@@ -598,29 +598,13 @@ class MiniCodeApp(App):
                             )
 
                     elif isinstance(event, DoneEvent):
-                        # 本轮完成：更新历史、结束流式构建、刷新 token 显示
+                        # 本轮完成：更新历史、结束流式构建
+                        # token 已在 UsageEvent 中更新，此处不再重复估算
                         self._history = event.history
                         final_step = event.step  # 保存 step 用于后台记忆写入
                         self.call_from_thread(
                             self.conversation.end_agent_response,
                         )
-
-                        # 更新 Header token 显示
-                        try:
-                            from app.context.manager import (
-                                DEFAULT_USABLE_CONTEXT_BUDGET,
-                                estimate_messages_tokens,
-                            )
-                            total = estimate_messages_tokens(self._history)
-                            self.call_from_thread(
-                                self._update_token_display,
-                                self.header,
-                                total,
-                                DEFAULT_USABLE_CONTEXT_BUDGET,
-                            )
-                        except Exception:
-                            # token 估算失败不影响主链路
-                            pass
 
                     elif isinstance(event, ErrorEvent):
                         self.call_from_thread(
