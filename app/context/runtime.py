@@ -753,7 +753,13 @@ class MicrocompactResult:
 
 
 class LightweightContextPhase:
-    """对应新版 MiniCode 的 tool budget / read dedup / recent cleanup 阶段。"""
+    """每轮请求前的轻量治理阶段。
+
+       为保证 prompt cache 命中率（DeepSeek 缓存可省 ~96% token），
+       此阶段已关闭所有消息修改操作（去重/过滤/裁剪）。
+       消息严格 append-only，旧消息一字不改，缓存前缀稳定命中。
+       Microcompact 和 Auto Compact 继续正常工作。
+    """
 
     def run(
         self,
@@ -764,17 +770,10 @@ class LightweightContextPhase:
         fixed_overhead_tokens: int,
         pinned_tool_names: set[str] | None,
     ) -> tuple[CompactionResult, list[str]]:
-        target_tokens = max(
-            1,
-            int(usable_budget * AUTO_COMPACT_TARGET_RATIO) - fixed_overhead_tokens,
-        )
-        result = compact_recent_messages(
-            messages,
-            pinned_tool_names=pinned_tool_names,
-            target_tokens=target_tokens,
-            protected_recent_messages=config.protected_recent_messages,
-        )
-        return result, ["tool_budget", "read_dedup", "recent_tool_cleanup"]
+        # 不修改任何历史消息，直接返回原样
+        # 每轮修改消息内容会破坏 DeepSeek prompt cache 的前缀匹配
+        result = CompactionResult(messages=list(messages))
+        return result, ["cache_preserved"]
 
 
 class MicrocompactEngine:
