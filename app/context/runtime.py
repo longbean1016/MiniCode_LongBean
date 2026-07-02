@@ -73,12 +73,11 @@ _ANALYSIS_MODE_KEYWORDS = (
     "workflow",
     "walkthrough",
 )
+# 分析模式下优先保留上下文结果的工具（对齐新工具集）
 _ANALYSIS_PINNED_TOOL_NAMES = {
-    "file_overview",
-    "get_ast_info",
-    "find_symbols",
-    "locate_symbol",
-    "find_references",
+    "read_file",
+    "grep_files",
+    "glob_files",
 }
 
 

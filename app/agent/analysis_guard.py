@@ -12,12 +12,12 @@ NUDGE_ANALYSIS_CONVERGE = (
     "请直接基于已有证据给出最终答案，并明确写出仍然不确定的点。"
 )
 NUDGE_ANALYSIS_TOOL_PRIORITY = (
-    "这是代码链路分析任务。优先使用 get_ast_info 或 find_symbols 这类结构化工具确认真实函数表，"
+    "这是代码链路分析任务。优先使用 grep_files 或 glob_files 这类搜索工具确认真实函数位置，"
     "再按需使用 read_file 看局部分块；不要一上来只靠连续分块阅读。"
 )
 NUDGE_ANALYSIS_STRUCTURE_FIRST = (
-    "当前仍处于代码分析取证阶段。请先使用 get_ast_info、find_symbols、locate_symbol 或 file_overview "
-    "确认真实顶层符号和文件结构，再决定是否需要 read_file 看局部源码。"
+    "当前仍处于代码分析取证阶段。请先使用 grep_files、glob_files "
+    "确认文件结构和符号位置，再决定是否需要 read_file 看局部源码。"
 )
 
 _ANALYSIS_KEYWORDS = (
@@ -54,7 +54,8 @@ _DIRECTORY_QUALIFIED_FILE_PATTERN = re.compile(
 _CLI_ARG_PATTERN = re.compile(r"add_argument\(\s*[\"'](--[A-Za-z0-9_-]+)[\"']")
 _ANSWER_CLI_ARG_PATTERN = re.compile(r"(--[A-Za-z0-9_-]+)")
 _COMMON_FILE_EXTENSIONS = {"py", "js", "ts", "tsx", "jsx", "json", "yaml", "yml", "md", "txt"}
-_ANALYSIS_STRUCTURE_FIRST_TOOLS = {"file_overview", "get_ast_info", "find_symbols", "locate_symbol"}
+# 分析阶段优先使用的工具（对齐新工具集）
+_ANALYSIS_STRUCTURE_FIRST_TOOLS = {"glob_files", "grep_files"}
 
 
 def _normalize_target(value: str) -> str:
@@ -176,97 +177,45 @@ def _normalize_symbol_name(raw_name: str) -> str:
 
 
 def _extract_symbols_from_tool_result(tool_name: str, raw_output: str) -> tuple[set[str], set[str]]:
-    """从结构化工具输出里提取真实符号名和顶层函数名。"""
+    """从工具输出里提取真实符号名和函数名（已适配新工具集）。"""
     observed_symbols: set[str] = set()
     observed_functions: set[str] = set()
 
     if not raw_output.strip():
         return observed_symbols, observed_functions
 
-    current_section = ""
-    for raw_line in raw_output.splitlines():
-        line = raw_line.strip()
-        if not line:
-            continue
+    # grep_files content 模式 — 从匹配的行中提取标识符
+    if tool_name == "grep_files":
+        for raw_line in raw_output.splitlines():
+            if ":" not in raw_line:
+                continue
+            line = raw_line.strip()
+            for match in _FUNCTION_CALL_PATTERN.findall(line):
+                if _IDENTIFIER_PATTERN.fullmatch(match):
+                    observed_symbols.add(match)
+            for match in _DOTTED_FUNCTION_CALL_PATTERN.findall(line):
+                last = match.rsplit(".", 1)[-1]
+                if _IDENTIFIER_PATTERN.fullmatch(last):
+                    observed_symbols.add(last)
+        return observed_symbols, observed_functions
 
-        if line.endswith(":"):
-            current_section = line[:-1]
-            continue
-
-        if tool_name == "file_overview":
-            if current_section == "导入":
-                symbol_name = _normalize_symbol_name(line)
-                if symbol_name:
-                    observed_symbols.add(symbol_name)
-                continue
-            if current_section == "函数":
-                match = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)\s*\(", line)
-                if match:
-                    function_name = match.group(1)
-                    observed_symbols.add(function_name)
-                    observed_functions.add(function_name)
-                continue
-            if current_section == "类":
-                symbol_name = _normalize_symbol_name(line.split(" ", 1)[0])
-                if symbol_name:
-                    observed_symbols.add(symbol_name)
-                continue
-
-        if tool_name == "get_ast_info":
-            if current_section == "导入":
-                symbol_name = _normalize_symbol_name(line)
-                if symbol_name:
-                    observed_symbols.add(symbol_name)
-                continue
-            if line.startswith("function "):
-                function_name = _normalize_symbol_name(line[len("function "):])
-                if function_name:
-                    observed_symbols.add(function_name)
-                    observed_functions.add(function_name)
-                continue
-            if line.startswith("class "):
-                symbol_name = _normalize_symbol_name(line[len("class "):])
-                if symbol_name:
-                    observed_symbols.add(symbol_name)
-                continue
-            if line.startswith("variable "):
-                symbol_name = _normalize_symbol_name(line[len("variable "):])
-                if symbol_name:
-                    observed_symbols.add(symbol_name)
-                continue
-            if line.startswith("- method ") or line.startswith("  - method "):
-                symbol_name = _normalize_symbol_name(line.split("method ", 1)[1])
-                if symbol_name:
-                    observed_symbols.add(symbol_name)
-                continue
-
-        if tool_name == "find_symbols":
-            match = re.match(r"^[^:]+:\d+\s+([A-Za-z_][A-Za-z0-9_]*)\s+([A-Za-z_][A-Za-z0-9_]*)", line)
+    # read_file — 从源码中提取函数名和类名
+    if tool_name == "read_file":
+        for raw_line in raw_output.splitlines():
+            line = raw_line.strip()
+            # def / async def
+            match = re.match(r"^(?:async\s+)?def\s+([A-Za-z_][A-Za-z0-9_]*)", line)
             if match:
-                symbol_kind = match.group(1)
-                symbol_name = match.group(2)
-                observed_symbols.add(symbol_name)
-                if symbol_kind == "function":
-                    observed_functions.add(symbol_name)
-            continue
-
-        if tool_name == "locate_symbol":
-            if line.startswith("符号:"):
-                symbol_name = _normalize_symbol_name(line.split(":", 1)[1])
-                if symbol_name:
-                    observed_symbols.add(symbol_name)
+                fn = match.group(1)
+                observed_symbols.add(fn)
+                observed_functions.add(fn)
                 continue
-            match = re.match(
-                r"^(?:[^:]+:\d+:\s+)?(class|function|method|variable)\s+([A-Za-z_][A-Za-z0-9_]*)",
-                line,
-            )
+            # class
+            match = re.match(r"^class\s+([A-Za-z_][A-Za-z0-9_]*)", line)
             if match:
-                symbol_kind = match.group(1)
-                symbol_name = match.group(2)
-                observed_symbols.add(symbol_name)
-                if symbol_kind == "function":
-                    observed_functions.add(symbol_name)
-            continue
+                observed_symbols.add(match.group(1))
+                continue
+        return observed_symbols, observed_functions
 
     return observed_symbols, observed_functions
 
@@ -279,7 +228,7 @@ def _extract_analysis_facts_from_tool_result(
     observed_step_types = set(_STEP_TYPE_PATTERN.findall(raw_output))
     line_count: int | None = None
 
-    if tool_name in {"file_overview", "get_ast_info"}:
+    if tool_name in {"read_file", "grep_files", "glob_files"}:
         match = _LINE_COUNT_PATTERN.search(raw_output)
         if match:
             line_count = int(match.group(1))
@@ -654,12 +603,6 @@ def _record_analysis_evidence(
     if target and tool_name in {"file_overview", "get_ast_info"} and extracted_functions:
         observed_file_function_counts[target] = len(extracted_functions)
 
-    if tool_name == "file_overview" and result.ok and target:
-        covered_paths.add(target)
-        overview_paths.add(target)
-        tracker["structured_hits"] = int(tracker["structured_hits"]) + 1
-        return
-
     if tool_name == "read_file" and result.ok and target:
         covered_paths.add(target)
         read_paths.add(target)
@@ -692,25 +635,14 @@ def _record_analysis_evidence(
             truncated_read_paths.add(target)
         return
 
-    if tool_name == "find_references" and result.ok:
-        symbol = tool_input.get("symbol")
-        if isinstance(symbol, str) and symbol.strip():
-            reference_symbols.add(symbol.strip())
-            tracker["structured_hits"] = int(tracker["structured_hits"]) + 1
-        return
-
-    if tool_name in {"find_symbols", "locate_symbol", "get_ast_info"} and result.ok:
-        if target:
-            covered_paths.add(target)
-        if tool_name == "get_ast_info" and target:
-            ast_paths.add(target)
+    if tool_name == "glob_files" and result.ok:
+        # glob_files 等同于结构探索，计入 structured_hits
         tracker["structured_hits"] = int(tracker["structured_hits"]) + 1
         return
 
     if (
         tool_name == "grep_files"
         and not result.ok
-        and "目标不是目录" in result.output
         and target
     ):
         invalid_grep_file_paths.add(target)
