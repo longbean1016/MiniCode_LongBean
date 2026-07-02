@@ -64,6 +64,7 @@ class ApprovalRequest:
     input_data: Any  # 原始工具输入，批准后用于重试
     approval_type: str = "command"  # 审批类型：command | workspace_access
     workspace_path: str = ""  # 待加入的工作目录路径（仅 workspace_access 类型使用）
+    suggestions: list[dict] | None = None  # 规则建议列表 [{"tool":...,"pattern":...,...}]
 
 
 

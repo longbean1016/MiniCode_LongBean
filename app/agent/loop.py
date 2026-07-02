@@ -613,6 +613,7 @@ def _run_agent_loop(
                     command=str(result.meta.get("command", ""))
                     reason = str(result.meta.get("reason", ""))
                     action_key = str(result.meta.get("action_key", ""))
+                    suggestions = result.meta.get("suggestions")  # 规则建议列表
 
                     # 授权前先补一条占位 tool_result，保证消息协议完整。
                     # 否则历史里只剩 tool_call 没有 tool_result，下一次继续会话时会断链。
@@ -624,12 +625,15 @@ def _run_agent_loop(
                         meta=dict(result.meta),
                     )
 
+                    # ── 构建审批消息（包含规则建议信息）──
                     approval_message = (
                         "该操作需要用户授权。\n"
                         f"工具: {tool_name}\n"
                         f"命令: {command}\n"
                         f"原因: {reason}"
                     )
+                    if suggestions:
+                        approval_message += f"\n建议规则: {len(suggestions)} 条"
 
                     approval_step = AgentStep(
                         type="approval",
@@ -640,6 +644,8 @@ def _run_agent_loop(
                             action_key=action_key,
                             message=approval_message,
                             input_data=tool_input,
+                            # 传递规则建议给 TUI 展示
+                            suggestions=suggestions,
                         ),
                     )
                     return approval_step, builder.build()
@@ -1060,6 +1066,7 @@ def stream_agent(
                     command = str(result.meta.get("command", ""))
                     reason = str(result.meta.get("reason", ""))
                     action_key = str(result.meta.get("action_key", ""))
+                    suggestions = result.meta.get("suggestions")  # 规则建议列表
 
                     # 写入占位 tool_result，保证消息协议完整
                     builder.add_tool_result(
@@ -1070,12 +1077,15 @@ def stream_agent(
                         meta=dict(result.meta),
                     )
 
+                    # ── 构建审批消息（包含规则建议信息）──
                     approval_message = (
                         "该操作需要用户授权。\n"
                         f"工具: {tool_name}\n"
                         f"命令: {command}\n"
                         f"原因: {reason}"
                     )
+                    if suggestions:
+                        approval_message += f"\n建议规则: {len(suggestions)} 条"
 
                     approval_step = AgentStep(
                         type="approval",
@@ -1086,6 +1096,7 @@ def stream_agent(
                             action_key=action_key,
                             message=approval_message,
                             input_data=tool_input,
+                            suggestions=suggestions,
                         ),
                     )
                     # 把审批请求推送给 UI，暂停等待用户确认

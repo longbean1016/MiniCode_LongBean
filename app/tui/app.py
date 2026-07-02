@@ -296,6 +296,10 @@ class MiniCodeApp(App):
         else:
             self._tool_context.approved_actions.add(approval.action_key)
 
+            # ── 规则持久化：用户批准后保存建议的规则（对标 Claude Code "Yes, and don't ask again"）──
+            if approval.suggestions:
+                self._save_permission_suggestions(approval)
+
         # 重新执行工具
         self._tool_context.approved_actions.add(approval.action_key)
         result = self._tool_registry.execute_tool(
@@ -363,6 +367,49 @@ class MiniCodeApp(App):
 
         try:
             env_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        except Exception:
+            pass  # 持久化失败不阻塞主流程
+
+    @staticmethod
+    def _save_permission_suggestions(approval) -> None:
+        """将用户批准后生成的权限建议规则保存到 .bean/settings.json。
+
+           对标 Claude Code 的 "Yes, and don't ask again" 规则持久化机制。
+
+           Args:
+               approval: ApprovalRequest 实例，其中 suggestions 包含规则建议列表
+        """
+        if not approval.suggestions:
+            return
+
+        from pathlib import Path as _Path
+        from app.permissions.rules import PermissionRule, MatchType
+        from app.permissions.settings import load_rules, save_rules
+
+        try:
+            # 获取当前工作目录（即 .bean 的上级目录）
+            cwd = str(_Path(".").resolve())
+            existing_rules = load_rules(cwd)
+
+            # 将建议转为 PermissionRule 对象
+            for s in approval.suggestions:
+                match_type: MatchType = s.get("match_type", "prefix")
+                rule = PermissionRule(
+                    tool=s.get("tool", "run_command"),
+                    behavior="allow",
+                    match_type=match_type,
+                    pattern=s.get("pattern", ""),
+                    source="user_settings",
+                )
+                # 避免重复添加
+                key = (rule.tool, rule.behavior, rule.match_type, rule.pattern)
+                if not any(
+                    (r.tool, r.behavior, r.match_type, r.pattern) == key
+                    for r in existing_rules
+                ):
+                    existing_rules.append(rule)
+
+            save_rules(existing_rules, cwd)
         except Exception:
             pass  # 持久化失败不阻塞主流程
 
