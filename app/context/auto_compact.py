@@ -103,19 +103,24 @@ class AutoCompactDispatcher:
         self,
         *,
         total_tokens: int,
-        usable_budget: int,
+        model_name: str = "",
         tool_result_tokens: int = 0,
         repeated_scan_count: int = 0,
     ) -> bool:
-        # 与 MiniCode 新版一致：一旦 circuit breaker 触发，
-        # 后续自动压缩先短路，避免每轮都重复做高成本尝试。
+        """判断是否需要触发 Auto Compact。
+
+           对标 Claude Code shouldAutoCompact()：
+           熔断 → 抑制检查 → 绝对 token 阈值 + 预测增长。
+        """
+        # 熔断保护：连续失败超过上限后停止自动压缩（对标 MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES）
         if self.is_tripped:
             return False
+        # 抑制窗口：上次失败后有冷却期
         if self._suppressed_until > time.time():
             return False
         return should_trigger_auto_compact(
             total_tokens=total_tokens,
-            usable_budget=usable_budget,
+            model_name=model_name,
             tool_result_tokens=tool_result_tokens,
             repeated_scan_count=repeated_scan_count,
         )
@@ -131,6 +136,7 @@ class AutoCompactDispatcher:
         fixed_overhead_tokens: int = 0,
         force_full: bool = False,
         semantic_summarizer: OlderHistorySummarizer | None = None,
+        model_name: str = "",
     ) -> AutoCompactResult:
         # 在调度器入口统一计算 token 压力与扫描噪声。
         # 这样旧入口和新入口最终都会走同一套触发条件。
@@ -150,7 +156,7 @@ class AutoCompactDispatcher:
 
         if not force_full and not self.should_trigger(
             total_tokens=tokens_before,
-            usable_budget=usable_budget,
+            model_name=model_name,
             tool_result_tokens=tool_result_tokens,
             repeated_scan_count=repeated_scan_count,
         ):
@@ -208,16 +214,39 @@ class AutoCompactDispatcher:
 def should_trigger_auto_compact(
     *,
     total_tokens: int,
-    usable_budget: int,
+    model_name: str = "",
     tool_result_tokens: int = 0,
     repeated_scan_count: int = 0,
 ) -> bool:
-    """Trigger auto compact only on overall context high-water pressure."""
+    """判断是否需要触发 Auto Compact。
+
+       对标 Claude Code shouldAutoCompact()：
+       - 阈值改为绝对 token 数（不是比例）
+       - 支持预测触发：当前用量 + 预估本轮增长 >= 阈值就提前压缩
+       - 熔断：连续失败 3 次停止
+
+       Args:
+           total_tokens: 当前上下文占用的 token 估计值
+           model_name: 模型名称，用于查询上下文窗口和阈值
+           tool_result_tokens: 工具结果占用的 token 数（预留，暂未使用）
+           repeated_scan_count: 重复扫描次数（预留，暂未使用）
+    """
     _ = tool_result_tokens
     _ = repeated_scan_count
-    if usable_budget <= 0:
+
+    if not model_name:
         return False
-    return total_tokens >= int(usable_budget * AUTO_COMPACT_TRIGGER_RATIO)
+
+    # 使用绝对 token 数阈值（对标 Claude Code getAutoCompactThreshold）
+    from app.infra.model_capabilities import get_compact_threshold, estimate_max_turn_growth
+    threshold = get_compact_threshold(model_name)
+    if threshold <= 0:
+        return False
+
+    # 预测触发：当前用量 + 本轮预估增长（max_output + 工具结果预估）>= 阈值
+    growth = estimate_max_turn_growth(model_name)
+    predicted_total = total_tokens + growth
+    return predicted_total >= threshold
 
 
 def run_auto_compact(

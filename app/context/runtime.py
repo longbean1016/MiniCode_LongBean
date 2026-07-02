@@ -972,6 +972,7 @@ class ContextCompactor:
         auto_compact_failure_count: int = 0,
         auto_compact_suppressed_until: float = 0.0,
         semantic_summarizer: OlderHistorySummarizer | None = None,
+        model_name: str = "",
     ) -> ContextPipelineResult:
         auto_compact = AutoCompactDispatcher(
             config=AutoCompactDispatcherConfig(),
@@ -1015,6 +1016,7 @@ class ContextCompactor:
             fixed_overhead_tokens=fixed_overhead_tokens,
             force_full=force_auto_compact,
             semantic_summarizer=semantic_summarizer,
+            model_name=model_name,
         )
         if auto_compact_result.applied:
             steps_taken.append(f"auto_compact:{auto_compact_result.strategy}")
@@ -1099,6 +1101,7 @@ class ContextCompactorPipeline:
         auto_compact_failure_count: int = 0,
         auto_compact_suppressed_until: float = 0.0,
         semantic_summarizer: OlderHistorySummarizer | None = None,
+        model_name: str = "",
     ) -> ContextPipelineResult:
         return self._compactor.process_request(
             messages=messages,
@@ -1120,6 +1123,7 @@ class ContextCompactorPipeline:
             auto_compact_failure_count=auto_compact_failure_count,
             auto_compact_suppressed_until=auto_compact_suppressed_until,
             semantic_summarizer=semantic_summarizer,
+            model_name=model_name,
         )
 
 
