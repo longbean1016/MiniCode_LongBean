@@ -39,6 +39,8 @@ class ConversationWidget(RichLog):
         self._turn_count = 0
         self._intermediate_collapsed = False
         self._last_agent_response = ""
+        # 本轮 agent 回复开始时的 entries 长度，collapse 时只收起本轮的工具调用
+        self._turn_start_idx = 0
 
     def on_mount(self) -> None:
         # 默认欢迎文案。如果上层调用 replay_history() 回填历史消息，文案会被覆盖。
@@ -129,6 +131,8 @@ class ConversationWidget(RichLog):
     def begin_agent_response(self) -> None:
         self._current_response = ""
         self._intermediate_collapsed = False
+        # 记录本轮起点：collapse 时只清理本轮新增的工具调用，不动历史
+        self._turn_start_idx = len(self._entries)
         # 用醒目的标签区分 agent 回答
         label = Text()
         label.append("◆ Agent ", style="bold $success")
@@ -156,9 +160,20 @@ class ConversationWidget(RichLog):
     # ── 收起中间消息 ─────────────────────────────────────
 
     def _collapse(self) -> None:
+        """收起本轮的工具调用/思考消息，只保留历史轮次和当前文字回答。
+
+           之前用全局过滤导致历史记录中的工具调用也被删除，
+           现在改为只清理本轮（_turn_start_idx 之后）的中间消息。
+        """
         if self._intermediate_collapsed:
             return
-        self._entries = [e for e in self._entries if e.kind not in self._INTERMEDIATE]
+        # 保留 _turn_start_idx 之前的全部历史 + 之后非中间类型的条目
+        kept = (
+            self._entries[:self._turn_start_idx] +
+            [e for e in self._entries[self._turn_start_idx:]
+             if e.kind not in self._INTERMEDIATE]
+        )
+        self._entries = kept
         self._intermediate_collapsed = True
         self._render_all()
 
