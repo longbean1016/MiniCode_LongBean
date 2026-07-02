@@ -912,6 +912,14 @@ def stream_agent(
                         cache_hit_tokens=cache_hit,
                         cache_miss_tokens=cache_miss,
                     )
+                    # 记录缓存命中率到 debug.log，方便排查和性能分析
+                    cache_total = cache_hit + cache_miss
+                    if cache_total > 0:
+                        rate = (cache_hit / cache_total) * 100
+                        log_event(
+                            f"[session={session_id or '-'}] prompt_cache: hit={cache_hit} miss={cache_miss} rate={rate:.1f}% total={total_tokens}",
+                            echo=False,
+                        )
             model_cost = time.perf_counter() - model_started_at
 
         except Exception as error:
