@@ -15,7 +15,8 @@ from app.types import ChatMessage
 _READ_TOOLS = {"read_file"}
 _COLLECTION_TOOLS = {"glob_files", "grep_files"}
 _READ_FILE_PATH_PATTERN = re.compile(r"^FILE:\s*(.+)$", re.MULTILINE)
-_MICROCOMPACT_MARKER_PREFIX = "[旧 tool_result 内容已由 microcompact 清理]"
+# 对标 Claude Code microCompact.ts TIME_BASED_MC_CLEARED_MESSAGE
+_MICROCOMPACT_MARKER_PREFIX = "[Old tool result content cleared]"
 _EMPTY_SUCCESS_TOOL_RESULT_MARKER = "[工具执行成功，内容无额外信息]"
 _EMPTY_SUCCESS_PATTERNS = (
     "文件写入成功",
@@ -178,52 +179,11 @@ def _microcompact_tool_results(
     semantic_summarizer: object | None = None,
     result: CompactionResult,
 ) -> None:
-    """对较旧 tool_result 做正文清理，但保留 tool_result 结构供后续恢复。"""
-    extraction_candidates: list[dict[str, object]] = []
-    tool_call_input_by_id = _build_tool_call_input_by_id(compacted)
-    for index, message in enumerate(compacted):
-        if message.get("role") != "tool_result":
-            continue
-        if index in protected_tool_indexes:
-            continue
-        if _is_already_microcompacted_tool_result(message):
-            continue
-        original_content = str(message.get("content", ""))
-        source_content = (
-            original_tool_contents.get(index, original_content)
-            if original_tool_contents is not None
-            else original_content
-        )
-        extraction_candidates.append(
-            {
-                "tool_name": str(message.get("tool_name", "") or "unknown"),
-                "tool_input": tool_call_input_by_id.get(
-                    str(message.get("tool_use_id", "")).strip(),
-                    {},
-                ),
-                "content": source_content,
-            }
-        )
+    """对较旧 tool_result 做正文清理，替换为统一占位文本。
 
-    if extraction_candidates and semantic_summarizer is not None:
-        try:
-            extracted = semantic_summarizer.extract_microcompact_carryovers(
-                tool_results=extraction_candidates
-            )
-        except Exception:
-            extracted = {}
-        # 轻量模型抽取成功时，直接按结构化槽位写入结果；
-        # 失败则保持"只清正文、不写 WM"的文档约定。
-        result.carried_tool_findings.extend(
-            _normalize_extracted_lines(extracted, "tool_findings")
-        )
-        result.carried_open_issues.extend(
-            _normalize_extracted_lines(extracted, "open_issues")
-        )
-        result.carried_key_decisions.extend(
-            _normalize_extracted_lines(extracted, "key_decisions")
-        )
-
+       对标 Claude Code microCompact.ts 的 TIME_BASED_MC_CLEARED_MESSAGE。
+       不再调用模型做语义摘要，纯裁剪 + 占位，零额外 API 消耗。
+    """
     for index, message in enumerate(compacted):
         if message.get("role") != "tool_result":
             continue
@@ -233,13 +193,9 @@ def _microcompact_tool_results(
             continue
 
         original_content = str(message.get("content", ""))
-        source_content = (
-            original_tool_contents.get(index, original_content)
-            if original_tool_contents is not None
-            else original_content
-        )
-        summary = _build_microcompact_summary(message)
-        if not summary or summary == original_content:
+        # 记录原文长度用于 token 节省估算
+        summary = _MICROCOMPACT_MARKER_PREFIX
+        if summary == original_content:
             continue
 
         compacted[index]["content"] = summary
@@ -349,19 +305,6 @@ def _is_already_microcompacted_tool_result(message: ChatMessage) -> bool:
         message.get("_microcompacted")
         or message.get("_deduped_read_result")
     )
-
-
-def _build_microcompact_summary(message: ChatMessage) -> str:
-    tool_name = str(message.get("tool_name", "") or "unknown")
-    meta = message.get("meta", {})
-    path = ""
-    if isinstance(meta, dict):
-        path = str(meta.get("path", "") or meta.get("file_path", "")).strip()
-
-    lines = [_MICROCOMPACT_MARKER_PREFIX, f"工具: {tool_name}"]
-    if path:
-        lines.append(f"路径: {path}")
-    return "\n".join(lines)
 
 
 def _dedupe_tool_results(
