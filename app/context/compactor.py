@@ -121,7 +121,7 @@ def compact_recent_messages(
 def microcompact_old_tool_results(
     messages: list[ChatMessage],
     *,
-    keep_recent_tool_rounds: int,
+    keep_recent_tool_results: int,
     pinned_tool_names: set[str] | None = None,
     semantic_summarizer: object | None = None,
 ) -> CompactionResult:
@@ -139,9 +139,9 @@ def microcompact_old_tool_results(
     result = CompactionResult(messages=compacted)
     result.dropped_progress_messages = max(0, len(messages) - len(compacted))
 
-    protected_tool_indexes = _collect_protected_tool_indexes_by_rounds(
+    protected_tool_indexes = _collect_protected_tool_indexes_by_count(
         compacted=compacted,
-        max_recent_tool_rounds=max(0, keep_recent_tool_rounds),
+        max_recent_tool_results=max(0, keep_recent_tool_results),
         pinned_tools={
             str(tool_name).strip()
             for tool_name in (pinned_tool_names or set())
@@ -369,38 +369,36 @@ def _dedupe_tool_results(
         result.deduped_read_results += 1
 
 
-def _collect_protected_tool_indexes_by_rounds(
+def _collect_protected_tool_indexes_by_count(
     *,
     compacted: list[ChatMessage],
-    max_recent_tool_rounds: int,
+    max_recent_tool_results: int,
     pinned_tools: set[str],
 ) -> set[int]:
-    """保护最近 N 轮的全部 tool_result（按 user 消息切分轮次）。
+    """保护最近 N 条 tool_result（按条数，对标 Claude Code keepRecent=5）。
 
-    这些结果往往承载真实文件事实，不能在微压缩阶段被提前折掉。
+       不再按轮次切分——轮次边界不可靠且一轮可能包含多个工具调用。
+       直接倒序扫描，保留最后 max_recent_tool_results 条 tool_result。
     """
     keep_indexes: set[int] = set()
 
-    if max_recent_tool_rounds > 0:
-        # 找到所有 user 消息的位置作为轮边界
-        round_boundaries: list[int] = []
-        for i, msg in enumerate(compacted):
-            if str(msg.get("role", "")) == "user":
-                round_boundaries.append(i)
+    if max_recent_tool_results <= 0:
+        return keep_indexes
 
-        if round_boundaries:
-            protected_start = round_boundaries[
-                -min(max_recent_tool_rounds, len(round_boundaries))
-            ]
-            for i, msg in enumerate(compacted):
-                if msg.get("role") == "tool_result" and i >= protected_start:
-                    keep_indexes.add(i)
+    # 从后往前扫描，收集最近 N 条 tool_result 的索引
+    found = 0
+    for i in range(len(compacted) - 1, -1, -1):
+        if compacted[i].get("role") == "tool_result":
+            keep_indexes.add(i)
+            found += 1
+            if found >= max_recent_tool_results:
+                break
         else:
             # 没有 user 消息，回退：保护全部
             for i, msg in enumerate(compacted):
                 if msg.get("role") == "tool_result":
                     keep_indexes.add(i)
-    # max_recent_tool_rounds <= 0 时不保护任何结果
+    # max_recent_tool_results <= 0 时不保护任何结果
 
     # pinned_tools：保护指定工具的最新一次结果
     if pinned_tools:

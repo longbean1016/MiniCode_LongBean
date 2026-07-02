@@ -28,6 +28,7 @@ class ChatMessage(TypedDict,total=False):
     input: Any # 工具调用时的输入参数。
     is_error: bool # 表示这条消息是不是错误结果。
     meta: dict[str, Any] # 附加元信息，例如工具原始输出、截断标记等。
+    created_at: float # 消息创建时间戳（time.time()），用于 microcompact 空闲时间触发判断。
 
 class ToolCall(TypedDict):
     """

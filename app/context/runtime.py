@@ -659,7 +659,8 @@ def _build_compacted_request(
 
 # ── 上下文压缩流水线（原 compactor_pipeline.py） ──
 
-_MICROCOMPACT_KEEP_RECENT_TOOL_ROUNDS = 3
+# 对标 Claude Code timeBasedMCConfig.keepRecent（默认保留最近 5 条 tool_result）
+_MICROCOMPACT_KEEP_RECENT_TOOL_RESULTS = 5
 _MICROCOMPACT_INTERVAL_SECONDS = 60 * 60
 # 对标 Claude Code timeBasedMCConfig.gapThresholdMinutes（默认 60 分钟）
 _MICROCOMPACT_GAP_THRESHOLD_MINUTES = 60
@@ -693,15 +694,19 @@ def _gap_since_last_assistant_minutes(
     """计算距离最后一条 assistant 消息已经过了多少分钟。
 
        对标 Claude Code evaluateTimeBasedTrigger() 的 gapMinutes 计算。
-
-       注意：当前 MiniCode ChatMessage 没有 timestamp 字段，
-       因此无法精确计算空闲时间。此函数仅检查是否存在 assistant 消息，
-       存在时返回 0（表示刚活跃过），不存在时返回 None。
-       后续 ChatMessage 加 timestamp 字段后可以启用精确计算。
+       使用 ChatMessage.created_at 作为消息时间戳。
+       返回 None 表示消息列表中没有任何 assistant 消息。
     """
+    if now is None:
+        now = time.time()
+
     for msg in reversed(messages):
         if msg.get("role") == "assistant":
-            return 0.0  # 有 assistant 消息但无法知道具体时间
+            created_at = msg.get("created_at")
+            if isinstance(created_at, (int, float)) and created_at > 0:
+                return (now - created_at) / 60.0
+            # 旧消息没有 created_at 字段，保守返回 0
+            return 0.0
     return None
 
 
@@ -739,16 +744,15 @@ class LightweightCompactionConfig:
 
 @dataclass(slots=True)
 class MicrocompactState:
-    """
-    microcompact 的跨轮次状态。
+    """microcompact 的跨轮次状态。
 
-    当前项目把它落在 context_state 里，而不是常驻内存对象里，
-    这样恢复会话时仍能延续上一轮的节流窗口。
+       对标 Claude Code MicrocompactResult 的状态跟踪。
+       keep_recent_tool_results 默认 5，按条数保留最近 tool_result。
     """
 
     last_time_based_compact: float = 0.0
     time_based_interval: float = _MICROCOMPACT_INTERVAL_SECONDS
-    keep_recent_tool_rounds: int = 0
+    keep_recent_tool_results: int = _MICROCOMPACT_KEEP_RECENT_TOOL_RESULTS
     total_tokens_cleared: int = 0
 
 
@@ -767,7 +771,7 @@ class MicrocompactResult:
     # 记录 microcompact 决策细节，便于日志和 context_state 直接定位原因。
     reason: str = "not_evaluated"
     tool_round_count: int = 0
-    keep_recent_tool_rounds: int = 0
+    keep_recent_tool_results: int = 0
     cooldown_remaining_seconds: float = 0.0
 
 
@@ -834,13 +838,13 @@ class MicrocompactEngine:
                 last_compact_at=self._state.last_time_based_compact,
                 reason=str(decision["reason"]),
                 tool_round_count=int(decision["tool_round_count"]),
-                keep_recent_tool_rounds=int(decision["keep_recent_tool_rounds"]),
+                keep_recent_tool_results=int(decision["keep_recent_tool_results"]),
                 cooldown_remaining_seconds=float(decision["cooldown_remaining_seconds"]),
             )
 
         compaction_result = microcompact_old_tool_results(
             messages,
-            keep_recent_tool_rounds=self._state.keep_recent_tool_rounds,
+            keep_recent_tool_results=self._state.keep_recent_tool_results,
             pinned_tool_names=pinned_tool_names,
             semantic_summarizer=semantic_summarizer,
         )
@@ -853,7 +857,7 @@ class MicrocompactEngine:
                 carried_key_decisions=list(compaction_result.carried_key_decisions),
                 reason="no_old_tool_results",
                 tool_round_count=int(decision["tool_round_count"]),
-                keep_recent_tool_rounds=int(decision["keep_recent_tool_rounds"]),
+                keep_recent_tool_results=int(decision["keep_recent_tool_results"]),
             )
 
         self._state.last_time_based_compact = now
@@ -869,7 +873,7 @@ class MicrocompactEngine:
             carried_key_decisions=list(compaction_result.carried_key_decisions),
             reason="applied",
             tool_round_count=int(decision["tool_round_count"]),
-            keep_recent_tool_rounds=int(decision["keep_recent_tool_rounds"]),
+            keep_recent_tool_results=int(decision["keep_recent_tool_results"]),
         )
 
     def _should_apply(
@@ -898,7 +902,7 @@ class MicrocompactEngine:
     ) -> dict[str, float | int | str | bool]:
         """评估是否触发 microcompact。对标 Claude Code evaluateTimeBasedTrigger()。"""
         tool_rounds = _count_tool_rounds(messages)
-        keep_recent = max(0, self._state.keep_recent_tool_rounds)
+        keep_recent = max(0, self._state.keep_recent_tool_results)
         gap_minutes = _gap_since_last_assistant_minutes(messages, now)
 
         if gap_minutes is None:
@@ -906,7 +910,7 @@ class MicrocompactEngine:
                 "should_apply": False,
                 "reason": "no_assistant_message",
                 "tool_round_count": tool_rounds,
-                "keep_recent_tool_rounds": keep_recent,
+                "keep_recent_tool_results": keep_recent,
                 "cooldown_remaining_seconds": 0.0,
             }
 
@@ -915,7 +919,7 @@ class MicrocompactEngine:
                 "should_apply": False,
                 "reason": "gap_too_small",
                 "tool_round_count": tool_rounds,
-                "keep_recent_tool_rounds": keep_recent,
+                "keep_recent_tool_results": keep_recent,
                 "cooldown_remaining_seconds": (_MICROCOMPACT_GAP_THRESHOLD_MINUTES - gap_minutes) * 60.0,
             }
 
@@ -923,7 +927,7 @@ class MicrocompactEngine:
             "should_apply": True,
             "reason": "ready",
             "tool_round_count": tool_rounds,
-            "keep_recent_tool_rounds": keep_recent,
+            "keep_recent_tool_results": keep_recent,
             "cooldown_remaining_seconds": 0.0,
         }
 
@@ -1036,7 +1040,7 @@ class ContextCompactor:
             "microcompact_applied": microcompact_result.applied,
             "microcompact_reason": microcompact_result.reason,
             "microcompact_tool_rounds": microcompact_result.tool_round_count,
-            "microcompact_keep_recent_rounds": microcompact_result.keep_recent_tool_rounds,
+            "microcompact_keep_recent_rounds": microcompact_result.keep_recent_tool_results,
             "microcompact_cooldown_remaining_seconds": (
                 microcompact_result.cooldown_remaining_seconds
             ),
@@ -1106,7 +1110,7 @@ class ContextCompactorPipeline:
             pinned_tool_names=pinned_tool_names,
             microcompact_state=MicrocompactState(
                 last_time_based_compact=max(0.0, float(last_microcompact_at or 0.0)),
-                keep_recent_tool_rounds=_MICROCOMPACT_KEEP_RECENT_TOOL_ROUNDS,
+                keep_recent_tool_results=_MICROCOMPACT_KEEP_RECENT_TOOL_RESULTS,
             ),
             auto_compact_failure_count=auto_compact_failure_count,
             auto_compact_suppressed_until=auto_compact_suppressed_until,
