@@ -157,7 +157,7 @@ def run_agent_once(
     session: SessionData,
     history_summarizer: OlderHistorySummarizer | None = None,
     history: list[ChatMessage] | None = None,
-    max_steps: int = 20,
+    max_steps: int = 50,
     session_id: str = "",
 ) -> tuple[AgentStep, list[ChatMessage]]:
     """执行一轮 agent 主循环：模型 -> 工具 -> 再模型，直到完成或达到上限。"""
@@ -190,7 +190,7 @@ def continue_agent_from_history(
     tool_context: ToolContext,
     session: SessionData,
     history_summarizer: OlderHistorySummarizer | None = None,
-    max_steps: int = 20,
+    max_steps: int = 50,
     session_id: str = "",
 ) -> tuple[AgentStep, list[ChatMessage]]:
     """基于已有历史继续主循环，不再追加新的 user 消息。"""
@@ -757,7 +757,7 @@ def stream_agent(
     session: object,  # SessionData
     history_summarizer: object | None,  # OlderHistorySummarizer | None
     history: list | None,  # list[ChatMessage] | None
-    max_steps: int = 20,  # 最大循环步数，防止死循环
+    max_steps: int = 50,  # 最大循环步数，防止死循环
     session_id: str = "",  # 当前会话 ID
 ) -> object:  # Generator[AgentEvent, None, None]
     """流式执行一轮 Agent 请求。
