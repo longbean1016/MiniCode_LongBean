@@ -194,11 +194,12 @@ class OpenAIModelAdapter:
 
         # 遍历流式响应，把每一块 delta 转成 StreamChunk
         for chunk in response_stream:
-            # 用法统计（Usage）出现在最后一个 chunk 中，没有 choices 字段
+            # 捕获 API 返回的 token 用量（OpenAI 在 choices=[] 的单独 chunk 里，
+            # DeepSeek 等厂商在最后一个带 choices 的 chunk 里一并返回 usage）
+            if chunk.usage:
+                yield StreamChunk(type="usage", text=str(chunk.usage.total_tokens))
+
             if not chunk.choices:
-                # 捕获 API 返回的 token 用量（对标 Claude Code 的 usage 展示）
-                if chunk.usage:
-                    yield StreamChunk(type="usage", text=str(chunk.usage.total_tokens))
                 continue
 
             delta = chunk.choices[0].delta
