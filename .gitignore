@@ -111,3 +111,6 @@ docs
 .superpowers
 
 .mcp.json
+
+# 配置文件
+.bean
