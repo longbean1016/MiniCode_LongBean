@@ -1,6 +1,5 @@
-﻿from __future__ import annotations
-
-"""文本搜索工具，负责在目录或文件范围内查找匹配内容。"""
+"""grep 文本搜索工具，支持目录/单文件搜索、glob 过滤和多种输出模式。
+   参考 Claude Code GrepTool 语义实现，优先使用 ripgrep，不可用时回退 Python 原生扫描。"""
 
 from pathlib import Path
 import subprocess
@@ -10,13 +9,17 @@ from app.agent.permissions import PathAccessStatus, PermissionManager
 from app.agent.tooling import ToolDefinition
 from app.types import ToolContext, ToolResult
 
-# 搜索类工具不一定要做 offset/limit 分页，
-# 但必须把“总命中数”和“当前返回多少条”明确告诉模型。
-DEFAULT_MAX_MATCHES = 200
-MAX_MAX_MATCHES = 1_000
-MAX_MATCH_LINE_CHARS = 240
-MAX_OUTPUT_CHARS = 12_000
-_BLOCKED_INTERNAL_DIRS = {".cache", "cache", ".sessions", "sessions", ".context_state", "context_state"}
+# ── 搜索参数默认值（对齐 Claude Code GrepTool） ──
+DEFAULT_HEAD_LIMIT = 250          # 默认最多返回行数/文件数
+MAX_HEAD_LIMIT = 10_000           # 允许的上限（0 表示不限）
+MAX_MATCH_LINE_CHARS = 240        # 单行最大展示字符数
+MAX_OUTPUT_CHARS = 16_000         # 输出总字符预算
+# 排除的内部目录和 VCS 目录 — 避免把缓存/状态文件当作源码搜索
+_BLOCKED_INTERNAL_DIRS = {
+    ".cache", "cache", ".sessions", "sessions", ".context_state", "context_state",
+    ".git", ".svn", ".hg", ".bzr",
+}
+# ripgrep 额外排除规则
 _RG_EXCLUDE_GLOBS = (
     "!.git/**",
     "!.memory/**",
@@ -28,320 +31,325 @@ _RG_EXCLUDE_GLOBS = (
 )
 
 
-def _validate(input_data: Any) -> dict[str, int | str]:
-    """校验 grep_files 输入，并支持 max_matches 控制返回条数。"""
-    if not isinstance(input_data, dict):
-        raise ValueError("grep_files 输入必须是一个字典，包含 pattern 和 path 字段。")
+def _validate(input_data: Any) -> dict[str, Any]:
+    """校验 grep_files 输入参数（对齐 Claude Code GrepTool input_schema）。
 
+       支持：pattern / path / glob / output_mode / head_limit / offset / -i / -n
+    """
+    if not isinstance(input_data, dict):
+        raise ValueError("grep_files 输入必须是字典，包含 pattern 字段。")
+
+    # ── pattern（必填） ──
     pattern = input_data.get("pattern")
     if not isinstance(pattern, str) or not pattern.strip():
-        raise ValueError("pattern 必须是非空字符串")
+        raise ValueError("pattern 必须是非空字符串。")
 
-    path = input_data.get("path", ".")
-    if not isinstance(path, str):
-        raise ValueError("path 必须是字符串")
+    # ── path（可选，默认当前目录）──
+    raw_path = input_data.get("path")
+    if raw_path is not None and not isinstance(raw_path, str):
+        raise ValueError("path 必须是字符串。")
+    path = raw_path.strip() if isinstance(raw_path, str) and raw_path.strip() else "."
 
-    raw_max_matches = input_data.get("max_matches", DEFAULT_MAX_MATCHES)
+    # ── glob 文件过滤（可选）──
+    glob_filter = input_data.get("glob")
+    if glob_filter is not None and not isinstance(glob_filter, str):
+        raise ValueError("glob 必须是字符串。")
+
+    # ── output_mode: content | files_with_matches | count ──
+    output_mode = input_data.get("output_mode", "files_with_matches")
+    if output_mode not in ("content", "files_with_matches", "count"):
+        raise ValueError("output_mode 必须是 'content'、'files_with_matches' 或 'count'。")
+
+    # ── head_limit（可选，默认 250，0=不限）──
+    raw_head = input_data.get("head_limit")
+    head_limit = DEFAULT_HEAD_LIMIT
+    if raw_head is not None:
+        try:
+            head_limit = int(raw_head)
+        except (TypeError, ValueError):
+            pass
+    if head_limit < 0 or head_limit > MAX_HEAD_LIMIT:
+        raise ValueError(f"head_limit 必须在 0 到 {MAX_HEAD_LIMIT} 之间。")
+
+    # ── offset（可选，默认 0）──
+    raw_offset = input_data.get("offset", 0)
     try:
-        max_matches = int(raw_max_matches)
-    except (TypeError, ValueError) as error:
-        raise ValueError("max_matches 必须是整数") from error
+        offset = int(raw_offset)
+    except (TypeError, ValueError):
+        offset = 0
+    if offset < 0:
+        raise ValueError("offset 必须 >= 0。")
 
-    if max_matches < 1 or max_matches > MAX_MAX_MATCHES:
-        raise ValueError(f"max_matches 必须在 1 到 {MAX_MAX_MATCHES} 之间")
+    # ── -i: 大小写不敏感 ──
+    case_insensitive = bool(input_data.get("-i", False))
+
+    # ── -n: 显示行号（content 模式下默认 true）──
+    show_line_numbers = bool(input_data.get("-n", True))
 
     return {
         "pattern": pattern.strip(),
-        "path": path.strip(),
-        "max_matches": max_matches,
+        "path": path,
+        "glob": glob_filter.strip() if glob_filter else None,
+        "output_mode": output_mode,
+        "head_limit": head_limit,
+        "offset": offset,
+        "case_insensitive": case_insensitive,
+        "show_line_numbers": show_line_numbers,
     }
 
 
-def _run(validated_input: dict[str, int | str], context: ToolContext) -> ToolResult:
-    """在目录内递归搜索文本，并返回显式的截断说明。"""
+def _run(validated_input: dict[str, Any], context: ToolContext) -> ToolResult:
+    """在目录/文件内搜索匹配文本，支持 content / files_with_matches / count 三种输出模式。"""
     permission_manager = PermissionManager(
         context.cwd,
         additional_workspaces={Path(p) for p in context.additional_workspaces},
         permanent_workspaces={Path(p) for p in context.permanent_workspaces},
     )
 
-    pattern = str(validated_input["pattern"])
-    raw_path = str(validated_input["path"])
-    max_matches = int(validated_input["max_matches"])
+    pattern = validated_input["pattern"]
+    raw_path = validated_input["path"]
+    glob_filter = validated_input["glob"]
+    output_mode = validated_input["output_mode"]
+    head_limit = validated_input["head_limit"]
+    offset = validated_input["offset"]
+    case_insensitive = validated_input["case_insensitive"]
+    show_line_numbers = validated_input["show_line_numbers"]
+
+    # 路径权限检查
     check = permission_manager.check_path_access(raw_path)
     if check.status == PathAccessStatus.OUTSIDE_WORKSPACE:
         return ToolResult(
             ok=False,
             output=f"目标路径不在工作目录范围内：{raw_path}",
             error="WORKSPACE_ACCESS_REQUIRED",
-            meta={
-                "path": raw_path,
-                "resolved_path": str(check.resolved_path) if check.resolved_path else raw_path,
-                "action_key": f"workspace::{raw_path}",
-                "reason": check.message,
-            },
+            meta={"path": raw_path, "action_key": f"workspace::{raw_path}", "reason": check.message},
         )
     target_path = check.resolved_path
-    normalized_path = _to_workspace_relative_path(target_path, context.cwd)
-
-    # 默认不允许把内部上下文目录作为 grep 根目录，避免模型全文检索历史缓存后反复打转。
-    blocked_reason = _match_blocked_internal_path(normalized_path)
-    if blocked_reason is not None:
-        return ToolResult(
-            ok=False,
-            output=(
-                f"默认不允许搜索内部上下文目录：{raw_path}\n"
-                f"原因：{blocked_reason}\n"
-                "请优先对源码、配置或业务目录进行搜索。"
-            ),
-            error="SEARCH_POLICY_BLOCKED",
-            meta={
-                "path": raw_path,
-                "normalized_path": normalized_path,
-                "blocked_reason": blocked_reason,
-            },
-        )
 
     if not target_path.exists():
-        return ToolResult(
-            ok=False,
-            output=f"路径不存在：{raw_path}",
+        return ToolResult(ok=False, output=f"路径不存在：{raw_path}")
+
+    # ── 支持单文件搜索（Claude Code GrepTool 的新增能力）──
+    if target_path.is_file():
+        return _search_single_file(
+            pattern=pattern, file_path=target_path, raw_path=raw_path,
+            output_mode=output_mode, head_limit=head_limit, offset=offset,
+            case_insensitive=case_insensitive, show_line_numbers=show_line_numbers,
         )
 
     if not target_path.is_dir():
-        return ToolResult(
-            ok=False,
-            output=(
-                f"目标不是目录：{raw_path}\n"
-                "grep_files 只能搜索目录。\n"
-                "如果你要理解单个文件，请优先改用 read_file、file_overview 或 find_references。"
-            ),
-            error="SEARCH_EXPECTS_DIRECTORY",
-            meta={"path": raw_path},
-        )
+        return ToolResult(ok=False, output=f"目标不是目录也不是文件：{raw_path}",
+                          error="SEARCH_INVALID_PATH")
 
+    # ── 目录搜索：优先走 ripgrep ──
     rg_result = _run_with_rg(
-        pattern=pattern,
-        raw_path=raw_path,
-        target_path=target_path,
-        cwd=context.cwd,
-        max_matches=max_matches,
+        pattern=pattern, raw_path=raw_path, target_path=target_path,
+        cwd=context.cwd, output_mode=output_mode, head_limit=head_limit,
+        offset=offset, case_insensitive=case_insensitive, glob_filter=glob_filter,
+        show_line_numbers=show_line_numbers,
     )
     if rg_result is not None:
         return rg_result
 
+    # ── ripgrep 不可用时用 Python 回退 ──
     return _run_with_python_scan(
-        pattern=pattern,
-        raw_path=raw_path,
-        target_path=target_path,
-        max_matches=max_matches,
+        pattern=pattern, raw_path=raw_path, target_path=target_path,
+        output_mode=output_mode, head_limit=head_limit, offset=offset,
+        case_insensitive=case_insensitive, show_line_numbers=show_line_numbers,
     )
 
 
-def _run_with_rg(
-    *,
-    pattern: str,
-    raw_path: str,
-    target_path: Path,
-    cwd: str,
-    max_matches: int,
-) -> ToolResult | None:
-    """优先使用 ripgrep；不可用或异常时交给 Python 回退实现。"""
-    base_command = [
-        "rg",
-        "--fixed-strings",
-        "--line-number",
-        "--no-heading",
-        "--color",
-        "never",
-        "--no-messages",
-    ]
-    for glob in _RG_EXCLUDE_GLOBS:
-        base_command.extend(["--glob", glob])
+# ── 单文件搜索 ──
 
-    count_command = [*base_command, "--count", "--", pattern, raw_path]
-    try:
-        count_process = subprocess.run(
-            count_command,
-            cwd=cwd,
-            text=True,
-            capture_output=True,
-            timeout=10,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-
-    # rg: 0=有匹配，1=无匹配，2+=错误。错误时保留旧实现的宽松行为。
-    if count_process.returncode not in {0, 1}:
-        return None
-
-    total_matches = _parse_rg_count_output(count_process.stdout)
-    if total_matches == 0:
-        return _format_search_result(
-            pattern=pattern,
-            raw_path=raw_path,
-            matches=[],
-            total_matches=0,
-            truncated=False,
-            content_clipped=False,
-            output_budget_hit=False,
-            search_engine="rg",
-        )
-
-    search_command = [*base_command, "--", pattern, raw_path]
-    try:
-        search_process = subprocess.run(
-            search_command,
-            cwd=cwd,
-            text=True,
-            capture_output=True,
-            timeout=10,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-
-    if search_process.returncode not in {0, 1}:
-        return None
-
-    matches: list[str] = []
-    content_clipped = False
-    output_budget_hit = False
-    current_output_chars = 0
-
-    for raw_line in search_process.stdout.splitlines():
-        rendered_line, line_was_clipped = _normalize_rg_match_line(
-            raw_line,
-            target_path=target_path,
-            cwd=cwd,
-        )
-        projected_chars = current_output_chars + len(rendered_line) + 1
-        if projected_chars > MAX_OUTPUT_CHARS and matches:
-            output_budget_hit = True
-            break
-        if len(matches) >= max_matches:
-            break
-
-        matches.append(rendered_line)
-        current_output_chars = projected_chars
-        if line_was_clipped:
-            content_clipped = True
-
-    truncated = total_matches > len(matches) or output_budget_hit
-    return _format_search_result(
-        pattern=pattern,
-        raw_path=raw_path,
-        matches=matches,
-        total_matches=total_matches,
-        truncated=truncated,
-        content_clipped=content_clipped,
-        output_budget_hit=output_budget_hit,
-        search_engine="rg",
-    )
-
-
-def _run_with_python_scan(
-    *,
-    pattern: str,
-    raw_path: str,
-    target_path: Path,
-    max_matches: int,
+def _search_single_file(
+    *, pattern: str, file_path: Path, raw_path: str, output_mode: str,
+    head_limit: int, offset: int, case_insensitive: bool, show_line_numbers: bool,
 ) -> ToolResult:
-    """rg 不可用时保留原来的 Python 扫描兜底。"""
-    matches: list[str] = []
-    total_matches = 0
-    truncated = False
-    content_clipped = False
-    output_budget_hit = False
-    current_output_chars = 0
+    """对单个文件做内容搜索（Claude Code GrepTool 支持 path 指向文件）。"""
+    try:
+        content = file_path.read_text(encoding="utf-8")
+    except Exception as exc:
+        return ToolResult(ok=False, output=f"无法读取文件：{raw_path} — {exc}",
+                          error="FILE_READ_FAILED")
 
-    for file_path in target_path.rglob("*"):
-        if not file_path.is_file():
-            continue
+    lines = content.splitlines()
+    matched_lines: list[str] = []
+    search_pattern = pattern.lower() if case_insensitive else pattern
 
-        relative_path = file_path.relative_to(target_path)
-        # 遍历普通目录时，也跳过内部上下文目录下面的文件，避免把缓存和状态当源码搜索。
-        if _contains_internal_context_part(relative_path):
-            continue
+    for line_num, line in enumerate(lines, start=1):
+        target = line.lower() if case_insensitive else line
+        if search_pattern in target:
+            clipped, _ = _clip_match_line(line)
+            prefix = f"{raw_path}:{line_num}: " if show_line_numbers else f"{raw_path}: "
+            matched_lines.append(f"{prefix}{clipped}")
 
-        try:
-            content = file_path.read_text(encoding="utf-8")
-        except Exception:
-            # 保持现有宽松行为：读不了的文件直接跳过，避免一次搜索整体失败。
-            continue
-
-        for line_num, line in enumerate(content.splitlines(), start=1):
-            if pattern not in line:
-                continue
-
-            total_matches += 1
-            if len(matches) < max_matches:
-                clipped_line, line_was_clipped = _clip_match_line(line)
-                rendered_line = f"{relative_path}:{line_num}: {clipped_line}"
-                projected_chars = current_output_chars + len(rendered_line) + 1
-
-                # 先在工具层做总字符预算，避免超长 grep 结果全压到 registry 才被动收尾。
-                if projected_chars > MAX_OUTPUT_CHARS and matches:
-                    output_budget_hit = True
-                    truncated = True
-                    continue
-
-                matches.append(rendered_line)
-                current_output_chars = projected_chars
-                if line_was_clipped:
-                    content_clipped = True
-            else:
-                truncated = True
-
-    return _format_search_result(
-        pattern=pattern,
-        raw_path=raw_path,
-        matches=matches,
-        total_matches=total_matches,
-        truncated=truncated,
-        content_clipped=content_clipped,
-        output_budget_hit=output_budget_hit,
+    return _format_final_result(
+        pattern=pattern, raw_path=raw_path, matched_lines=matched_lines,
+        output_mode=output_mode, head_limit=head_limit, offset=offset,
         search_engine="python",
     )
 
 
-def _format_search_result(
-    *,
-    pattern: str,
-    raw_path: str,
-    matches: list[str],
-    total_matches: int,
-    truncated: bool,
-    content_clipped: bool,
-    output_budget_hit: bool,
-    search_engine: str,
-) -> ToolResult:
-    if total_matches == 0:
-        output = (
-            f"PATTERN: {pattern}\n"
-            f"ROOT: {raw_path}\n"
-            "TOTAL_MATCHES: 0\n"
-            "RETURNED_MATCHES: 0\n"
-            "TRUNCATED: no\n"
-            "CONTENT_CLIPPED: no\n"
-            "OUTPUT_BUDGET_HIT: no\n"
-            f"SEARCH_ENGINE: {search_engine}\n\n"
-            "没有找到匹配的内容。"
-        )
+# ── ripgrep 优先搜索 ──
+
+def _run_with_rg(
+    *, pattern: str, raw_path: str, target_path: Path, cwd: str,
+    output_mode: str, head_limit: int, offset: int,
+    case_insensitive: bool, glob_filter: str | None, show_line_numbers: bool,
+) -> ToolResult | None:
+    """使用 ripgrep 搜索；不可用时返回 None 让调用方回退 Python 扫描。"""
+    args = ["rg", "--hidden", "--no-heading", "--color", "never", "--no-messages"]
+
+    # 排除 VCS 和内部上下文目录
+    for vcs_dir in [".git", ".svn", ".hg"]:
+        args.extend(["--glob", f"!{vcs_dir}"])
+    for exc in _RG_EXCLUDE_GLOBS:
+        args.extend(["--glob", exc])
+
+    # 大小写不敏感
+    if case_insensitive:
+        args.append("-i")
+
+    # 输出模式（对齐 Claude Code GrepTool）
+    if output_mode == "files_with_matches":
+        args.append("-l")
+    elif output_mode == "count":
+        args.append("-c")
+    elif output_mode == "content" and show_line_numbers:
+        args.append("-n")
+
+    # glob 过滤
+    if glob_filter:
+        for g in glob_filter.replace(",", " ").split():
+            if g.strip():
+                args.extend(["--glob", g.strip()])
+
+    # 限制列宽，避免 base64/压缩 js 污染结果
+    args.extend(["--max-columns", "500"])
+
+    # 确保 pattern 不以 - 开头导致 rg 把它当成选项
+    if pattern.startswith("-"):
+        args.extend(["-e", pattern, raw_path])
     else:
-        header_lines = [
-            f"PATTERN: {pattern}",
-            f"ROOT: {raw_path}",
-            f"TOTAL_MATCHES: {total_matches}",
-            f"RETURNED_MATCHES: {len(matches)}",
-            f"TRUNCATED: {'yes' if truncated else 'no'}",
-            f"CONTENT_CLIPPED: {'yes' if content_clipped else 'no'}",
-            f"OUTPUT_BUDGET_HIT: {'yes' if output_budget_hit else 'no'}",
-            f"SEARCH_ENGINE: {search_engine}",
-            "",
-        ]
-        output = "\n".join(header_lines + matches)
+        args.extend(["--", pattern, raw_path])
+
+    try:
+        result = subprocess.run(
+            args, cwd=cwd, text=True, capture_output=True,
+            timeout=15, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+    # rg: 0=有匹配, 1=无匹配, 2+=错误
+    if result.returncode not in {0, 1}:
+        return None
+
+    matched_lines: list[str] = []
+    for raw_line in result.stdout.splitlines():
+        if not raw_line.strip():
+            continue
+        line, _ = _normalize_rg_line(raw_line, target_path, cwd)
+        matched_lines.append(line)
+
+    return _format_final_result(
+        pattern=pattern, raw_path=raw_path, matched_lines=matched_lines,
+        output_mode=output_mode, head_limit=head_limit, offset=offset,
+        search_engine="rg",
+    )
+
+
+# ── Python 回退扫描 ──
+
+def _run_with_python_scan(
+    *, pattern: str, raw_path: str, target_path: Path,
+    output_mode: str, head_limit: int, offset: int,
+    case_insensitive: bool, show_line_numbers: bool,
+) -> ToolResult:
+    """Python 原生文件扫描回退方案（rg 不可用时使用）。"""
+    matched_lines: list[str] = []
+    search_pattern = pattern.lower() if case_insensitive else pattern
+
+    for file_path in target_path.rglob("*"):
+        if not file_path.is_file():
+            continue
+        # 跳过内部目录下的文件
+        if any(p.lower() in _BLOCKED_INTERNAL_DIRS for p in file_path.parts):
+            continue
+        try:
+            content = file_path.read_text(encoding="utf-8")
+        except Exception:
+            continue
+
+        rel_path = str(file_path.relative_to(target_path))
+        for line_num, line in enumerate(content.splitlines(), start=1):
+            target = line.lower() if case_insensitive else line
+            if search_pattern in target:
+                clipped, _ = _clip_match_line(line)
+                prefix = f"{rel_path}:{line_num}: " if show_line_numbers else f"{rel_path}: "
+                matched_lines.append(f"{prefix}{clipped}")
+
+    return _format_final_result(
+        pattern=pattern, raw_path=raw_path, matched_lines=matched_lines,
+        output_mode=output_mode, head_limit=head_limit, offset=offset,
+        search_engine="python",
+    )
+
+
+# ── 结果格式化 ──
+
+def _format_final_result(
+    *, pattern: str, raw_path: str, matched_lines: list[str],
+    output_mode: str, head_limit: int, offset: int, search_engine: str,
+) -> ToolResult:
+    """统一格式化搜索结果，应用 head_limit + offset 截断 + 字符预算保护。"""
+    total_matches = len(matched_lines)
+
+    # 统计匹配文件数（用于 files_with_matches 和 count 模式）
+    files_set: set[str] = set()
+    for line in matched_lines:
+        if ":" in line:
+            files_set.add(line.split(":", 1)[0])
+
+    # 应用 offset
+    if offset > 0 and offset < len(matched_lines):
+        matched_lines = matched_lines[offset:]
+
+    # 应用 head_limit（0 = 不限）
+    limited = False
+    if head_limit > 0 and len(matched_lines) > head_limit:
+        matched_lines = matched_lines[:head_limit]
+        limited = True
+
+    # 构建输出头
+    lines_after = len(matched_lines)
+    header_parts = [
+        f"PATTERN: {pattern}",
+        f"ROOT: {raw_path}",
+        f"MODE: {output_mode}",
+        f"TOTAL_MATCHES: {total_matches}",
+        f"RETURNED: {lines_after}",
+        f"ENGINE: {search_engine}",
+    ]
+    if limited:
+        header_parts.append(f"(head_limit={head_limit}, offset={offset})")
+    header = "\n".join(header_parts) + "\n\n"
+
+    # 字符预算保护
+    output_chars = len(header)
+    result_lines: list[str] = []
+    truncated = limited
+    for line in matched_lines:
+        proj = output_chars + len(line) + 1
+        if proj > MAX_OUTPUT_CHARS and result_lines:
+            truncated = True
+            break
+        result_lines.append(line)
+        output_chars = proj
+
+    output = header + "\n".join(result_lines)
+    if truncated:
+        output += "\n\n(结果已截断，缩小搜索范围可获取更多结果)"
 
     return ToolResult(
         ok=True,
@@ -350,95 +358,48 @@ def _format_search_result(
             "pattern": pattern,
             "search_root": raw_path,
             "total_matches": total_matches,
-            "returned_matches": len(matches),
+            "returned_matches": lines_after,
             "truncated": truncated,
-            "content_clipped": content_clipped,
-            "output_budget_hit": output_budget_hit,
+            "output_mode": output_mode,
+            "num_files": len(files_set),
             "search_engine": search_engine,
         },
     )
 
 
-def _parse_rg_count_output(output: str) -> int:
-    total = 0
-    for line in output.splitlines():
-        try:
-            total += int(line.rsplit(":", 1)[-1])
-        except ValueError:
-            continue
-    return total
+# ── 辅助函数 ──
 
-
-def _normalize_rg_match_line(raw_line: str, *, target_path: Path, cwd: str) -> tuple[str, bool]:
-    path_part, line_num, line = _split_rg_match_line(raw_line)
-    display_path = _to_target_relative_rg_path(path_part, target_path=target_path, cwd=cwd)
-    clipped_line, line_was_clipped = _clip_match_line(line)
-    return f"{display_path}:{line_num}: {clipped_line}", line_was_clipped
-
-
-def _split_rg_match_line(raw_line: str) -> tuple[str, str, str]:
-    first_separator = raw_line.find(":")
-    if first_separator < 0:
-        return raw_line, "1", ""
-    second_separator = raw_line.find(":", first_separator + 1)
-    if second_separator < 0:
-        return raw_line[:first_separator], "1", raw_line[first_separator + 1 :]
-    return (
-        raw_line[:first_separator],
-        raw_line[first_separator + 1 : second_separator],
-        raw_line[second_separator + 1 :],
-    )
-
-
-def _to_target_relative_rg_path(path_text: str, *, target_path: Path, cwd: str) -> str:
-    rg_path = Path(path_text)
+def _normalize_rg_line(raw_line: str, target_path: Path, cwd: str) -> tuple[str, bool]:
+    """把 ripgrep 输出的绝对路径转为相对于搜索根目录的路径。"""
+    if ":" not in raw_line:
+        return raw_line, False
+    path_part, rest = raw_line.split(":", 1)
+    rg_path = Path(path_part)
     if not rg_path.is_absolute():
         rg_path = Path(cwd) / rg_path
     try:
-        return rg_path.resolve().relative_to(target_path.resolve()).as_posix()
+        display = rg_path.resolve().relative_to(target_path.resolve()).as_posix()
     except ValueError:
-        return path_text.replace("\\", "/")
-
-
-def _to_workspace_relative_path(target_path: Path, cwd: str) -> str:
-    """把绝对路径转成工作区相对路径，便于统一做目录策略判断。"""
-    workspace_root = Path(cwd).resolve()
-    try:
-        relative_path = target_path.resolve().relative_to(workspace_root)
-    except ValueError:
-        return target_path.resolve().as_posix()
-    return relative_path.as_posix()
-
-
-def _match_blocked_internal_path(relative_path: str) -> str | None:
-    """判断 grep 根目录是否命中了内部上下文目录。"""
-    normalized = relative_path.replace("\\", "/").lstrip("./")
-    if not normalized:
-        return None
-
-    first_part = normalized.split("/", 1)[0].lower()
-    if first_part in _BLOCKED_INTERNAL_DIRS:
-        return "这是内部上下文目录，默认不作为全文搜索入口。"
-    return None
-
-
-def _contains_internal_context_part(relative_path: Path) -> bool:
-    """判断递归到的文件是否位于内部上下文目录下。"""
-    return any(part.lower() in _BLOCKED_INTERNAL_DIRS for part in relative_path.parts)
+        display = path_part.replace("\\", "/")
+    return f"{display}:{rest}", False
 
 
 def _clip_match_line(line: str) -> tuple[str, bool]:
-    """裁剪超长命中行，避免单条大日志直接撑爆搜索结果。"""
+    """裁剪超长命中行，避免单行大日志直接撑爆搜索结果。"""
     if len(line) <= MAX_MATCH_LINE_CHARS:
         return line, False
-
     keep = max(80, MAX_MATCH_LINE_CHARS - 18)
     return f"{line[:keep]} ...[单行已截断]", True
 
 
+# ── 注册工具 ──
 grep_files_tool = ToolDefinition(
     name="grep_files",
-    description="在指定目录中搜索包含目标文本的文件内容，并显式返回命中统计。",
+    description=(
+        "在文件内容中搜索正则表达式匹配。"
+        "支持目录和单文件、glob 文件过滤、三种输出模式（content/files_with_matches/count），"
+        "支持 head_limit + offset 分页和 -i 大小写不敏感。"
+    ),
     validator=_validate,
     runner=_run,
     input_schema={
@@ -446,15 +407,36 @@ grep_files_tool = ToolDefinition(
         "properties": {
             "pattern": {
                 "type": "string",
-                "description": "要搜索的文本内容，必填。",
+                "description": "要搜索的正则表达式模式。",
             },
             "path": {
                 "type": "string",
-                "description": "要搜索的目录路径，选填，默认为当前目录。",
+                "description": "要搜索的文件或目录路径。默认当前工作目录。支持指向单个文件。",
             },
-            "max_matches": {
+            "glob": {
+                "type": "string",
+                "description": "glob 模式过滤文件名，例如 '*.py' 或 '*.{ts,tsx}'（映射为 rg --glob）。",
+            },
+            "output_mode": {
+                "type": "string",
+                "enum": ["content", "files_with_matches", "count"],
+                "description": "输出模式：content 显示匹配行，files_with_matches 只显示文件路径，count 显示匹配计数。默认 files_with_matches。",
+            },
+            "head_limit": {
                 "type": "integer",
-                "description": f"最多返回多少条匹配，默认 {DEFAULT_MAX_MATCHES}，最大 {MAX_MAX_MATCHES}。",
+                "description": f"最多返回多少条结果，相当于 '| head -N'。默认 {DEFAULT_HEAD_LIMIT}，设为 0 表示不限。",
+            },
+            "offset": {
+                "type": "integer",
+                "description": "跳过前 N 条结果，相当于 '| tail -n +N'。默认 0。",
+            },
+            "-i": {
+                "type": "boolean",
+                "description": "大小写不敏感搜索（rg -i）。默认 false。",
+            },
+            "-n": {
+                "type": "boolean",
+                "description": "显示行号（rg -n）。仅在 output_mode=content 时有效。默认 true。",
             },
         },
         "required": ["pattern"],
