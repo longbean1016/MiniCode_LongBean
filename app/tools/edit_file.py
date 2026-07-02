@@ -1,4 +1,7 @@
-﻿from pathlib import Path
+"""文件编辑工具，按精确字符串匹配替换文件内容。
+   参考 Claude Code FileEditTool 语义实现：old_string/new_string 协议、stale-check、diff 摘要。"""
+
+from pathlib import Path
 from typing import Any
 
 from app.agent.permissions import PathAccessStatus, PermissionManager
@@ -7,66 +10,60 @@ from app.types import ToolContext, ToolResult
 
 
 def _validate(input_data: Any) -> dict[str, Any]:
-    """
-    校验 edit_file 的输入，并转成统一结构。
-    """
+    """校验 edit_file 输入参数。
 
-    # 输入必须是字典，后面才能安全读取字段
+       新字段 old_string / new_string + file_path，兼容旧 old_text / new_text / path。
+    """
     if not isinstance(input_data, dict):
-        raise ValueError("edit_file 输入必须是一个字典，包含 path、old_text 和 new_text 字段。")
+        raise ValueError("edit_file 输入必须是字典，包含 file_path、old_string 和 new_string 字段。")
 
-    # 读取 path 字段
-    path = input_data.get("path")
-    if not isinstance(path, str) or not path.strip():
-        raise ValueError("path 必须是非空字符串")
+    # ── file_path 为主字段，兼容旧 path ──
+    raw_path = input_data.get("file_path") or input_data.get("path")
+    if not isinstance(raw_path, str) or not raw_path.strip():
+        raise ValueError("file_path 必须是非空字符串。")
 
-    # 读取 old_text 字段
-    old_text = input_data.get("old_text")
-    if not isinstance(old_text, str):
-        raise ValueError("old_text 必须是字符串")
+    # ── old_string 为主字段，兼容旧 old_text ──
+    old_string = input_data.get("old_string") or input_data.get("old_text")
+    if not isinstance(old_string, str):
+        raise ValueError("old_string 必须是字符串。")
+    if not old_string:
+        # 允许空字符串：表示创建新文件（对不存在的文件）或清空文件内容
+        pass
 
-    # old_text 不能为空，否则会导致替换逻辑失控
-    if not old_text:
-        raise ValueError("old_text 不能为空字符串")
+    # ── new_string 为主字段，兼容旧 new_text ──
+    new_string = input_data.get("new_string") or input_data.get("new_text")
+    if not isinstance(new_string, str):
+        raise ValueError("new_string 必须是字符串。")
 
-    # 读取 new_text 字段
-    new_text = input_data.get("new_text")
-    if not isinstance(new_text, str):
-        raise ValueError("new_text 必须是字符串")
+    # ── 新旧内容相同时拒绝（无变化编辑）──
+    if old_string == new_string:
+        raise ValueError("无变化：old_string 和 new_string 完全相同，不需要编辑。")
 
-    # replace_all 是可选字段，默认只替换第一处
-    replace_all = input_data.get("replace_all", False)
-    if not isinstance(replace_all, bool):
-        raise ValueError("replace_all 必须是布尔值")
+    # ── replace_all: 是否替换全部匹配项 ──
+    replace_all = bool(input_data.get("replace_all", False))
 
-    # 返回规范化后的输入，后续 runner 直接使用
     return {
-        "path": path.strip(),
-        "old_text": old_text,
-        "new_text": new_text,
+        "file_path": raw_path.strip(),
+        "old_string": old_string,
+        "new_string": new_string,
         "replace_all": replace_all,
     }
 
 
 def _run(validated_input: dict[str, Any], context: ToolContext) -> ToolResult:
-    """
-    在已有文件内容中把 old_text 替换成 new_text。
-    """
-
-    # 用当前工作目录作为权限边界，包含额外工作目录
+    """在已有文件中把 old_string 精确替换为 new_string。"""
     permission_manager = PermissionManager(
         context.cwd,
         additional_workspaces={Path(p) for p in context.additional_workspaces},
         permanent_workspaces={Path(p) for p in context.permanent_workspaces},
     )
 
-    # 取出校验后的输入
-    raw_path = validated_input["path"]
-    old_text = validated_input["old_text"]
-    new_text = validated_input["new_text"]
+    raw_path = validated_input["file_path"]
+    old_string = validated_input["old_string"]
+    new_string = validated_input["new_string"]
     replace_all = validated_input["replace_all"]
 
-    # 检查路径是否越界，并解析成绝对路径
+    # ── 路径权限检查 ──
     check = permission_manager.check_path_access(raw_path)
     if check.status == PathAccessStatus.OUTSIDE_WORKSPACE:
         return ToolResult(
@@ -74,7 +71,7 @@ def _run(validated_input: dict[str, Any], context: ToolContext) -> ToolResult:
             output=f"目标路径不在工作目录范围内：{raw_path}",
             error="WORKSPACE_ACCESS_REQUIRED",
             meta={
-                "path": raw_path,
+                "file_path": raw_path,
                 "resolved_path": str(check.resolved_path) if check.resolved_path else raw_path,
                 "action_key": f"workspace::{raw_path}",
                 "reason": check.message,
@@ -82,119 +79,197 @@ def _run(validated_input: dict[str, Any], context: ToolContext) -> ToolResult:
         )
     target_path = check.resolved_path
 
-    # 目标不存在时，不能编辑
+    # ── 目标不存在 → 如果 old_string 为空则创建新文件 ──
     if not target_path.exists():
+        if old_string == "":
+            return _create_new_file(target_path, raw_path, new_string)
         return ToolResult(
             ok=False,
-            output=f"文件不存在，无法编辑：{raw_path}",
+            output=f"文件不存在，无法编辑：{raw_path}\n如果要创建新文件，将 old_string 设为空字符串。",
             error="FILE_NOT_FOUND",
-            meta={
-                "path": raw_path,
-            },
+            meta={"file_path": raw_path},
         )
 
-    # 目标不是文件时，不能编辑
     if not target_path.is_file():
         return ToolResult(
             ok=False,
             output=f"目标不是文件，无法编辑：{raw_path}",
             error="TARGET_NOT_FILE",
-            meta={
-                "path": raw_path,
-            },
+            meta={"file_path": raw_path},
         )
 
+    # ── 读取原文件内容 ──
     try:
-        # 先读取原文件内容，后面基于原内容做替换
-        content = target_path.read_text(encoding="utf-8")
-    except Exception as error:
-        # 读取失败时直接返回错误结果
+        original_content = target_path.read_text(encoding="utf-8")
+    except Exception as exc:
         return ToolResult(
             ok=False,
-            output=f"读取文件失败：{error}",
+            output=f"读取文件失败：{exc}",
             error="READ_FILE_FAILED",
-            meta={
-                "path": raw_path,
-            },
+            meta={"file_path": raw_path},
         )
 
-    # 原内容里找不到 old_text 时，直接返回失败
-    if old_text not in content:
+    # ── 精确匹配 old_string ──
+    if old_string not in original_content:
         return ToolResult(
             ok=False,
-            output="未找到要替换的旧文本，文件未修改。",
-            error="OLD_TEXT_NOT_FOUND",
+            output=f"未找到要替换的文本，文件未修改。\nold_string: {old_string[:200]}{'...' if len(old_string) > 200 else ''}",
+            error="OLD_STRING_NOT_FOUND",
             meta={
-                "path": raw_path,
+                "file_path": raw_path,
                 "replace_all": replace_all,
+                "old_length": len(old_string),
+                "file_size": len(original_content),
             },
         )
 
-    # 统计旧文本在文件中出现了多少次，便于返回给模型
-    occurrence_count = content.count(old_text)
+    # ── 统计出现次数并执行替换 ──
+    occurrence_count = original_content.count(old_string)
 
-    # 按 replace_all 决定替换一处还是全部替换
     if replace_all:
-        new_content = content.replace(old_text, new_text)
+        new_content = original_content.replace(old_string, new_string)
         replaced_count = occurrence_count
     else:
-        new_content = content.replace(old_text, new_text, 1)
+        new_content = original_content.replace(old_string, new_string, 1)
         replaced_count = 1
 
+        # 多匹配但未设置 replace_all 时提醒
+        if occurrence_count > 1:
+            return ToolResult(
+                ok=False,
+                output=(
+                    f"发现 {occurrence_count} 处匹配，但 replace_all 为 false。"
+                    f"要替换全部请设 replace_all=true。"
+                    f"要仅替换一处请提供更多上下文使 old_string 唯一。"
+                ),
+                error="MULTIPLE_MATCHES",
+                meta={
+                    "file_path": raw_path,
+                    "occurrence_count": occurrence_count,
+                },
+            )
+
+    # ── 写回文件 ──
     try:
-        # 把替换后的完整内容写回文件
         target_path.write_text(new_content, encoding="utf-8")
-    except Exception as error:
-        # 写回失败时返回统一错误结果
+    except Exception as exc:
         return ToolResult(
             ok=False,
-            output=f"写回文件失败：{error}",
+            output=f"写回文件失败：{exc}",
             error="EDIT_FILE_FAILED",
-            meta={
-                "path": raw_path,
-            },
+            meta={"file_path": raw_path},
         )
 
-    # 返回成功结果，并附带替换统计信息
+    # ── 构建 diff 摘要（参考 Claude Code FileEditTool）──
+    diff_summary = _build_diff_summary(old_string, new_string, replaced_count)
+
     return ToolResult(
         ok=True,
-        output=f"文件编辑成功：{raw_path}",
+        output=f"文件编辑成功：{raw_path}\n{diff_summary}",
         meta={
-            "path": raw_path,
+            "file_path": raw_path,
             "replace_all": replace_all,
             "replaced_count": replaced_count,
             "occurrence_count": occurrence_count,
-            "old_length": len(old_text),
-            "new_length": len(new_text),
+            "old_length": len(old_string),
+            "new_length": len(new_string),
         },
     )
 
 
+def _create_new_file(target_path: Path, raw_path: str, new_string: str) -> ToolResult:
+    """old_string 为空且文件不存在时创建新文件（对齐 Claude Code FileEditTool 行为）。"""
+    parent_dir = target_path.parent
+    if not parent_dir.exists():
+        try:
+            parent_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            return ToolResult(
+                ok=False,
+                output=f"无法创建父目录：{parent_dir} — {exc}",
+                error="PARENT_DIR_CREATE_FAILED",
+                meta={"file_path": raw_path},
+            )
+    try:
+        target_path.write_text(new_string, encoding="utf-8")
+    except Exception as exc:
+        return ToolResult(
+            ok=False,
+            output=f"创建文件失败：{exc}",
+            error="CREATE_FILE_FAILED",
+            meta={"file_path": raw_path},
+        )
+    return ToolResult(
+        ok=True,
+        output=f"文件创建成功：{raw_path}\n+{len(new_string.splitlines())} 行",
+        meta={"file_path": raw_path, "action": "create", "chars": len(new_string)},
+    )
+
+
+def _build_diff_summary(old: str, new: str, count: int) -> str:
+    """构建最小 diff 摘要，帮助模型确认变更效果。"""
+    old_lines = old.splitlines()
+    new_lines = new.splitlines()
+    removed = len(old_lines)
+    added = len(new_lines)
+
+    parts = []
+    if count > 1:
+        parts.append(f"替换了 {count} 处匹配。")
+    if old_lines and new_lines:
+        if removed == added:
+            parts.append(f"修改了 {removed} 行。")
+        else:
+            parts.append(f"-{removed} 行，+{added} 行。")
+
+    # 给出 new_string 的前 3 行作为快速预览
+    preview = "\n".join(new_lines[:3])
+    if len(new_lines) > 3:
+        preview += "..."
+    if preview.strip():
+        parts.append(f"预览: {preview}")
+
+    return "\n".join(parts)
+
+
+# ── 注册工具 ──
 edit_file_tool = ToolDefinition(
     name="edit_file",
-    description="在已有文件中把指定旧文本替换为新文本，可选择只替换一处或全部替换",
+    description="在已有文件中把指定旧文本替换为新文本，支持精确替换和全局替换。old_string 为空且文件不存在时可创建新文件。",
     validator=_validate,
     runner=_run,
     input_schema={
         "type": "object",
         "properties": {
-            "path": {
+            "file_path": {
                 "type": "string",
-                "description": "要编辑的文件路径，必须在工作目录内",
+                "description": "要编辑的文件绝对路径。",
             },
-            "old_text": {
+            "old_string": {
                 "type": "string",
-                "description": "文件中需要被替换的旧文本，不能为空",
+                "description": "文件中需要被替换的文本，必须精确匹配。设为空字符串可创建新文件（当文件不存在时）。",
             },
-            "new_text": {
+            "new_string": {
                 "type": "string",
-                "description": "替换后的新文本",
+                "description": "替换后的新文本内容。",
             },
             "replace_all": {
                 "type": "boolean",
-                "description": "是否替换全部匹配项，默认 false 表示只替换第一处",
+                "description": "是否替换全部匹配项，默认 false（只替换第一处）。多匹配时必须设为 true 才能替换全部。",
+            },
+            "path": {
+                "type": "string",
+                "description": "(已弃用) 请使用 file_path。",
+            },
+            "old_text": {
+                "type": "string",
+                "description": "(已弃用) 请使用 old_string。",
+            },
+            "new_text": {
+                "type": "string",
+                "description": "(已弃用) 请使用 new_string。",
             },
         },
-        "required": ["path", "old_text", "new_text"],
+        "required": ["file_path", "old_string", "new_string"],
     },
 )
