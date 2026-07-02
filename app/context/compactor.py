@@ -46,11 +46,6 @@ class CompactionResult:
     dropped_progress_messages: int = 0
     priority_dropped_messages: int = 0
     tokens_freed_estimate: int = 0
-    # microcompact 清正文之前会尝试用轻量模型承接关键语义，
-    # 这里按 working memory 的槽位拆开，避免后续再靠规则猜测含义。
-    carried_tool_findings: list[str] = field(default_factory=list)
-    carried_open_issues: list[str] = field(default_factory=list)
-    carried_key_decisions: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -262,37 +257,6 @@ def _dedupe_consecutive_assistant_messages(
         result.deduped_assistant_messages += duplicate_end - index
         index = duplicate_end + 1
     return output
-
-
-def _build_tool_call_input_by_id(compacted: list[ChatMessage]) -> dict[str, object]:
-    """按 tool_use_id 找回原始 tool_call input，供 microcompact 模型理解工具上下文。"""
-    mapping: dict[str, object] = {}
-    for message in compacted:
-        if message.get("role") != "assistant_tool_call":
-            continue
-        tool_use_id = str(message.get("tool_use_id", "")).strip()
-        if not tool_use_id:
-            continue
-        mapping[tool_use_id] = message.get("input", {})
-    return mapping
-
-
-def _normalize_extracted_lines(raw_value: object, key: str) -> list[str]:
-    """清洗轻量模型返回的结构化数组，保证后续 WM 写入只处理非空短文本。"""
-    if not isinstance(raw_value, dict):
-        return []
-    raw_lines = raw_value.get(key, [])
-    if not isinstance(raw_lines, list):
-        return []
-    lines: list[str] = []
-    seen: set[str] = set()
-    for item in raw_lines:
-        line = " ".join(str(item).strip().split())
-        if not line or line in seen:
-            continue
-        seen.add(line)
-        lines.append(line)
-    return lines
 
 
 def _is_already_microcompacted_tool_result(message: ChatMessage) -> bool:
