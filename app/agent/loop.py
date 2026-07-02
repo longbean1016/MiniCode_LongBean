@@ -1008,21 +1008,163 @@ def stream_agent(
                     pending_user_nudge = _build_analysis_convergence_nudge(analysis_tracker)
                 continue
 
-            # 逐个执行工具
+            # ── 并行执行工具（对标 Claude Code isConcurrencySafe）──
+            # 将工具按并发安全性分类：只读工具可并行，写工具必须串行
+            # 并发安全的工具集合（对标 Claude Code 各工具的 isConcurrencySafe 返回值）
+            _CONCURRENCY_SAFE = {
+                "read_file", "grep_files", "glob_files",
+                "web_search", "web_fetch", "ask_user", "agent_dispatch",
+                "memory",
+            }
+            parallel_calls: list[dict] = []
+            sequential_calls: list[dict] = []
+
             for call in calls:
+                tool_name = call["tool_name"]
+                if tool_name in _CONCURRENCY_SAFE:
+                    parallel_calls.append(call)
+                elif tool_name == "run_command":
+                    # run_command 按命令风险分级：只读命令可并行，写/高风险命令串行
+                    raw_cmd = str(call.get("input", {}).get("command", ""))
+                    if raw_cmd:
+                        from app.permissions.command_safety import classify_command_risk
+                        risk = classify_command_risk(raw_cmd)
+                        if risk == "read_only":
+                            parallel_calls.append(call)
+                        else:
+                            sequential_calls.append(call)
+                    else:
+                        sequential_calls.append(call)
+                else:
+                    # edit_file / write_file 等写工具必须串行，避免文件冲突
+                    sequential_calls.append(call)
+
+            # 所有工具调用统一写入消息历史（保持协议顺序）
+            for call in calls:
+                builder.add_tool_call(
+                    tool_use_id=call["id"],
+                    tool_name=call["tool_name"],
+                    input_data=call["input"],
+                )
+
+            # ── 阶段1：线程池并发执行只读工具 ──
+            if parallel_calls:
+                from concurrent.futures import ThreadPoolExecutor, as_completed
+                # 通知 UI 所有并行工具开始执行
+                for call in parallel_calls:
+                    yield ToolRunningEvent(name=call["tool_name"])
+
+                # 并发提交所有只读工具到线程池
+                parallel_results: dict[int, ToolResult] = {}
+                with ThreadPoolExecutor(max_workers=min(8, len(parallel_calls))) as executor:
+                    future_to_idx = {}
+                    for idx, call in enumerate(parallel_calls):
+                        future = executor.submit(
+                            tool_registry.execute_tool,
+                            tool_name=call["tool_name"],
+                            input_data=call["input"],
+                            context=tool_context,
+                        )
+                        future_to_idx[future] = (idx, call)
+
+                    # 等所有工具完成
+                    for future in as_completed(future_to_idx):
+                        idx, call = future_to_idx[future]
+                        try:
+                            result = future.result()
+                        except Exception as tool_error:
+                            result = ToolResult(
+                                ok=False,
+                                output=f"工具调用发生未捕获异常: {tool_error}",
+                                error="UNCAUGHT_TOOL_ERROR",
+                                meta={"tool_name": call["tool_name"]},
+                            )
+                        parallel_results[idx] = result
+
+                # 按原始调用顺序处理结果（保证消息协议一致性）
+                for idx, call in enumerate(parallel_calls):
+                    result = parallel_results[idx]
+                    tool_name = call["tool_name"]
+                    tool_input = call["input"]
+                    tool_use_id = call["id"]
+
+                    log_event(
+                        f"[session={session_id or '-'}] 工具 {tool_name} "
+                        f"返回 ok={result.ok} error={result.error}",
+                        echo=False,
+                    )
+
+                    # 构建结果摘要并通知 UI
+                    raw = str(result.output).strip()
+                    preview = raw[:120].replace("\n", " ") + ("..." if len(raw) > 120 else "")
+                    summary = preview
+                    if result.error:
+                        summary += f"  错误 {result.error}"
+                    yield ToolResultEvent(name=tool_name, summary=summary, ok=result.ok)
+
+                    # 分析护栏和探索历史记录
+                    if analysis_tracker is not None:
+                        _record_analysis_evidence(
+                            analysis_tracker, tool_name=tool_name,
+                            tool_input=tool_input, result=result,
+                        )
+                    if _is_exploration_tool(tool_name):
+                        tool_target = _extract_tool_target(tool_input)
+                        exploration_history.append((tool_name, tool_target))
+
+                    # 权限检查：并行工具中如有需要授权的，中断流程
+                    if result.error == "PERMISSION_REQUIRED":
+                        command = str(result.meta.get("command", ""))
+                        reason = str(result.meta.get("reason", ""))
+                        action_key = str(result.meta.get("action_key", ""))
+                        suggestions = result.meta.get("suggestions")
+                        builder.add_tool_result(
+                            tool_use_id=tool_use_id, tool_name=tool_name,
+                            content="该操作需要用户授权，当前尚未执行。",
+                            is_error=True, meta=dict(result.meta),
+                        )
+                        approval_message = (
+                            "该操作需要用户授权。\n"
+                            f"工具: {tool_name}\n命令: {command}\n原因: {reason}"
+                        )
+                        if suggestions:
+                            approval_message += f"\n建议规则: {len(suggestions)} 条"
+                        approval_step = AgentStep(
+                            type="approval", content=approval_message,
+                            approval=ApprovalRequest(
+                                tool_name=tool_name, tool_use_id=tool_use_id,
+                                action_key=action_key, message=approval_message,
+                                input_data=tool_input, suggestions=suggestions,
+                            ),
+                        )
+                        yield ApprovalEvent(approval=approval_step.approval)
+                        yield DoneEvent(step=approval_step, history=builder.build())
+                        return
+
+                    # 将成功结果写入消息历史
+                    context_output = result.meta.get("context_output", result.output)
+                    if not isinstance(context_output, str) or not context_output.strip():
+                        context_output = result.output
+                    builder.add_tool_result(
+                        tool_use_id=tool_use_id, tool_name=tool_name,
+                        content=context_output, is_error=not result.ok,
+                        meta=dict(result.meta),
+                    )
+
+                    if not result.ok:
+                        log_event(
+                            f"[session={session_id or '-'}] 工具 {tool_name} 执行失败: {result.error}",
+                            echo=False,
+                        )
+
+            # ── 阶段2：串行执行写工具（edit_file/write_file/高风险命令等）──
+            for call in sequential_calls:
                 tool_name = call["tool_name"]
                 tool_input = call["input"]
                 tool_use_id = call["id"]
 
                 # 通知 UI：工具开始执行
                 yield ToolRunningEvent(name=tool_name)
-
-                # 把工具调用请求写入消息历史
-                builder.add_tool_call(
-                    tool_use_id=tool_use_id,
-                    tool_name=tool_name,
-                    input_data=tool_input,
-                )
 
                 # 执行工具
                 tool_started_at = time.perf_counter()
@@ -1053,8 +1195,7 @@ def stream_agent(
                     echo=False,
                 )
 
-                # 构造工具结果摘要，通知 UI（优先显示目标路径）
-                # 用实际内容的前 120 字符做摘要（对齐 replay_history 的显示逻辑）
+                # 构造工具结果摘要，通知 UI
                 raw = str(result.output).strip()
                 preview = raw[:120].replace("\n", " ") + ("..." if len(raw) > 120 else "")
                 summary = preview
@@ -1067,7 +1208,7 @@ def stream_agent(
                     ok=result.ok,
                 )
 
-                # ---- 分析护栏：记录观察到的文件/符号/行数 ----
+                # 分析护栏：记录观察到的文件/符号/行数
                 if analysis_tracker is not None:
                     _record_analysis_evidence(
                         analysis_tracker,
@@ -1086,7 +1227,7 @@ def stream_agent(
                     command = str(result.meta.get("command", ""))
                     reason = str(result.meta.get("reason", ""))
                     action_key = str(result.meta.get("action_key", ""))
-                    suggestions = result.meta.get("suggestions")  # 规则建议列表
+                    suggestions = result.meta.get("suggestions")
 
                     # 写入占位 tool_result，保证消息协议完整
                     builder.add_tool_result(
@@ -1097,7 +1238,7 @@ def stream_agent(
                         meta=dict(result.meta),
                     )
 
-                    # ── 构建审批消息（包含规则建议信息）──
+                    # 构建审批消息（包含规则建议信息）
                     approval_message = (
                         "该操作需要用户授权。\n"
                         f"工具: {tool_name}\n"
@@ -1164,7 +1305,7 @@ def stream_agent(
                     yield DoneEvent(step=approval_step, history=builder.build())
                     return
 
-                # 正常情况：把工具结果写回消息历史
+                # 把成功工具结果写入消息历史
                 context_output = result.meta.get("context_output", result.output)
                 if not isinstance(context_output, str) or not context_output.strip():
                     context_output = result.output
