@@ -600,7 +600,7 @@ def _record_analysis_evidence(
     observed_step_types.update(extracted_step_types)
     if target and line_count is not None:
         observed_file_line_counts[target] = line_count
-    if target and tool_name in {"file_overview", "get_ast_info"} and extracted_functions:
+    if target and tool_name in {"read_file", "grep_files"} and extracted_functions:
         observed_file_function_counts[target] = len(extracted_functions)
 
     if tool_name == "read_file" and result.ok and target:
@@ -732,7 +732,7 @@ def _should_block_redundant_analysis_calls(
         raw_target = tool_input.get("path")
         target = _normalize_target(raw_target) if isinstance(raw_target, str) and raw_target.strip() else ""
 
-        if tool_name == "file_overview" and target and target in overview_paths:
+        if tool_name == "read_file" and target and target in overview_paths:
             redundant_calls += 1
             continue
 
@@ -760,13 +760,7 @@ def _should_block_redundant_analysis_calls(
                     redundant_calls += 1
                     continue
 
-        if tool_name == "find_references":
-            symbol = tool_input.get("symbol")
-            if isinstance(symbol, str) and symbol.strip() in reference_symbols:
-                redundant_calls += 1
-                continue
-
-        if tool_name == "grep_files" and target and target in invalid_grep_file_paths:
+        if tool_name == "grep_files":
             redundant_calls += 1
 
     if remaining_steps <= 1:
@@ -798,11 +792,11 @@ def _build_analysis_convergence_nudge(tracker: dict[str, object]) -> str:
 
     overview_paths = list(tracker["overview_paths"])
     if overview_paths:
-        evidence_lines.append(f"已获取 file_overview: {', '.join(sorted(overview_paths)[:2])}")
+        evidence_lines.append(f"已获取 read_file 覆盖: {', '.join(sorted(overview_paths)[:2])}")
 
     reference_symbols = list(tracker["reference_symbols"])
     if reference_symbols:
-        evidence_lines.append(f"已获取 find_references: {', '.join(sorted(reference_symbols)[:3])}")
+        evidence_lines.append(f"已获取 grep_files 引用: {', '.join(sorted(reference_symbols)[:3])}")
 
     observed_functions = [
         symbol

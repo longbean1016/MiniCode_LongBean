@@ -53,15 +53,11 @@ NUDGE_AFTER_TOOL_RESULT = (
     "你已经拿到了工具结果。请先判断现有证据是否已经足够："
     "足够就直接给最终答案；不够才继续一次最必要的工具调用。不要重复刚看到的内容。"
 )
+# 探索类工具名称集合（对齐新 8 核心工具集）
 EXPLORATION_TOOL_NAMES = {
     "read_file",
-    "file_overview",
-    "find_symbols",
-    "find_references",
-    "locate_symbol",
-    "get_ast_info",
-    "list_files",
     "grep_files",
+    "glob_files",
 }
 
 
@@ -509,7 +505,7 @@ def _run_agent_loop(
                 and _should_redirect_analysis_to_structure_first(analysis_tracker, step.calls)
             ):
                 # 链路分析早期如果一上来就 read_file，很容易在半截源码上脑补流程。
-                # 先强制拿一份 file_overview / AST / symbol 级结构，再决定读哪一段源码。
+                # 先强制拿一份 grep_files / glob_files 级结构，再决定读哪一段源码。
                 pending_user_nudge = NUDGE_ANALYSIS_TOOL_PRIORITY + "\n" + NUDGE_ANALYSIS_STRUCTURE_FIRST
                 log_event(
                     f"[session={session_id or '-'}] 第 {step_index + 1} 轮检测到分析任务过早直接 read_file，要求先获取结构化证据"
@@ -1186,7 +1182,7 @@ def stream_agent(
             # ---- 分析护栏：事实校验 ----
             # 对代码分析类回答做最后一层检查：
             # 1. 证据是否足够（至少读过目标文件、观察到过关键符号）
-            # 2. 回答中是否引用了未经 read_file/find_symbols 确认的函数名
+            # 2. 回答中是否引用了未经 read_file/grep_files 确认的函数名
             # 3. 是否有无事实依据的分析断言
             if (
                 analysis_tracker is not None

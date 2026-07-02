@@ -11,9 +11,9 @@ from app.context.manager import estimate_messages_tokens
 from app.types import ChatMessage
 
 # 这里只对 read_file 做"路径 + 完整内容 hash"的精确去重；
-# list_files / grep_files 更像集合结果，直接复用同一规则容易误伤。
+# glob_files / grep_files 更像集合结果，直接复用同一规则容易误伤。
 _READ_TOOLS = {"read_file"}
-_COLLECTION_TOOLS = {"list_files", "grep_files"}
+_COLLECTION_TOOLS = {"glob_files", "grep_files"}
 _READ_FILE_PATH_PATTERN = re.compile(r"^FILE:\s*(.+)$", re.MULTILINE)
 _MICROCOMPACT_MARKER_PREFIX = "[旧 tool_result 内容已由 microcompact 清理]"
 _EMPTY_SUCCESS_TOOL_RESULT_MARKER = "[工具执行成功，内容无额外信息]"
@@ -615,7 +615,7 @@ def _normalize_read_path(path: str) -> str:
 
 
 def _build_collection_dedupe_identity(*, tool_name: str, content: str) -> tuple[str, str] | None:
-    """给 list_files / grep_files 生成轻量语义去重标识。"""
+    """给 glob_files / grep_files 生成轻量语义去重标识。"""
     lines = [line.strip() for line in content.splitlines() if line.strip()]
     if not lines:
         return None

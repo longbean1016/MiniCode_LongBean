@@ -912,7 +912,7 @@ def _count_repeated_scan_results(messages: list[ChatMessage]) -> int:
         if message.get("role") != "tool_result":
             continue
         tool_name = str(message.get("tool_name", "")).strip()
-        if tool_name not in {"list_files", "grep_files", "read_file"}:
+        if tool_name not in {"glob_files", "grep_files", "read_file"}:
             continue
         content = str(message.get("content", "")).strip().lower()
         signature = (tool_name, _limit_summary_text(content, 120))
