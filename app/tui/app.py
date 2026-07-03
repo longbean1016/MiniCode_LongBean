@@ -126,8 +126,10 @@ class MiniCodeApp(App):
         # 注入异步结果回调: MCP 后台线程完成后通过 call_from_thread 安全更新 UI
         if mcp_manager is not None:
             mcp_manager.set_result_callback(self._on_mcp_async_result)
-        # 从 session 初始化消息历史
-        self._history = list(session.messages) if session else []
+        # 从 session 初始化消息历史，清理残缺的 tool_call/tool_result 对
+        raw_history = list(session.messages) if session else []
+        from app.context.message_safety import normalize_tool_call_pairs
+        self._history = normalize_tool_call_pairs(raw_history)
         # 待处理的审批请求（ApprovalEvent 到达后暂存，等待用户 y/n）
         self._pending_approval = None
         # Ctrl+C 退出防误触：记录上一次按下的时间戳
@@ -351,9 +353,10 @@ class MiniCodeApp(App):
 
             if permanent:
                 self._tool_context.permanent_workspaces.add(workspace_path)
-                self._save_permanent_workspace(workspace_path)
             else:
                 self._tool_context.additional_workspaces.add(workspace_path)
+            # 持久化到 ~/.bean/settings.json，下次启动自动加载
+            self._save_workspace_to_settings(workspace_path)
 
             label = "永久" if permanent else "会话级"
             self.conversation.add_system_info(
@@ -389,6 +392,22 @@ class MiniCodeApp(App):
         )
         self._pending_approval = None
         self._run_agent_stream(None)
+
+    @staticmethod
+    def _save_workspace_to_settings(workspace_path: str) -> None:
+        """将授权的工作目录持久化到 ~/.bean/settings.json。"""
+        from app.infra.user_config import load_user_config, save_user_config
+        try:
+            config = load_user_config()
+            workspaces = config.raw.get("workspaces", [])
+            if not isinstance(workspaces, list):
+                workspaces = []
+            if workspace_path not in workspaces:
+                workspaces.append(workspace_path)
+            config.raw["workspaces"] = workspaces
+            save_user_config(config)
+        except Exception:
+            pass
 
     @staticmethod
     def _save_permanent_workspace(workspace_path: str) -> None:

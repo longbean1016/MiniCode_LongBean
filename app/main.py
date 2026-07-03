@@ -144,9 +144,18 @@ def main() -> None:
     )  # type: ignore[arg-type]
     print(f"[STARTUP] model adapter: {time.time() - _t:.1f}s")
 
+    # ── 加载已授权的额外工作目录 ──
+    from app.infra.user_config import load_user_config
+    user_cfg = load_user_config()
+    saved_workspaces = user_cfg.raw.get("workspaces", [])
+    if isinstance(saved_workspaces, list):
+        additional_dirs = set(config.workspace_additional_dirs) | {str(w) for w in saved_workspaces}
+    else:
+        additional_dirs = set(config.workspace_additional_dirs)
+
     tool_context = ToolContext(
         cwd=config.workspace_root,
-        permanent_workspaces=set(config.workspace_additional_dirs),
+        permanent_workspaces=additional_dirs,
     )
 
     # 新版 Hermes 风格 MemoryStore：MEMORY.md + USER.md，Markdown 列表格式
