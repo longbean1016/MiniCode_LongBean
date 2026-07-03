@@ -1137,6 +1137,17 @@ def stream_agent(
                                 input_data=tool_input, suggestions=suggestions,
                             ),
                         )
+                        # 为其他已完成的并行工具补占位 tool_result，保证消息协议完整
+                        for _j, _oc in enumerate(parallel_calls):
+                            if _j == idx:
+                                continue
+                            _r = parallel_results.get(_j)
+                            if _r is not None:
+                                builder.add_tool_result(
+                                    tool_use_id=_oc["id"], tool_name=_oc["tool_name"],
+                                    content=str(_r.output), is_error=not _r.ok,
+                                    meta=dict(_r.meta),
+                                )
                         yield ApprovalEvent(approval=approval_step.approval)
                         yield DoneEvent(step=approval_step, history=builder.build())
                         return
