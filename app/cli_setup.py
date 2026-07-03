@@ -10,7 +10,7 @@ from app.infra.user_config import ensure_user_config, save_user_config
 def run_cli_setup() -> None:
     """命令行配置向导：三步输入 API Key → Base URL → 模型选择。"""
     print()
-    print("  MiniCode 首次配置")
+    print("  BeanCode 首次配置")
     print("  ────────────────")
     print()
 

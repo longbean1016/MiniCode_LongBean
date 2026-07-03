@@ -27,7 +27,7 @@ from app.types import AgentStep, ChatMessage, ToolContext
 def _build_arg_parser() -> argparse.ArgumentParser:
     """构建命令行参数解析器。"""
     parser = argparse.ArgumentParser(
-        description="LongBean MiniCode Agent",
+        description="LongBean BeanCode Agent",
     )
 
     # 显式指定某个 session_id 恢复会话

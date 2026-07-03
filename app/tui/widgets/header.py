@@ -47,10 +47,10 @@ class HeaderWidget(Static):
     def _build_text(self) -> str:
         """构建 Header 显示文本。
 
-        格式: " MiniCode Agent · session: xxxxxxxx  |  模型: xxx  |  tokens: xxx"
+        格式: " BeanCode Agent · session: xxxxxxxx  |  模型: xxx  |  tokens: xxx"
         """
         return (
-            f" MiniCode Agent · session: {self._short_session}"
+            f" BeanCode Agent · session: {self._short_session}"
             f"  |  模型: {self._model_name}"
             f"  |  tokens: {self.token_info}"
         )
