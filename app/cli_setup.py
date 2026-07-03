@@ -88,10 +88,11 @@ def run_cli_setup() -> None:
         except ValueError:
             model = models[0]
 
-    # ── 保存配置 ──
+    # ── 保存配置：models 只包含当前厂商的模型，不混入其他厂商 ──
     config.api_key = api_key
     config.base_url = base_url
     config.model = model
+    config.models = models  # models 已在上面按 provider 过滤
     save_user_config(config)
 
     print()

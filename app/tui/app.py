@@ -269,43 +269,61 @@ class MiniCodeApp(App):
         self._run_agent_stream(user_text)
 
     def _handle_model_command(self, text: str) -> None:
-        """处理 /model 命令：展示可选模型列表，支持编号选择切换。
+        """处理 /model 命令：按编号或名称切换模型。
 
-           /model          → 列出所有可用模型
-           /model <name>   → 直接切换到指定模型
+           /model       → 列出可用模型（按当前厂商过滤）
+           /model 2     → 切换到第 2 个模型
+           /model deepseek-v4-pro → 按名称切换
         """
         from app.infra.user_config import load_user_config, update_user_model
-        from app.infra.model_capabilities import get_context_window, get_max_output_tokens
+        from app.infra.model_capabilities import _MODEL_CAPABILITIES, detect_provider, get_models_for_provider
 
         config = load_user_config()
-        extra = text[6:].strip()  # "/model" 后面的内容
+        extra = text[6:].strip()
 
-        # /model <name> 直接切换
-        if extra:
-            update_user_model(extra)
-            self._model.model_name = extra
-            self.header.update_model(extra)
-            self.conversation.add_system_info(f"模型已切换: {extra}")
-            # 刷新上下文窗口显示
-            ctx = get_context_window(extra)
-            self.conversation.add_system_info(f"上下文窗口: {ctx // 1000}k tokens")
-            return
-
-        # /model 列出可选模型
-        config = load_user_config()
-        from app.infra.model_capabilities import _MODEL_CAPABILITIES
-
-        models = list(_MODEL_CAPABILITIES.keys())
+        # 按当前 base_url 自动过滤厂商模型
+        provider = detect_provider(config.base_url)
+        models = get_models_for_provider(provider)
         current = config.model
 
-        lines = ["可选模型:", ""]
+        # ── /model <数字> 按编号切换 ──
+        if extra and extra.isdigit():
+            idx = int(extra) - 1
+            if 0 <= idx < len(models):
+                model = models[idx]
+                update_user_model(model)
+                self._model.model_name = model
+                self.header.update_model(model)
+                self.conversation.add_system_info(f"模型已切换: {model} (上下文: {_MODEL_CAPABILITIES[model]['context_window'] // 1000}k)")
+                return
+            else:
+                self.conversation.add_system_info(f"无效编号，有效范围 1-{len(models)}")
+                return
+
+        # ── /model <名称> 按名称切换 ──
+        if extra:
+            # 模糊匹配
+            matched = None
+            for m in models:
+                if extra.lower() in m.lower():
+                    matched = m
+                    break
+            if matched:
+                update_user_model(matched)
+                self._model.model_name = matched
+                self.header.update_model(matched)
+                self.conversation.add_system_info(f"模型已切换: {matched}")
+                return
+            else:
+                self.conversation.add_system_info(f"未找到模型: {extra}，使用 /model 查看列表")
+                return
+
+        # ── /model 列出模型（按厂商过滤，一条一行，显示编号）──
+        lines = [f"可选模型 (厂商: {provider.upper()}):", ""]
         for i, m in enumerate(models, 1):
             active = " ← 当前" if m == current else ""
-            ctx = _MODEL_CAPABILITIES[m]["context_window"]
-            max_out = _MODEL_CAPABILITIES[m]["max_output"]
-            lines.append(f"  {i}. {m}{active}  (上下文: {ctx // 1000}k, 最大输出: {max_out // 1000}k)")
-        lines.append("")
-        lines.append("使用 /model <名称> 切换，例如 /model deepseek-v4-pro")
+            ctx = _MODEL_CAPABILITIES[m]["context_window"] // 1000
+            lines.append(f"  {i}. {m}{active}  ({ctx}k)")
 
         self.conversation.add_system_info("\n".join(lines))
 
