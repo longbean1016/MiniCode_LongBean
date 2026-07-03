@@ -106,6 +106,8 @@ Thumbs.db
 
 USER.md
 
+.claude
+
 docs
 
 .superpowers
@@ -117,3 +119,4 @@ docs
 
 .claude.env
 .env.example
+.context_state/
