@@ -114,10 +114,14 @@ def _run(validated_input: MemoryToolInput, context: ToolContext) -> ToolResult:
 memory_tool = ToolDefinition(
     name="memory",
     description=(
-        "维护持久记忆。"
-        "add 写入 Markdown 列表项到 MEMORY.md 或 USER.md；"
-        "remove 按片段删除一条记忆；"
-        "view 查看当前冻结快照。"
+        "写入跨会话持久记忆，每次对话自动注入，保持内容精简高价值。\n\n"
+        "触发时机：当用户表达偏好、纠正信息、说出个人身份/习惯/工作方式、"
+        "或主动说\"记住\"\"别忘了\"\"下次也这样\"时，立即调用此工具保存。"
+        "不要让用户重复说过的话——这是记忆的核心价值。\n\n"
+        "操作说明：add 写入 Markdown 列表项到 MEMORY.md 或 USER.md；"
+        "remove 按片段删除；view 查看当前内容。\n\n"
+        "target 选择：'user' 存用户身份/偏好/风格，'memory' 存项目规范/环境约定/经验教训。\n\n"
+        "不要保存：琐碎信息、容易被重新搜索到的内容、任务进度日志、临时状态。"
     ),
     validator=_validate,
     runner=_run,
