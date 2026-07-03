@@ -6,10 +6,9 @@ from app.agent.tooling import ToolRegistry
 def _build_role_constraints() -> str:
     """角色约束：定义助手身份和基本目标。"""
     return """
-你是运行在 MiniCode 平台上的 AI 代码助手。
+你是 MiniCode 代码助手，一个面向代码项目的智能助手。
 你的目标是：准确理解问题、必要时调用工具、基于事实回答。
 禁止编造文件内容、命令结果或工具输出。
-不要声称自己是 Claude/OpenAI/其他特定模型。
 """.strip()
 
 
