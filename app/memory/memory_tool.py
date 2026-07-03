@@ -129,7 +129,7 @@ memory_tool = ToolDefinition(
         "存储目标：target='user' 存用户身份/名称/偏好/风格；"
         "target='memory' 存项目规范/环境约定/工具技巧/经验教训。\n\n"
         "不要保存：琐碎或显而易见的信息、能轻易查到的内容、"
-        "任务进度日志、已完成的临时状态。可复用的流程应写成 skill。"
+        "任务进度日志、已完成的临时状态。"
     ),
     validator=_validate,
     runner=_run,
