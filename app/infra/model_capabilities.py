@@ -12,20 +12,53 @@
 from dataclasses import dataclass
 
 # ── 模型能力字典（对标 Claude Code ALL_MODEL_CONFIGS + context.ts 硬编码）──
-# 新增模型只需在这里加一行
-_MODEL_CAPABILITIES: dict[str, dict[str, int]] = {
+# 新增模型只需在这里加一行，包含 provider 字段用于按厂商过滤
+_MODEL_CAPABILITIES: dict[str, dict[str, int | str]] = {
     # DeepSeek 系列（1M 上下文，API 默认 max_output=32K）
-    "deepseek-v4-flash":     {"context_window": 1_048_576, "max_output": 32_768},
-    "deepseek-v4-pro":       {"context_window": 1_048_576, "max_output": 32_768},
+    "deepseek-v4-flash":     {"context_window": 1_048_576, "max_output": 32_768, "provider": "deepseek"},
+    "deepseek-v4-pro":       {"context_window": 1_048_576, "max_output": 32_768, "provider": "deepseek"},
     # OpenAI 系列
-    "gpt-4o-mini":           {"context_window": 128_000,   "max_output": 16_384},
-    "gpt-4o":                {"context_window": 128_000,   "max_output": 16_384},
-    "gpt-4-turbo":           {"context_window": 128_000,   "max_output": 4_096},
+    "gpt-4o-mini":           {"context_window": 128_000,   "max_output": 16_384, "provider": "openai"},
+    "gpt-4o":                {"context_window": 128_000,   "max_output": 16_384, "provider": "openai"},
+    "gpt-4-turbo":           {"context_window": 128_000,   "max_output": 4_096,  "provider": "openai"},
     # Claude 系列（通过 OpenAI 兼容接口使用）
-    "claude-sonnet-4-6":     {"context_window": 200_000,   "max_output": 32_000},
-    "claude-opus-4-6":       {"context_window": 200_000,   "max_output": 64_000},
-    "claude-haiku-4-5":      {"context_window": 200_000,   "max_output": 16_384},
+    "claude-sonnet-4-6":     {"context_window": 200_000,   "max_output": 32_000, "provider": "anthropic"},
+    "claude-opus-4-6":       {"context_window": 200_000,   "max_output": 64_000, "provider": "anthropic"},
+    "claude-haiku-4-5":      {"context_window": 200_000,   "max_output": 16_384, "provider": "anthropic"},
 }
+
+# ── URL 到厂商映射（对标 Hermes-agent 的 base_url_hostname 检测）──
+# 当用户输入 base_url 时，自动识别厂商，只展示该厂商的模型
+_PROVIDER_PATTERNS: dict[str, str] = {
+    "api.deepseek.com":     "deepseek",
+    "deepseek.com":         "deepseek",
+    "api.openai.com":       "openai",
+    "openai.com":           "openai",
+    "api.anthropic.com":    "anthropic",
+    "anthropic.com":        "anthropic",
+}
+
+
+def detect_provider(base_url: str) -> str:
+    """根据 base_url 自动识别模型厂商。
+
+       匹配规则：URL 中包含已知域名则返回对应厂商名，否则返回 "custom"。
+       对标 Hermes-agent 的 base_url_hostname 检测逻辑。
+    """
+    lowered = base_url.lower()
+    for pattern, provider in _PROVIDER_PATTERNS.items():
+        if pattern in lowered:
+            return provider
+    return "custom"
+
+
+def get_models_for_provider(provider: str) -> list[str]:
+    """返回指定厂商的可选模型列表。custom 时返回全部模型。"""
+    models = []
+    for model_id, caps in _MODEL_CAPABILITIES.items():
+        if provider == "custom" or caps.get("provider") == provider:
+            models.append(model_id)
+    return models if models else list(_MODEL_CAPABILITIES.keys())
 
 # ── 默认值（未知模型使用） ──
 _DEFAULT_CONTEXT_WINDOW = 128_000

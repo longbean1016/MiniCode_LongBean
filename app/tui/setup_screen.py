@@ -1,52 +1,62 @@
 """首次启动配置向导 — 收集 api_key / base_url 并选择模型后保存到 ~/.bean/settings.json。
 
-   对标 Claude Code 首次启动时的配置流程。
+   对标 Hermes-agent 的交互式配置流程 + Claude Code 的配置存储方式。
+   base_url 输入后自动识别厂商，只展示该厂商的可用模型。
 """
 
 from textual.app import ComposeResult
-from textual.containers import Container, VerticalScroll
+from textual.containers import Container, Horizontal, VerticalScroll
 from textual.screen import Screen
-from textual.widgets import Button, Input, Label, Select, Static
+from textual.widgets import Button, Input, Label, RadioButton, RadioSet, Static
+from textual import events
 
 
 class SetupScreen(Screen):
-    """首次配置界面：API Key → Base URL → 模型选择 → 保存。
+    """首次配置界面。
 
-       用户填写完成后点"开始使用"，配置写入 ~/.bean/settings.json。
+       用户输入 base_url → 自动检测厂商 → 展示该厂商模型 → 勾选 → 保存。
     """
 
     CSS = """
     SetupScreen {
         align: center middle;
+        background: $surface-darken-1;
     }
     #setup-container {
-        width: 55;
-        height: auto;
-        border: solid $primary;
+        width: 58;
+        max-height: 90%;
+        border: thick $primary;
         padding: 2 3;
         background: $surface;
     }
     #setup-title {
         content-align: center middle;
-        padding: 1;
+        padding: 1 2;
         text-style: bold;
+        color: $text;
     }
-    #setup-form {
-        padding: 1 0;
+    #setup-subtitle {
+        content-align: center middle;
+        padding: 0 2 1 2;
+        color: $text-disabled;
     }
     Label {
         padding: 1 0 0 0;
+        text-style: bold;
     }
     Input {
         width: 100%;
         margin: 1 0;
     }
-    Select {
-        width: 100%;
+    #model-list {
+        height: auto;
+        max-height: 14;
+        border: solid $primary-darken-1;
+        padding: 0 1;
         margin: 1 0;
     }
     #setup-error {
-        color: red;
+        color: $error;
         padding: 1 0;
         height: 1;
     }
@@ -54,50 +64,85 @@ class SetupScreen(Screen):
         width: 100%;
         margin: 1 0;
     }
+    Horizontal {
+        width: 100%;
+        height: auto;
+    }
     """
 
     def __init__(self) -> None:
         super().__init__()
-        self._available_models = self._load_model_list()
-
-    def _load_model_list(self) -> list[tuple[str, str]]:
-        """从 model_capabilities 加载可选模型列表。"""
-        from app.infra.model_capabilities import _MODEL_CAPABILITIES
-        models = []
-        for model_id in _MODEL_CAPABILITIES:
-            models.append((model_id, model_id))
-        return models
+        self._provider = "deepseek"  # 当前检测到的厂商
 
     def compose(self) -> ComposeResult:
-        """构建配置表单界面。"""
+        """构建配置表单。"""
         with Container(id="setup-container"):
             yield Static("MiniCode 首次配置", id="setup-title")
+            yield Static("填写 API Key 和 Base URL，选择模型后开始使用", id="setup-subtitle")
 
-            with VerticalScroll(id="setup-form"):
-                yield Label("API Key:")
+            with VerticalScroll():
+                # ── API Key ──
+                yield Label("API Key")
                 yield Input(
                     placeholder="sk-xxxxxxxxxxxxxxxxxxxxxxxx",
                     id="input-key",
                     password=True,
                 )
 
-                yield Label("Base URL:")
+                # ── Base URL ──
+                yield Label("Base URL（输入后自动识别厂商和模型）")
                 yield Input(
                     placeholder="https://api.deepseek.com",
                     id="input-url",
                     value="https://api.deepseek.com",
                 )
 
-                yield Label("选择模型:")
-                yield Select(
-                    self._available_models,
-                    id="select-model",
-                    value=self._available_models[0][0] if self._available_models else "",
-                )
+                # ── 模型选择 ──
+                yield Label("可用模型（点击选择，默认勾选第一个）")
+                yield Static("正在加载模型列表...", id="model-status")
+
+                with VerticalScroll(id="model-list"):
+                    yield RadioSet(
+                        RadioButton("deepseek-v4-flash", id="radio-default"),
+                        id="model-radios",
+                    )
 
                 yield Static("", id="setup-error")
 
                 yield Button("开始使用", id="setup-btn", variant="primary")
+
+    def on_mount(self) -> None:
+        """挂载后根据默认 base_url 加载模型列表。"""
+        self._refresh_models()
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        """base_url 输入变化时刷新模型列表。"""
+        if event.input.id == "input-url":
+            self._refresh_models()
+
+    def _refresh_models(self) -> None:
+        """根据当前 base_url 检测厂商，刷新模型选择列表。"""
+        from app.infra.model_capabilities import detect_provider, get_models_for_provider
+
+        url = self.query_one("#input-url", Input).value.strip()
+        if not url:
+            url = "https://api.deepseek.com"
+
+        self._provider = detect_provider(url)
+        models = get_models_for_provider(self._provider)
+
+        # 更新模型列表
+        radio_set = self.query_one("#model-radios", RadioSet)
+        radio_set.remove_children()
+
+        for i, model in enumerate(models):
+            radio_set.mount(RadioButton(model, id=f"radio-{i}", value=(i == 0)))
+
+        # 更新状态提示
+        provider_label = self._provider.upper() if self._provider != "custom" else "未知厂商（显示全部模型）"
+        self.query_one("#model-status", Static).update(
+            f"厂商: {provider_label}  |  模型数量: {len(models)}"
+        )
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         """处理"开始使用"按钮点击。"""
@@ -106,9 +151,16 @@ class SetupScreen(Screen):
 
         api_key = self.query_one("#input-key", Input).value.strip()
         base_url = self.query_one("#input-url", Input).value.strip()
-        model = self.query_one("#select-model", Select).value
 
-        # 校验必填项
+        # 获取选中的模型
+        radio_set = self.query_one("#model-radios", RadioSet)
+        selected = radio_set.pressed_button
+        if selected is None:
+            self.query_one("#setup-error", Static).update("请选择一个模型")
+            return
+
+        model = str(selected.label) if hasattr(selected, "label") else str(selected)
+
         if not api_key:
             self.query_one("#setup-error", Static).update("请输入 API Key")
             return
@@ -122,7 +174,7 @@ class SetupScreen(Screen):
         config = ensure_user_config()
         config.api_key = api_key
         config.base_url = base_url
-        config.model = str(model) if model else "deepseek-v4-flash"
+        config.model = model
         save_user_config(config)
 
         # 配置完成，跳转到主界面
