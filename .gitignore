@@ -116,3 +116,4 @@ docs
 .bean
 
 .claude.env
+.env.example
