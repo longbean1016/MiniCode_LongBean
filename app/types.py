@@ -113,41 +113,13 @@ class AppConfig:
     # 例如 DeepSeek: https://api.deepseek.com
     base_url: str
 
-    # 当前使用的模型名称
     model: str
-
-    # 生成长期记忆语义向量时使用的 embedding 模型
-    embedding_model: str
-
-    # embedding 服务专用 API Key
-    embedding_api_key: str
-
-    # embedding 服务专用基础地址
-    embedding_base_url: str
-
-    # embedding 向量维度；为 0 时表示不显式传 dimensions
-    embedding_dimensions: int
 
     # agent 允许工作的根目录
     workspace_root: str
 
     # 永久额外工作目录（分号分隔的绝对路径列表）
     workspace_additional_dirs: list[str]
-
-    # 是否启用 Qdrant 服务端向量索引
-    qdrant_enabled: bool
-
-    # Qdrant 服务端地址，例如 http://localhost:6333
-    qdrant_url: str
-
-    # Qdrant 本地持久化目录；非空时优先走本地 embedded 模式
-    qdrant_path: str
-
-    # Qdrant API Key，本地无鉴权时可为空
-    qdrant_api_key: str
-
-    # 长期记忆向量集合名
-    qdrant_collection: str
 
     # 主聊天模型调用的最大重试次数
     model_retry_max_attempts: int
@@ -184,48 +156,6 @@ class AppConfig:
 
     # 辅助模型熔断冷却时间（秒）
     aux_model_circuit_recovery_timeout_seconds: float
-
-    # embedding / Qdrant 这类向量链路调用的最大重试次数
-    vector_retry_max_attempts: int
-
-    # 向量链路重试的基础等待秒数
-    vector_retry_base_delay_seconds: float
-
-    # 向量链路重试的退避倍数
-    vector_retry_backoff_multiplier: float
-
-    # 向量链路单次重试等待上限
-    vector_retry_max_delay_seconds: float
-
-    # 向量链路连续失败多少次后触发熔断
-    vector_circuit_failure_threshold: int
-
-    # 向量链路熔断冷却时间（秒）
-    vector_circuit_recovery_timeout_seconds: float
-
-    # active project 记忆达到这个数量阈值时，允许触发一次低频全量 decay 刷新
-    decay_full_scan_trigger_count: int
-
-    # decay 分数下限，避免分数完全掉到 0
-    decay_min_score: float
-
-    # 低于这个分数时，记忆开始具备“可归档”的资格
-    decay_archive_threshold: float
-
-    # 记忆至少老化到多少天后，才允许被 decay 归档
-    decay_archive_age_days: float
-
-    # confidence 高于这个阈值的记忆，默认不被 decay 归档
-    decay_archive_confidence_threshold: float
-
-    # usage_count 高于这个阈值的记忆，默认不被 decay 归档
-    decay_archive_usage_threshold: int
-
-    # 是否启用 decay 结果摘要日志
-    decay_log_enabled: bool
-
-    # decay 日志是否同步打印到控制台
-    decay_log_echo: bool
 
 
 @dataclass(slots=True)
