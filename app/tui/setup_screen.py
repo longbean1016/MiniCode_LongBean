@@ -127,9 +127,12 @@ class SetupScreen(Screen):
         except Exception:
             pass  # 首次调用时还没有 RadioSet
 
-        new_radio = RadioSet(id="model-radios")
-        for i, model in enumerate(models):
-            new_radio.mount(RadioButton(model, id=f"setup-model-{i}", value=(i == 0)))
+        # 先创建带全部子项的 RadioSet，再一次性挂载到 DOM
+        buttons = [
+            RadioButton(model, id=f"setup-model-{i}", value=(i == 0))
+            for i, model in enumerate(models)
+        ]
+        new_radio = RadioSet(*buttons, id="model-radios")
         model_list.mount(new_radio)
 
         # 更新状态提示
