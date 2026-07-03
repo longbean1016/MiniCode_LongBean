@@ -3,17 +3,9 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-"""应用配置加载模块，负责读取环境变量并构造统一配置对象。"""
-
-from dotenv import load_dotenv
+"""应用配置加载模块，从 ~/.bean/settings.json 读取配置并构造统一配置对象。"""
 
 from app.types import AppConfig
-
-
-# 启动时先加载项目根目录下的 .env。
-# 当前使用 override=True，表示 .env 中的值会覆盖进当前进程环境；
-# 这里保持和现有运行行为一致，只把注释写清楚，避免阅读时代码与说明相互矛盾。
-load_dotenv(override=True)
 
 
 def _get_env(name: str, default: str | None = None, required: bool = False) -> str:
@@ -89,20 +81,20 @@ def load_config() -> AppConfig:
     - `QDRANT_API_KEY`: Qdrant API Key（本地无鉴权时可留空）
     - `QDRANT_COLLECTION`: 向量集合名
     """
-    # ── 优先从 ~/.bean/settings.json 读取 API 和模型配置 ──
+    # ── 从 ~/.bean/settings.json 读取 API 和模型配置 ──
     # 对标 Claude Code ~/.claude/settings.json 的配置体系
     from app.infra.user_config import load_user_config
     user_cfg = load_user_config()
 
-    # settings.json 有 api_key 就用它，否则回退 .env
-    if user_cfg.api_key:
-        api_key = user_cfg.api_key
-        base_url = user_cfg.base_url
-        model = user_cfg.model
-    else:
-        api_key = _get_env('OPENAI_API_KEY', required=True)
-        base_url = _get_env('OPENAI_BASE_URL', default='https://api.openai.com/v1')
-        model = _get_env('OPENAI_MODEL', default='gpt-4o-mini')
+    if not user_cfg.api_key:
+        print("未配置 API Key，请运行: python -m app.main --setup")
+        import sys; sys.exit(1)
+
+    api_key = user_cfg.api_key
+    base_url = user_cfg.base_url
+    model = user_cfg.model
+
+    # 其余配置继续从环境变量读取（WORKSPACE_ROOT 等非敏感配置）
     embedding_model = _get_env("EMBEDDING_MODEL", default="text-embedding-3-small")
     embedding_api_key = _get_env("EMBEDDING_API_KEY", default=api_key)
     embedding_base_url = _get_env("EMBEDDING_BASE_URL", default=base_url)
