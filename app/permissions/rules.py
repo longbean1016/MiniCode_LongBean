@@ -201,13 +201,13 @@ class PermissionRuleEngine:
         if not tokens:
             return suggestions
 
-        # 单 token 命令（如 'ls'）→ 精确匹配
+        # 单 token 命令（如 'ls'）→ 前缀匹配
         if len(tokens) == 1:
             suggestions.append(PermissionRule(
                 tool=tool_name,
                 behavior=behavior,
                 match_type="prefix",
-                pattern=f"{tokens[0]}:*",
+                pattern=tokens[0],
                 source="session",
             ))
             return suggestions
@@ -224,12 +224,12 @@ class PermissionRuleEngine:
 
         # 判断第二个 token 是否像子命令（纯字母+连字符，不以 - 开头）
         if sub_cmd and not sub_cmd.startswith("-") and sub_cmd.replace("-", "").isalpha():
-            # 双词前缀：如 'git push:*'
+            # 双词前缀：如 'git push'
             suggestions.append(PermissionRule(
                 tool=tool_name,
                 behavior=behavior,
                 match_type="prefix",
-                pattern=f"{main_cmd} {sub_cmd}:*",
+                pattern=f"{main_cmd} {sub_cmd}",
                 source="session",
             ))
 
@@ -238,7 +238,7 @@ class PermissionRuleEngine:
             tool=tool_name,
             behavior=behavior,
             match_type="prefix",
-            pattern=f"{main_cmd}:*",
+            pattern=main_cmd,
             source="session",
         ))
 

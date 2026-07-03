@@ -34,72 +34,59 @@ def build_openai_tools(tools:list[ToolDefinition])->list[dict[str,Any]]:
     return result
 
 def build_openai_messages(messages:list[ChatMessage])->list[dict[str,Any]]:
-    """把内部消息转成模型接口消息。"""
-    result:list[dict[str,Any]]=[]
+    """把内部消息转成模型接口消息。
 
-    # 先做一次 pair 归一化，再出站。
-    # 因为对 OpenAI 协议来说，孤立的 tool_result 不是“信息不完整”这么简单，
-    # 而是会直接导致请求非法。
-    for msg in normalize_tool_call_pairs(messages):
-        role=msg.get("role") 
-        content=msg.get("content")
+       合并连续的 assistant_tool_call 到同一个 assistant 消息，
+       保证 OpenAI 协议要求的所有 tool_call_id 都有对应 tool_result。
+    """
+    result: list[dict[str,Any]] = []
+    normalized = normalize_tool_call_pairs(messages)
+    idx = 0
+    while idx < len(normalized):
+        msg = normalized[idx]
+        role = msg.get('role')
+        content = msg.get('content')
 
-
-        # system/user/assistant 直接透传
-        if role in ("system","user","assistant"):
-            result.append(
-                {
-                    "role":role,
-                    "content":content
-                }
-            )
+        if role in ('system', 'user', 'assistant'):
+            result.append({'role': role, 'content': content})
+            idx += 1
             continue
 
-        # assistant_progress 没有对应的原生 role，
-        # 这里只能编码进 assistant 文本里，再在回包时拆回内部 kind。
-        if role == "assistant_progress":
-            result.append(
-                {
-                    "role": "assistant",
-                    "content": f"<progress>\n{content}\n</progress>",
-                }
-            )
+        if role == 'assistant_progress':
+            result.append({
+                'role': 'assistant',
+                'content': f'<progress>\n{content}\n</progress>',
+            })
+            idx += 1
             continue
 
-        # 内部协议里 tool_call 是单独 role；
-        # OpenAI 协议里则是 assistant 消息上的 tool_calls 字段。
-        if role=="assistant_tool_call":
-            result.append(
-                {
-                    "role":"assistant",
-                    "content":None,
-                    "tool_calls":[
-                        {
-                            "id": msg["tool_use_id"], # type: ignore
-                            "type": "function",
-                            "function": {
-                                "name": msg["tool_name"], # type: ignore
-                                "arguments": json.dumps(
-                                    msg.get("input", {}),
-                                    ensure_ascii=False,
-                                )
-                            }
-                        }
-                    ]
-                }
-            )
+        # 合并连续的 assistant_tool_call 到一个 assistant 消息
+        if role == 'assistant_tool_call':
+            tool_calls = []
+            while idx < len(normalized) and normalized[idx].get('role') == 'assistant_tool_call':
+                tc = normalized[idx]
+                tool_calls.append({
+                    'id': tc.get('tool_use_id', ''),
+                    'type': 'function',
+                    'function': {
+                        'name': tc.get('tool_name', ''),
+                        'arguments': json.dumps(tc.get('input', {}), ensure_ascii=False),
+                    }
+                })
+                idx += 1
+            result.append({'role': 'assistant', 'content': None, 'tool_calls': tool_calls})
             continue
-        # tool_result 的关键不是 content 本身，而是必须带上 tool_call_id。
-        # 只有这样模型下一轮才能把它识别为“这是刚才那个工具调用的返回结果”。
-        if role == "tool_result":
-            result.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": msg["tool_use_id"], # type: ignore
-                    "content": content,
-                }
-            )
+
+        if role == 'tool_result':
+            result.append({
+                'role': 'tool',
+                'tool_call_id': msg.get('tool_use_id', ''),
+                'content': content,
+            })
+            idx += 1
             continue
+
+        idx += 1
 
     return result
 
