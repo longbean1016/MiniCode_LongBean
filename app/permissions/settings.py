@@ -10,7 +10,8 @@ from app.permissions.rules import Behavior, MatchType, PermissionRule
 # ── 默认配置文件路径 ──
 def _default_settings_path(workspace_root: str = ".") -> Path:
     """获取 .bean/settings.json 的路径（项目级配置）。"""
-    return Path(workspace_root).resolve() / ".bean" / "settings.json"
+    # 统一使用用户目录下的 .bean/settings.json（不再用项目级路径）
+    return Path.home() / ".bean" / "settings.json"
 
 
 # ── 持久化 ──
