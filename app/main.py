@@ -47,6 +47,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="恢复模式，只支持 latest 或 list，例如 --resume latest",
     )
 
+    parser.add_argument(
+        "--setup",
+        action="store_true",
+        help="首次配置向导：设置 API Key、Base URL 和默认模型",
+    )
+
     return parser
 
 
@@ -88,28 +94,20 @@ def main() -> None:
     parser = _build_arg_parser()
     args = parser.parse_args()
 
-    # ── 检查配置：没有 api_key → 首次启动配置向导 ──
-    # 对标 Claude Code 首次启动时创建 ~/.claude/settings.json 的流程
+    # ── --setup：命令行交互式配置向导 ──
+    if args.setup:
+        from app.cli_setup import run_cli_setup
+        run_cli_setup()
+        return
+
+    # ── 检查配置：没有 api_key → 提示运行配置命令 ──
     from app.infra.user_config import has_api_key, ensure_user_config
 
     if not has_api_key():
-        # 确保配置文件骨架存在（api_key 为空）
         ensure_user_config()
-        # 启动 TUI 配置向导收集 api_key / base_url / model
-        from app.tui.setup_screen import SetupScreen
-        # 用 Textual 独立启动配置界面
-        from textual.app import App as TextualApp
-
-        class _SetupApp(TextualApp):
-            def on_mount(self) -> None:
-                self.push_screen(SetupScreen())
-
-        setup_app = _SetupApp()
-        setup_app.run()
-        # 配置向导完成后重新检查
-        if not has_api_key():
-            print("未配置 API Key，退出。")
-            return
+        print("首次使用请先配置 API Key 和模型：")
+        print("  python -m app.main --setup")
+        return
 
     # 配置先加载，再组装所有依赖。
     config = load_config()
