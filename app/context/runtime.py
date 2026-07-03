@@ -156,13 +156,7 @@ def prepare_agent_context(
         cached_risks=cached_state.recent_risks if cached_state is not None else [],
     )
 
-    active_context_snapshot, active_context_summary = _resolve_active_context(
-        older_history_summary=older_history_summary,
-        cached_state=cached_state,
-        resolved_user_preferences=resolved_user_preferences,
-        resolved_project_constraints=resolved_project_constraints,
-        recent_risks=recent_risks,
-    )
+    active_context_snapshot, active_context_summary = {}, ""
 
     # 固定 system + memory 开销估计（原基于 preview_stats 计算，简化为常数）
     fixed_overhead_tokens = int(usable_budget * 0.12)
