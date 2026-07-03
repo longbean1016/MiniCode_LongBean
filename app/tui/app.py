@@ -132,6 +132,8 @@ class MiniCodeApp(App):
         self._pending_approval = None
         # Ctrl+C 退出防误触：记录上一次按下的时间戳
         self._last_quit_attempt = 0.0
+        # /model 命令后的模型列表缓存，供数字输入匹配
+        self._model_list: list[str] = []
 
     # ================================================================
     # Widget 装配
@@ -263,67 +265,58 @@ class MiniCodeApp(App):
             self.conversation.add_user_message(user_text)
             return
 
+        # ── 模型选择模式：输入数字直接切换模型 ──
+        if user_text.strip().isdigit() and self._model_list:
+            idx = int(user_text.strip()) - 1
+            if 0 <= idx < len(self._model_list):
+                self._switch_to_model(self._model_list[idx])
+                self._model_list = []
+            else:
+                self.conversation.add_system_info(f"无效编号，有效范围 1-{len(self._model_list)}")
+            return
+
+        # 不在模型选择模式时，清空列表
+        self._model_list = []
+
         # 普通对话输入
         self.conversation.add_user_message(user_text)
         self.input_area.disable_input()
         self._run_agent_stream(user_text)
 
-    def _handle_model_command(self, text: str) -> None:
-        """处理 /model 命令：按编号或名称切换模型。
+    def _switch_to_model(self, model_id: str) -> None:
+        """切换到指定模型并更新 Header。"""
+        from app.infra.user_config import update_user_model
+        from app.infra.model_capabilities import _MODEL_CAPABILITIES
+        update_user_model(model_id)
+        self._model.model_name = model_id
+        self.header.update_model(model_id)
+        ctx = _MODEL_CAPABILITIES.get(model_id, {}).get("context_window", 0) // 1000
+        self.conversation.add_system_info(f"模型已切换: {model_id} ({ctx}k)")
 
-           /model       → 列出可用模型（按当前厂商过滤）
-           /model 2     → 切换到第 2 个模型
-           /model deepseek-v4-pro → 按名称切换
+    def _handle_model_command(self, text: str) -> None:
+        """处理 /model 命令：列出可用模型，之后直接输入编号切换。
+
+           /model  → 展示模型列表，用户输入 1/2/3 选择
         """
-        from app.infra.user_config import load_user_config, update_user_model
+        from app.infra.user_config import load_user_config
         from app.infra.model_capabilities import _MODEL_CAPABILITIES, detect_provider, get_models_for_provider
 
         config = load_user_config()
-        extra = text[6:].strip()
-
-        # 按当前 base_url 自动过滤厂商模型
         provider = detect_provider(config.base_url)
         models = get_models_for_provider(provider)
         current = config.model
 
-        # ── /model <数字> 按编号切换 ──
-        if extra and extra.isdigit():
-            idx = int(extra) - 1
-            if 0 <= idx < len(models):
-                model = models[idx]
-                update_user_model(model)
-                self._model.model_name = model
-                self.header.update_model(model)
-                self.conversation.add_system_info(f"模型已切换: {model} (上下文: {_MODEL_CAPABILITIES[model]['context_window'] // 1000}k)")
-                return
-            else:
-                self.conversation.add_system_info(f"无效编号，有效范围 1-{len(models)}")
-                return
+        # 保存模型列表，供后续数字输入匹配
+        self._model_list = models
 
-        # ── /model <名称> 按名称切换 ──
-        if extra:
-            # 模糊匹配
-            matched = None
-            for m in models:
-                if extra.lower() in m.lower():
-                    matched = m
-                    break
-            if matched:
-                update_user_model(matched)
-                self._model.model_name = matched
-                self.header.update_model(matched)
-                self.conversation.add_system_info(f"模型已切换: {matched}")
-                return
-            else:
-                self.conversation.add_system_info(f"未找到模型: {extra}，使用 /model 查看列表")
-                return
-
-        # ── /model 列出模型（按厂商过滤，一条一行，显示编号）──
+        # 展示模型列表
         lines = [f"可选模型 (厂商: {provider.upper()}):", ""]
         for i, m in enumerate(models, 1):
             active = " ← 当前" if m == current else ""
             ctx = _MODEL_CAPABILITIES[m]["context_window"] // 1000
             lines.append(f"  {i}. {m}{active}  ({ctx}k)")
+        lines.append("")
+        lines.append("输入编号切换，或输入其他内容继续对话")
 
         self.conversation.add_system_info("\n".join(lines))
 
