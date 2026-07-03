@@ -94,10 +94,7 @@ class SetupScreen(Screen):
                 yield Static("正在加载...", id="model-status")
 
                 with VerticalScroll(id="model-list"):
-                    yield RadioSet(
-                        RadioButton("deepseek-v4-flash", id="setup-model-0"),
-                        id="model-radios",
-                    )
+                    pass  # RadioSet 由 on_mount 动态创建
 
                 yield Static("", id="setup-error")
                 yield Button("开始使用", id="setup-btn", variant="primary")
@@ -122,13 +119,18 @@ class SetupScreen(Screen):
         self._provider = detect_provider(url)
         models = get_models_for_provider(self._provider)
 
-        # 清除旧选项并挂载新选项
-        radio_set = self.query_one("#model-radios", RadioSet)
-        for child in list(radio_set.children):
-            child.remove()
+        # 重建 RadioSet：先清理旧的，再挂载新的
+        model_list = self.query_one("#model-list", VerticalScroll)
+        try:
+            old_radio = self.query_one("#model-radios", RadioSet)
+            old_radio.remove()
+        except Exception:
+            pass  # 首次调用时还没有 RadioSet
 
+        new_radio = RadioSet(id="model-radios")
         for i, model in enumerate(models):
-            radio_set.mount(RadioButton(model, id=f"setup-model-{i}", value=(i == 0)))
+            new_radio.mount(RadioButton(model, id=f"setup-model-{i}", value=(i == 0)))
+        model_list.mount(new_radio)
 
         # 更新状态提示
         provider_label = self._provider.upper() if self._provider != "custom" else "自定义厂商（展示全部模型）"
