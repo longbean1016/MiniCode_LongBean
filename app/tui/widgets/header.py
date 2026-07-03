@@ -55,6 +55,18 @@ class HeaderWidget(Static):
             f"  |  tokens: {self.token_info}"
         )
 
+    def update_model(self, model_name: str) -> None:
+        """切换模型后刷新 Header 显示的模型名。
+
+           /model 命令选中新模型后调用此方法更新顶部状态栏。
+        """
+        self._model_name = model_name or "unknown"
+        try:
+            content = self.query_one("#header-content", Static)
+            content.update(self._build_text())
+        except Exception:
+            pass
+
     def watch_token_info(self, value: str) -> None:
         """token_info 变化时自动刷新 Header 显示。
 

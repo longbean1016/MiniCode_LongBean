@@ -257,10 +257,57 @@ class MiniCodeApp(App):
             self.conversation.add_system_info(result)
             return
 
+        # ── /model 命令：展示可选模型并切换 ──
+        if user_text.strip().startswith("/model"):
+            self._handle_model_command(user_text.strip())
+            self.conversation.add_user_message(user_text)
+            return
+
         # 普通对话输入
         self.conversation.add_user_message(user_text)
         self.input_area.disable_input()
         self._run_agent_stream(user_text)
+
+    def _handle_model_command(self, text: str) -> None:
+        """处理 /model 命令：展示可选模型列表，支持编号选择切换。
+
+           /model          → 列出所有可用模型
+           /model <name>   → 直接切换到指定模型
+        """
+        from app.infra.user_config import load_user_config, update_user_model
+        from app.infra.model_capabilities import get_context_window, get_max_output_tokens
+
+        config = load_user_config()
+        extra = text[6:].strip()  # "/model" 后面的内容
+
+        # /model <name> 直接切换
+        if extra:
+            update_user_model(extra)
+            self._model.model_name = extra
+            self.header.update_model(extra)
+            self.conversation.add_system_info(f"模型已切换: {extra}")
+            # 刷新上下文窗口显示
+            ctx = get_context_window(extra)
+            self.conversation.add_system_info(f"上下文窗口: {ctx // 1000}k tokens")
+            return
+
+        # /model 列出可选模型
+        config = load_user_config()
+        from app.infra.model_capabilities import _MODEL_CAPABILITIES
+
+        models = list(_MODEL_CAPABILITIES.keys())
+        current = config.model
+
+        lines = ["可选模型:", ""]
+        for i, m in enumerate(models, 1):
+            active = " ← 当前" if m == current else ""
+            ctx = _MODEL_CAPABILITIES[m]["context_window"]
+            max_out = _MODEL_CAPABILITIES[m]["max_output"]
+            lines.append(f"  {i}. {m}{active}  (上下文: {ctx // 1000}k, 最大输出: {max_out // 1000}k)")
+        lines.append("")
+        lines.append("使用 /model <名称> 切换，例如 /model deepseek-v4-pro")
+
+        self.conversation.add_system_info("\n".join(lines))
 
     def _handle_approval_reply(self, answer: str) -> None:
         """处理审批回复（输入框内输入 y/n 或 s/p/n）。
