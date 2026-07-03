@@ -30,17 +30,11 @@ DEFAULT_USABLE_CONTEXT_BUDGET = 128_000
 
 @dataclass(slots=True)
 class ContextStats:
-    """保存一次模型请求前的上下文统计信息。"""
+    """保存一次模型请求前的上下文统计信息（仅保留实际使用的字段）。"""
 
     usable_budget: int
     total_tokens: int
     usage_ratio: float
-    system_tokens: int
-    recent_tokens: int
-    memory_tokens: int
-    tool_result_tokens: int
-    message_count: int
-    tool_result_count: int
 
 
 @dataclass(slots=True)
@@ -124,40 +118,18 @@ def collect_context_stats(
     memory_context: str,
     usable_budget: int,
 ) -> ContextStats:
-    """
-    统计一次模型请求前的上下文占用。
-
-    这里把 system prompt 和记忆上下文拆开统计，
-    方便后面观察"到底是 recent history 胖，还是 memory 注入太多"。
-    """
-    system_tokens = estimate_message_tokens({"role": "system", "content": system_prompt})
-    recent_tokens = estimate_messages_tokens(recent_messages)
-    memory_tokens = estimate_tokens(memory_context)
-
-    tool_result_tokens = 0
-    tool_result_count = 0
-    for message in recent_messages:
-        if message.get("role") != "tool_result":
-            continue
-
-        tool_result_count += 1
-        tool_result_tokens += estimate_message_tokens(message)
-
-    total_tokens = system_tokens + recent_tokens + memory_tokens
-    usage_ratio = 0.0
-    if usable_budget > 0:
-        usage_ratio = total_tokens / usable_budget
+    """统计一次模型请求前的上下文 token 占用和压力比。"""
+    total_tokens = (
+        estimate_message_tokens({"role": "system", "content": system_prompt}) +
+        estimate_messages_tokens(recent_messages) +
+        estimate_tokens(memory_context)
+    )
+    usage_ratio = total_tokens / usable_budget if usable_budget > 0 else 0.0
 
     return ContextStats(
         usable_budget=usable_budget,
         total_tokens=total_tokens,
         usage_ratio=usage_ratio,
-        system_tokens=system_tokens,
-        recent_tokens=recent_tokens,
-        memory_tokens=memory_tokens,
-        tool_result_tokens=tool_result_tokens,
-        message_count=1 + len(recent_messages),
-        tool_result_count=tool_result_count,
     )
 
 
