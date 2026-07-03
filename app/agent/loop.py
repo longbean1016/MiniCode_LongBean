@@ -1137,7 +1137,7 @@ def stream_agent(
                                 input_data=tool_input, suggestions=suggestions,
                             ),
                         )
-                        # 为其他已完成的并行工具补占位 tool_result，保证消息协议完整
+                        # 为所有未处理的工具补占位 tool_result，保证消息协议完整
                         for _j, _oc in enumerate(parallel_calls):
                             if _j == idx:
                                 continue
@@ -1148,6 +1148,13 @@ def stream_agent(
                                     content=str(_r.output), is_error=not _r.ok,
                                     meta=dict(_r.meta),
                                 )
+                        # 串行工具还没执行，统一补占位
+                        for _sc in sequential_calls:
+                            builder.add_tool_result(
+                                tool_use_id=_sc["id"], tool_name=_sc["tool_name"],
+                                content="工具执行被中断（前置工具需要授权）",
+                                is_error=True, meta={},
+                            )
                         yield ApprovalEvent(approval=approval_step.approval)
                         yield DoneEvent(step=approval_step, history=builder.build())
                         return

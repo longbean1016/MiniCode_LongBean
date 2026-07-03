@@ -7,12 +7,11 @@
 - TUI 终端多轮对话界面（基于 Textual）
 - 11 个内置工具：文件读写、搜索、命令执行、网页抓取、网页搜索、子代理调度
 - 工具并行执行（只读工具线程池并发）
-- Prompt Cache 优化（DeepSeek 缓存命中率 ~96%，token 费用降低约 90%）
-- 对标 Claude Code 的权限系统（allow/deny/ask × exact/prefix/wildcard）
-- 支持 /model 命令切换模型、/mcp 命令管理 MCP Server
+- Prompt Cache 优化（DeepSeek 缓存命中率 ~95%，token 费用降低约 90%）
+- 支持 /model 命令切换模型
 - 会话恢复（--resume latest）
 - 持久记忆：MEMORY.md + USER.md 文件型注入
-- 对标 Claude Code 的上下文压缩机制（Microcompact + Auto Compact）
+- 参考 Claude Code 的上下文压缩机制（Microcompact + Auto Compact）
 
 ## 运行环境
 
