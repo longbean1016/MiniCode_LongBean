@@ -5,10 +5,9 @@
 """
 
 from textual.app import ComposeResult
-from textual.containers import Container, Horizontal, VerticalScroll
+from textual.containers import Container, VerticalScroll
 from textual.screen import Screen
 from textual.widgets import Button, Input, Label, RadioButton, RadioSet, Static
-from textual import events
 
 
 class SetupScreen(Screen):
@@ -64,15 +63,11 @@ class SetupScreen(Screen):
         width: 100%;
         margin: 1 0;
     }
-    Horizontal {
-        width: 100%;
-        height: auto;
-    }
     """
 
     def __init__(self) -> None:
         super().__init__()
-        self._provider = "deepseek"  # 当前检测到的厂商
+        self._provider = "deepseek"
 
     def compose(self) -> ComposeResult:
         """构建配置表单。"""
@@ -81,7 +76,6 @@ class SetupScreen(Screen):
             yield Static("填写 API Key 和 Base URL，选择模型后开始使用", id="setup-subtitle")
 
             with VerticalScroll():
-                # ── API Key ──
                 yield Label("API Key")
                 yield Input(
                     placeholder="sk-xxxxxxxxxxxxxxxxxxxxxxxx",
@@ -89,7 +83,6 @@ class SetupScreen(Screen):
                     password=True,
                 )
 
-                # ── Base URL ──
                 yield Label("Base URL（输入后自动识别厂商和模型）")
                 yield Input(
                     placeholder="https://api.deepseek.com",
@@ -97,22 +90,20 @@ class SetupScreen(Screen):
                     value="https://api.deepseek.com",
                 )
 
-                # ── 模型选择 ──
                 yield Label("可用模型（点击选择，默认勾选第一个）")
-                yield Static("正在加载模型列表...", id="model-status")
+                yield Static("正在加载...", id="model-status")
 
                 with VerticalScroll(id="model-list"):
                     yield RadioSet(
-                        RadioButton("deepseek-v4-flash", id="radio-default"),
+                        RadioButton("deepseek-v4-flash", id="setup-model-0"),
                         id="model-radios",
                     )
 
                 yield Static("", id="setup-error")
-
                 yield Button("开始使用", id="setup-btn", variant="primary")
 
     def on_mount(self) -> None:
-        """挂载后根据默认 base_url 加载模型列表。"""
+        """挂载后加载默认模型列表。"""
         self._refresh_models()
 
     def on_input_changed(self, event: Input.Changed) -> None:
@@ -131,17 +122,18 @@ class SetupScreen(Screen):
         self._provider = detect_provider(url)
         models = get_models_for_provider(self._provider)
 
-        # 更新模型列表
+        # 清除旧选项并挂载新选项
         radio_set = self.query_one("#model-radios", RadioSet)
-        radio_set.remove_children()
+        for child in list(radio_set.children):
+            child.remove()
 
         for i, model in enumerate(models):
-            radio_set.mount(RadioButton(model, id=f"radio-{i}", value=(i == 0)))
+            radio_set.mount(RadioButton(model, id=f"setup-model-{i}", value=(i == 0)))
 
         # 更新状态提示
-        provider_label = self._provider.upper() if self._provider != "custom" else "未知厂商（显示全部模型）"
+        provider_label = self._provider.upper() if self._provider != "custom" else "自定义厂商（展示全部模型）"
         self.query_one("#model-status", Static).update(
-            f"厂商: {provider_label}  |  模型数量: {len(models)}"
+            f"厂商: {provider_label}  |  可选模型: {len(models)} 个"
         )
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
