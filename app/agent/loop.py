@@ -858,6 +858,7 @@ def stream_agent(
 
         # 收集流式结果的缓冲区
         collected_text = ""  # 累积的文本回答
+        _api_total_tokens = 0  # API 返回的真实 token 总数（用于后续 token 预估基线）
         tool_calls_buf: dict[int, dict] = {}  # tool_index → {id, name, args_str}
 
         model_started_at = time.perf_counter()
@@ -897,6 +898,7 @@ def stream_agent(
                         cache_hit_tokens=cache_hit,
                         cache_miss_tokens=cache_miss,
                     )
+                    _api_total_tokens = total_tokens  # 保存到外层，写入 assistant 消息 meta
                     # 记录缓存命中率到 debug.log，方便排查和性能分析
                     cache_total = cache_hit + cache_miss
                     if cache_total > 0:
@@ -1386,8 +1388,10 @@ def stream_agent(
                     collected_text,
                 )
 
-            # 把流式收集到的文本写入历史
+            # 把流式收集到的文本写入历史，附带 API 真实 token 用量供后续预估
             builder.add_assistant(collected_text)
+            if _api_total_tokens > 0:
+                builder.history[-1]["_api_total_tokens"] = _api_total_tokens  # type: ignore[index]
 
         step = AgentStep(
             type="assistant",

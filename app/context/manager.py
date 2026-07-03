@@ -90,8 +90,31 @@ def estimate_message_tokens(message: ChatMessage) -> int:
 
 
 def estimate_messages_tokens(messages: list[ChatMessage]) -> int:
-    """估算一组消息的总 token。"""
-    return sum(estimate_message_tokens(message) for message in messages)
+    """估算一组消息的总 token。
+
+       对标 Claude Code tokenCountWithEstimation()：
+       从后往前找最近一次 API 返回的真实 token 数作为基线，
+       仅对基线之后的新增消息做粗略估算（字符数 ÷ 4）。
+    """
+    # ── 从后往前找有真实 token 数据的 assistant 消息 ──
+    baseline_tokens = 0
+    baseline_idx = -1
+    for i in range(len(messages) - 1, -1, -1):
+        msg = messages[i]
+        if msg.get("role") == "assistant":
+            stored = msg.get("_api_total_tokens")
+            if isinstance(stored, (int, float)) and stored > 0:
+                baseline_tokens = int(stored)
+                baseline_idx = i
+                break
+
+    # ── 没有基线 → 全部估算 ──
+    if baseline_idx < 0:
+        return sum(estimate_message_tokens(m) for m in messages)
+
+    # ── 基线 + 新增消息估算 ──
+    new_messages = messages[baseline_idx + 1:]
+    return baseline_tokens + sum(estimate_message_tokens(m) for m in new_messages)
 
 
 def collect_context_stats(
