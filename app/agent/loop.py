@@ -291,13 +291,6 @@ def _run_agent_loop(
             f"microcompact_cooldown_left={float(microcompact_cooldown_remaining):.0f}s "
             f"steps={','.join(prepared_context.pipeline_steps)}"
         )
-        log_event(
-            f"[session={session_id or '-'}] 第 {step_index + 1} 轮 token统计: "
-            f"total={prepared_context.stats.total_tokens} usage={prepared_context.stats.usage_ratio:.1%} "
-            f"budget={prepared_context.stats.usable_budget} system={prepared_context.stats.system_tokens} "
-            f"recent={prepared_context.stats.recent_tokens} memory={prepared_context.stats.memory_tokens} "
-            f"tool_results={prepared_context.stats.tool_result_tokens}"
-        )
 
         messages = _append_transient_user_nudge(
             prepared_context.messages,
@@ -850,15 +843,7 @@ def stream_agent(
         )
         context_cost = time.perf_counter() - context_started_at
 
-        # 上下文统计日志只写文件，不在终端显示
-        log_event(
-            f"[session={session_id or '-'}] 第 {step_index + 1} 轮 token统计: "
-            f"total={prepared_context.stats.total_tokens} "
-            f"usage={prepared_context.stats.usage_ratio:.1%} "
-            f"budget={prepared_context.stats.usable_budget} "
-            f"recent={prepared_context.stats.recent_tokens}",
-            echo=False,
-        )
+        # 上下文准备完成，进入流式循环
 
         messages = _append_transient_user_nudge(
             prepared_context.messages,
