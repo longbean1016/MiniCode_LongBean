@@ -89,11 +89,20 @@ def load_config() -> AppConfig:
     - `QDRANT_API_KEY`: Qdrant API Key（本地无鉴权时可留空）
     - `QDRANT_COLLECTION`: 向量集合名
     """
-    # 这里按“主模型 -> embedding / 向量 -> 重试熔断 -> decay”分组读取，
-    # 方便把配置结构和系统模块结构对应起来，减少排查时的跳转成本。
-    api_key = _get_env("OPENAI_API_KEY", required=True)
-    base_url = _get_env("OPENAI_BASE_URL", default="https://api.openai.com/v1")
-    model = _get_env("OPENAI_MODEL", default="gpt-4o-mini")
+    # ── 优先从 ~/.bean/settings.json 读取 API 和模型配置 ──
+    # 对标 Claude Code ~/.claude/settings.json 的配置体系
+    from app.infra.user_config import load_user_config
+    user_cfg = load_user_config()
+
+    # settings.json 有 api_key 就用它，否则回退 .env
+    if user_cfg.api_key:
+        api_key = user_cfg.api_key
+        base_url = user_cfg.base_url
+        model = user_cfg.model
+    else:
+        api_key = _get_env('OPENAI_API_KEY', required=True)
+        base_url = _get_env('OPENAI_BASE_URL', default='https://api.openai.com/v1')
+        model = _get_env('OPENAI_MODEL', default='gpt-4o-mini')
     embedding_model = _get_env("EMBEDDING_MODEL", default="text-embedding-3-small")
     embedding_api_key = _get_env("EMBEDDING_API_KEY", default=api_key)
     embedding_base_url = _get_env("EMBEDDING_BASE_URL", default=base_url)
